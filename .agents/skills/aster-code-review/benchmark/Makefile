@@ -38,7 +38,7 @@ check:
 # MIN_RECALL lowers the gate
 # — CI runs it informational (MIN_RECALL=1: report recall, don't fail on <100%).
 benchmark:
-	@ACR_AGENT_PROFILE="$(ACR_AGENT_PROFILE)" MIN_RECALL="$(or $(MIN_RECALL),100)" PROBLEMS="$(PROBLEMS)" KEEP_REVIEWS="$(KEEP)" ./run.sh
+	@ACR_AGENT_PROFILE="$(ACR_AGENT_PROFILE)" MIN_RECALL="$(or $(MIN_RECALL),100)" PROBLEMS="$(PROBLEMS)" KEEP_REVIEWS="$(KEEP)" ../src/run.py
 
 # Smoke test: does the skill run on this agent and emit gradeable reviews?
 # Uses the `.smoke` profile overlay (low effort) and skips escalation;
@@ -46,4 +46,4 @@ benchmark:
 # — but a run that errors or yields no review still fails.
 smoke:
 	@ACR_AGENT_PROFILE="$(ACR_AGENT_PROFILE)" ACR_PROFILE_VARIANT=smoke MIN_RECALL=0 \
-	  PROBLEMS="$(or $(PROBLEMS),$(SMOKE_PROBLEMS))" KEEP_REVIEWS="$(KEEP)" ./run.sh
+	  PROBLEMS="$(or $(PROBLEMS),$(SMOKE_PROBLEMS))" KEEP_REVIEWS="$(KEEP)" ../src/run.py
