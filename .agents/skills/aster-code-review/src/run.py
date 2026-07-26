@@ -27,8 +27,8 @@ import sys
 import tempfile
 from pathlib import Path
 import time
-
 import yaml
+from pipeline import run_review_pipeline
 
 
 DEFAULT_REMOTE = "https://github.com/asterinas/asterinas"
@@ -131,23 +131,16 @@ def build_review_prompt(skillargs: str) -> str:
 
 
 def launch_review_agent(worktree: Path, skillargs: str, env: dict[str, str]) -> int:
-
-
-    # implement consumed pass workflow here
+    print("consume ====","launch_review_agent: ",worktree, skillargs,"\n",flush=True)
+    review_skill = worktree / ".agents" / "skills" / "aster-code-review"
+    if not review_skill.is_dir():
+        review_skill = SKILL
     try:
-        prompt_args = build_arg_string(shlex.split(skillargs))
-    except ValueError as exc:
+        run_review_pipeline(skillargs, repo=worktree, skill=review_skill, env=env)
+    except Exception as exc:
         eprint(f"run.py: {exc}")
-        return 2
-
-    proc = run(
-        [str(RUN_AGENT), build_review_prompt(prompt_args)],
-        cwd=worktree,
-        env=env,
-        stdout=sys.stderr,
-        stderr=sys.stderr,
-    )
-    return proc.returncode
+        return 1
+    return 0
 
 
 if not os.environ.get("ACR_AGENT_PROFILE"):

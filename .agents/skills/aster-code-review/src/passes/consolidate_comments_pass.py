@@ -24,6 +24,7 @@ def consolidate_comments_pass(ctx: ReviewContext) -> ReviewContext:
 
     proc = run_agent(ctx, CONSOLIDATE_PROMPT.format(review=ctx.output))
     if proc.returncode != 0:
-        eprint(proc.stderr.strip())
+        if proc.stderr:
+            eprint(proc.stderr.strip())
         raise RuntimeError("consolidate_comments_pass failed")
     return ctx

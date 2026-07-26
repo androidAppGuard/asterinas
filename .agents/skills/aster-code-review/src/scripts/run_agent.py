@@ -23,8 +23,8 @@ from pathlib import Path
 
 
 HERE = Path(__file__).resolve().parent
-SKILL = HERE.parent
-PROFILES_DIR = SKILL / "../agent_profiles"
+SKILL = HERE.parent.parent
+PROFILES_DIR = SKILL / "agent_profiles"
 
 
 def eprint(message: str) -> None:

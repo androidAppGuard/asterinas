@@ -20,7 +20,7 @@
 # Usage: build_pass_prompt.sh <input-file> <persona> [<persona> ...]
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SKILLDIR="$(cd "$HERE/.." && pwd)"
+SKILLDIR="$(cd "$HERE/../.." && pwd)"
 REPO="$(cd "$SKILLDIR/../../.." && pwd)"   # .agents/skills/aster-code-review -> repo root
 
 # Where to read the guideline pages from.
@@ -91,7 +91,7 @@ inline_guidelines() { # <guideline-page-path-relative-to-GROOT>
 }
 
 # --- STABLE: the shared reviewer contract ------------------------------------
-cat "$SKILLDIR/scripts/pass_contract.md"
+cat "$SKILLDIR/src/scripts/pass_contract.md"
 printf '\n'
 
 # --- STABLE: one block per persona (template + inlined guideline page) --------

@@ -11,7 +11,7 @@ def _build_pass_prompt(ctx: ReviewContext, personas: list[str]) -> str:
     if ctx.input_file is None:
         raise RuntimeError("resolve_target_pass must run before fanout_review_pass")
     return command_output(
-        [str(ctx.skill / "scripts" / "build_pass_prompt.sh"), str(ctx.input_file), *personas],
+        [str(ctx.skill / "src" / "scripts" / "build_pass_prompt.sh"), str(ctx.input_file), *personas],
         cwd=ctx.repo,
         env=ctx.env,
     )
@@ -21,15 +21,19 @@ def _run_persona_group(ctx: ReviewContext, personas: list[str], output_name: str
     if ctx.fragdir is None:
         raise RuntimeError("fragdir is not initialized")
 
+    eprint(f"fanout_review_pass: build prompt for {', '.join(personas)}")
     prompt = _build_pass_prompt(ctx, personas)
+    eprint(f"fanout_review_pass: run agent for {', '.join(personas)}")
     proc = run_agent(ctx, prompt)
     if proc.returncode != 0:
-        eprint(proc.stderr.strip())
+        if proc.stderr:
+            eprint(proc.stderr.strip())
         return False
 
     fragment = ctx.fragdir / output_name
     fragment.write_text(proc.stdout.strip() + "\n")
     ctx.fragments.append(fragment)
+    eprint(f"fanout_review_pass: wrote {fragment}")
     return True
 
 

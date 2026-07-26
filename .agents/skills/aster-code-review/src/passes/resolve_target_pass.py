@@ -8,7 +8,7 @@ from .common import ReviewContext, command_output, parse_meta
 
 
 def resolve_target_pass(ctx: ReviewContext) -> ReviewContext:
-    script = ctx.skill / "scripts" / "resolve_target.sh"
+    script = ctx.skill / "src" / "scripts" / "resolve_target.sh"
     meta_text = command_output(
         [str(script), "--meta", ctx.raw_args],
         cwd=ctx.repo,

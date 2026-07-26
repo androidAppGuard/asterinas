@@ -67,6 +67,7 @@ def run_process(
 
 
 def command_output(argv: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> str:
+    print("consume ====(command_output) ", argv, cwd ,flush=True)
     proc = run_process(
         argv,
         cwd=cwd,
@@ -91,9 +92,9 @@ def parse_meta(text: str) -> dict[str, str]:
 
 def run_agent(ctx: ReviewContext, prompt: str) -> subprocess.CompletedProcess[str]:
     return run_process(
-        [str(ctx.skill / "scripts" / "run_agent.py"), prompt],
+        [str(ctx.skill / "src" / "scripts" / "run_agent.py"), prompt],
         cwd=ctx.repo,
         env=ctx.env,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=None,
     )

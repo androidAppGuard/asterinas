@@ -23,6 +23,7 @@ def write_summary_pass(ctx: ReviewContext) -> ReviewContext:
 
     proc = run_agent(ctx, SUMMARY_PROMPT.format(review=ctx.output))
     if proc.returncode != 0:
-        eprint(proc.stderr.strip())
+        if proc.stderr:
+            eprint(proc.stderr.strip())
         raise RuntimeError("write_summary_pass failed")
     return ctx
