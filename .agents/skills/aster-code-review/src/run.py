@@ -136,7 +136,7 @@ def launch_review_agent(worktree: Path, skillargs: str, env: dict[str, str]) -> 
     if not review_skill.is_dir():
         review_skill = SKILL
     try:
-        run_review_pipeline(skillargs, repo=worktree, env=env, keep_tmp=True)
+        run_review_pipeline(skillargs, repo=worktree, skill=review_skill, env=env, keep_tmp=True)
     except Exception as exc:
         eprint(f"run.py: {exc}")
         return 1
@@ -497,16 +497,16 @@ def run_one(
         return None
 
     caught, total = parse_two_fields(grade_cmd(defects_file, off))
-    if is_uint(caught) and is_uint(total) and caught == total and int(total) > 0:
-        return f"OFF {caught} {total}"
+    # if is_uint(caught) and is_uint(total) and caught == total and int(total) > 0:
+    return f"OFF {caught} {total}"
 
-    on = Path(str(wt) + ".on.md")
-    on.unlink(missing_ok=True)
-    if review_cmd(wt, on, f"{skillargs} --per-persona-context=yes") != 0:
-        return None
-    if not on.is_file() or on.stat().st_size == 0:
-        return None
-    return f"ON {grade_cmd(defects_file, on)}"
+    # on = Path(str(wt) + ".on.md")
+    # on.unlink(missing_ok=True)
+    # if review_cmd(wt, on, f"{skillargs} --per-persona-context=yes") != 0:
+    #     return None
+    # if not on.is_file() or on.stat().st_size == 0:
+    #     return None
+    # return f"ON {grade_cmd(defects_file, on)}"
 
 
 def shell_quote(value: str) -> str:
