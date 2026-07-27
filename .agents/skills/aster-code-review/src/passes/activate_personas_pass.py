@@ -71,7 +71,7 @@ def _documentation_path(relpath: str) -> bool:
 
 def activate_personas_pass(ctx: ReviewContext) -> ReviewContext:
     reviewed_paths = _diff_paths(ctx) if ctx.mode == "diff" else _split_files(ctx.files)
-
+    print(f"activate_personas_pass: reviewed_paths = {reviewed_paths}", flush=True)
     personas = ["maintainability", "development", "security"]
     if any(_hardware_path(ctx.repo, path) for path in reviewed_paths):
         personas.append("hardware")

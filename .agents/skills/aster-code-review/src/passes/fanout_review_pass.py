@@ -45,12 +45,13 @@ def fanout_review_pass(ctx: ReviewContext) -> ReviewContext:
     ctx.fragdir.mkdir(parents=True, exist_ok=True)
     ctx.fragments = []
 
-    if ctx.per_persona_context == "no":
-        if not _run_persona_group(ctx, ctx.personas, "combined.json"):
-            raise RuntimeError("combined review pass failed")
-        return ctx
+    # if ctx.per_persona_context == "no":
+    #     if not _run_persona_group(ctx, ctx.personas, "combined.json"):
+    #         raise RuntimeError("combined review pass failed")
+    #     return ctx
 
     for persona in ctx.personas:
         if not _run_persona_group(ctx, [persona], f"{persona}.json"):
             raise RuntimeError(f"{persona} review pass failed")
+        break
     return ctx

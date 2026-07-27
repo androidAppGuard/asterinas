@@ -38,16 +38,17 @@ def run_review_pipeline(
     repo: Path | None = None,
     skill: Path | None = None,
     env: dict[str, str] | None = None,
+    keep_tmp: bool = False,
 ) -> Path:
     skill_dir = skill or Path(__file__).resolve().parent.parent
     repo_dir = repo or Path.cwd()
 
-    with tempfile.TemporaryDirectory(prefix="acr-pipeline-") as tmp:
+    def run_with_tmp(tmp: Path) -> Path:
         ctx = ReviewContext(
             raw_args=raw_args,
             repo=repo_dir,
             skill=skill_dir,
-            workdir=Path(tmp),
+            workdir=tmp,
             env=env or os.environ.copy(),
         )
         for stage in PIPELINE_STAGES:
@@ -57,3 +58,11 @@ def run_review_pipeline(
         if ctx.output is None:
             raise RuntimeError("pipeline completed without an output path")
         return ctx.output
+
+    if keep_tmp:
+        tmp = Path(tempfile.mkdtemp(prefix="acr-pipeline-"))
+        print(f"pipeline: keeping temporary directory {tmp}", file=sys.stderr, flush=True)
+        return run_with_tmp(tmp)
+
+    with tempfile.TemporaryDirectory(prefix="acr-pipeline-") as tmp:
+        return run_with_tmp(Path(tmp))

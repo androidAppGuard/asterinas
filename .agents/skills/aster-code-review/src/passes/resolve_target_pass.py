@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from .common import ReviewContext, command_output, parse_meta
@@ -38,4 +39,5 @@ def resolve_target_pass(ctx: ReviewContext) -> ReviewContext:
 
     ctx.meta_file = ctx.workdir / "review-meta.env"
     ctx.meta_file.write_text(meta_text.rstrip() + f"\ndate={ctx.today}\n")
+    print(f"resolve_target_pass: wrote {ctx.input_file} and {ctx.meta_file}\n{ctx}", file=sys.stderr, flush=True)
     return ctx

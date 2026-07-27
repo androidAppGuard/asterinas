@@ -136,7 +136,7 @@ def launch_review_agent(worktree: Path, skillargs: str, env: dict[str, str]) -> 
     if not review_skill.is_dir():
         review_skill = SKILL
     try:
-        run_review_pipeline(skillargs, repo=worktree, skill=review_skill, env=env)
+        run_review_pipeline(skillargs, repo=worktree, env=env, keep_tmp=True)
     except Exception as exc:
         eprint(f"run.py: {exc}")
         return 1
@@ -488,7 +488,6 @@ def run_one(
         if not out.is_file() or out.stat().st_size == 0:
             return None
         return f"NEG {neg_grade_cmd(SPEC / f'{problem_id}.negatives.txt', out)}"
-
     defects_file = SPEC / f"{problem_id}.defects.txt"
     off = Path(str(wt) + ".off.md")
     off.unlink(missing_ok=True)
