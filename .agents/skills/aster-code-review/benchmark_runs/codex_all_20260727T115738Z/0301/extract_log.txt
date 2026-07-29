@@ -1,0 +1,64 @@
+ 我看完 log_0301.txt 和持久化的 benchmark_runs/codex_all_20260727T115738Z/0301/
+  keep/0301-rt-sigprocmask-unblockable-signals/review-fanout.md:1 后，结论是：按
+  review 文本语义，0301 的三个 expected defects 都被 Codex 写出来了。如果某个统计
+  说“只找到 1 个”，那更像是匹配/计分口径问题，而不是 agent 没发现。
+
+  三个预期 defect 的匹配情况
+
+  1. SIG_SETMASK 未过滤 SIGKILL/SIGSTOP：已发现。
+     Expected 在 benchmark_runs/codex_all_20260727T115738Z/0301/keep/0301-rt-
+     sigprocmask-unblockable-signals/expected-defects.txt:3。
+     Codex 在 benchmark_runs/codex_all_20260727T115738Z/0301/keep/0301-rt-
+     sigprocmask-unblockable-signals/review-fanout.md:102 的 Correctness finding 明
+     确写了：MaskOp::SetMask stores the user mask without clearing SIGKILL and
+     SIGSTOP。它还在 benchmark_runs/codex_all_20260727T115738Z/0301/keep/0301-rt-
+     sigprocmask-unblockable-signals/review-fanout.md:117 以 Security persona 重复
+     报了一次。
+
+  2. set_ptr == 0 时不应校验 invalid how：已发现。
+     Expected 在 benchmark_runs/codex_all_20260727T115738Z/0301/keep/0301-rt-
+     sigprocmask-unblockable-signals/expected-defects.txt:7。
+     Codex 在 benchmark_runs/codex_all_20260727T115738Z/0301/keep/0301-rt-
+     sigprocmask-unblockable-signals/review-fanout.md:73 报告：rt_sigprocmask
+     rejects an invalid how even when set_ptr == 0，并给出 rt_sigprocmask(999, 0,
+     oldset, 8) 的触发例子。
+
+  3. MaskOp 不该是 pub：已发现。
+     Expected 在 benchmark_runs/codex_all_20260727T115738Z/0301/keep/0301-rt-
+     sigprocmask-unblockable-signals/expected-defects.txt:11。
+     Codex 在 benchmark_runs/codex_all_20260727T115738Z/0301/keep/0301-rt-
+     sigprocmask-unblockable-signals/review-fanout.md:59 报告：MaskOp is declared
+     pub, but it is only used inside this file。
+
+  所以，如果按语义判断，不存在“另外两个没找到”。
+
+  为什么可能只被计成 1 个
+
+  最可能被严格计分器稳定命中的，是第 3 个 narrow-visibility，因为它的 persona、
+  grounding、severity、内容都几乎和 expected 完全一致。
+
+  另外两个虽然写出来了，但字段不完全对齐：
+
+  - 第 1 个 expected 是 development / Incorrect signal semantics / critical。Codex
+    的 Correctness finding 是 development / Incorrect signal masking / major，
+    Security finding 又是 security / validate-at-boundaries / major。语义对，但如果
+    matcher 严格看 persona、grounding、severity，就可能不认。
+
+  - 第 2 个 expected grounding 是 Incorrect argument validation。Codex 写成
+    Incorrect syscall semantics。内容完全命中，但 grounding 名称不一致，也可能被脆
+    弱 matcher 漏掉。
+
+  执行过程上的特点
+
+  Codex 实际流程是正常的：它 resolve 到 files 模式，head 是 2154124dc，目标是
+  kernel/src/syscall/rt_sigprocmask.rs；然后激活 maintainability、development、
+  security、documentation 四个 persona。Development pass 重点查 syscall ordering、
+  mask representation、SIGKILL/SIGSTOP 过滤；Maintainability pass 查到 MaskOp 的
+  public 可见性；Security pass 又重复确认了 unblockable signal 问题。
+
+  它还多报了几个额外 finding：sigset_size == 8 magic number、注释未精确引用 man
+  page、attribute 顺序、oldset_ptr 和 set_ptr aliasing。这些额外项会影响
+  precision，但不影响“三个 expected 是否出现在 review 中”的事实。
+
+  因此我的判断是：agent 找到了三个预期 defect；如果结果显示只找到一个，原因应优先查
+  评价匹配逻辑，而不是审查执行本身。

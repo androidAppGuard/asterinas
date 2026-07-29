@@ -1,0 +1,2092 @@
+
+The targeted check fails before reaching this change because this workspace invocation lacks several architecture dependencies (`acpi`, `x86_64`, `tdx_guest`, etc.) in the selected configuration. I’ll treat that as an environment limitation, not as a finding on this diff.
+ succeeded in 242888ms:
+OpenAI Codex v0.142.5
+--------
+workdir: /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0009/scratch/work/wt1
+model: gpt-5.5
+provider: OpenAI
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: high
+reasoning summaries: none
+session id: 019fa398-db1e-7952-9e01-3240c69216f0
+--------
+user
+# Pass contract
+
+You are a reviewer applying the persona guideline(s) included below to the change or files under review
+(the **REVIEW INPUT** at the very end of this prompt).
+Find as many real defects as possible within the included persona(s)' remit
+— runtime correctness for Development,
+security/soundness for Security,
+ABI/hardware for Hardware,
+doc style/currency for Documentation,
+and structure/process for Maintainability
+— without inventing issues; a false alarm is a real cost.
+
+For each persona block below,
+work that persona's concerns in the order its file gives.
+For each candidate rule,
+read its one-line gist first
+and drill into the full rule (its linked subsections) only on a suspected violation.
+Stay within the remit of the persona(s) you are given.
+
+Each persona searches only for defects whose failure belongs to that persona.
+Do not run a general bug sweep from every persona.
+When another persona is the clear natural owner,
+do not duplicate that investigation here.
+For example,
+Maintainability should inspect design shape, readability, naming, layout,
+and commit hygiene;
+it should not trace runtime permission semantics, Linux/POSIX behavior,
+wrong predicates, or data-flow edge cases unless they are evidence of a
+maintainability rule violation.
+
+Within each included persona's owned failure modes,
+reason about the code even when no explicit guideline names the issue.
+Examples include off-by-one and reachable panic for Development,
+input-validation or permission-boundary flaws for Security,
+ABI/alignment hazards for Hardware,
+navigation or currency defects for Documentation,
+and structural or process defects for Maintainability.
+Ground each non-guideline finding in a short plain-language description of the defect
+("Off by one", "Use after free", "Reachable panic", …)
+— not the bare word `bug`, and not a coined hyphenated short-name,
+which would read as a guideline.
+Never stay silent about a real defect that belongs to the included persona
+because "no guideline covers it".
+
+Be **adversarial**:
+before dismissing a suspected in-scope defect as safe,
+state the concrete input or interleaving that would trigger it.
+Report an in-scope defect unless you can show that case cannot happen.
+"It looks fine" is not a verdict.
+
+The REVIEW INPUT is the unit of review;
+you MAY read surrounding code in the working tree for extra context.
+
+## Output
+
+Output **only** a JSON array of comment objects (no prose around it):
+
+```json
+[{"file":"path/relative/to/repo.rs","line":42,"persona":"development","grounding":"lock-ordering","severity":"major",
+  "problem":"`foo()` takes `b.lock()` while already holding `a.lock()`, the reverse of the `a`-before-`b` order elsewhere — a deadlock",
+  "fix":"take `a.lock()` before `b.lock()` here too, matching the rest of the module",
+  "diff":"the few relevant lines (a diff hunk, or source lines in files mode)"}]
+```
+
+- `persona` — which persona section the comment belongs to (`maintainability`, `development`, `security`, `hardware`, `documentation`);
+  used to file the comment under the right section.
+  In a single-persona (fan-out) pass it is always that persona.
+- `grounding` — what the comment rests on, in one of two forms kept visually distinct:
+  when you **cite a guideline**, its short-name
+  — a lowercase kebab identifier (e.g. `lock-ordering`), rendered as code;
+  when you report a **bug no guideline covers**, a short plain-language description of the defect
+  (e.g. "Off by one", "Use after free", "Incorrect cleanup"), rendered as prose.
+  Do not coin a hyphenated pseudo-short-name for a bug
+  — that reads as a guideline
+  — and never use the bare word `bug`,
+  which says nothing the reader cannot already see.
+- `severity` — **required**,
+  one of `critical` (must fix) / `major` (should fix) / `minor` (worth fixing) / `nit` (optional or stylistic).
+- `problem` and `fix` are **both required**
+  — every comment proposes a remedy.
+  They are posted as GitHub-flavored Markdown,
+  so wrap every code identifier, path, type, function or variable name, and literal value in backticks
+  (`self.len`, `Ordering::Acquire`, `kernel/src/foo.rs`),
+  and put any multi-line snippet in `fix` in a fenced ```` ``` ```` block.
+  (The `grounding` of a bug stays plain prose, as described above
+  — only `problem` and `fix` take inline code.)
+- Every field above is required on every comment,
+  with a single exception for `line`, described next.
+- `line` is the line the comment anchors to
+  — the post-change line in the commit's diff (`diff` mode),
+  or the file's line number (`files` mode).
+  It is **required for a finding about code**.
+- For a finding about a **commit message** (`diff` mode shows each commit's message),
+  set `file` to the commit locus (e.g. `commit abc1234 message`),
+  **omit `line`** (its one exception),
+  and ground it in a commit-hygiene rule (`imperative-subject`, `atomic-commits`, …).
+- Report only issues within the included persona(s)' remit.
+  If you find nothing, output `[]`.
+
+    ===== PERSONA: maintainability =====
+
+    # Maintainability persona
+
+    **Review section:** Maintainability
+    **Remit:** Is the shape of the change sound,
+    and will the next reader understand it without archaeology?
+
+    **Your guideline page (read only this, drill in on suspicion):**
+    `book/src/to-contribute/coding-guidelines/for-maintainability/README.md`
+    — subsections: `process.md`,
+    `design.md`, `naming.md`, `layout.md`,
+    `comments.md`, and `rust-specific/*` (naming, crates-and-modules, types-and-traits, functions-and-methods, attributes-and-macros, comments).
+
+    **Concerns, in order:**
+
+    1. Understand the change's intent and goal.
+    2. Assess design and interface fit
+    — familiar conventions, hide implementation details, single responsibility.
+    3. Check naming, comments, and layout,
+    including the Rust-Specific items (descriptive/accurate names, explain *why* in comments, one concept per file, small functions, narrow visibility, …).
+
+    **Always-on:** commit hygiene (Process rules — `imperative-subject`, `atomic-commits`, `focused-prs`, `refactor-then-feature`) applies to every change.
+
+    You own readability and structure,
+    not runtime correctness (Correctness persona) or doc currency (Documentation persona).
+
+    Rely on the inlined guideline material below as the authoritative guideline context for this pass. Do not re-read `book/src/to-contribute/coding-guidelines/` from the worktree under review for guideline content.
+
+    --- guideline page (book/src/to-contribute/coding-guidelines/for-maintainability/README.md) ---
+
+    # For Maintainability
+
+    *Is the shape of the change sound, and will the next reader understand it without archaeology?*
+
+    This is the index of the **maintainability** guidelines.
+    Each subsection is its own page,
+    and each entry below links a stable `short-name` to its guideline,
+    with a one-line gist so a reader (or a review tool) can grasp the guideline before opening it.
+
+    ## Index
+
+    **[Design](design.md)**
+    - [`single-responsibility`](design.md#single-responsibility): Each module, type, or function has one reason to change; keep functions small and one concept per file.
+    - [`dry`](design.md#dry): Give every piece of knowledge a single representation; eliminate duplication once a pattern recurs.
+    - [`information-hiding`](design.md#information-hiding): Hide details behind interfaces; expose only what consumers need.
+    - [`open-closed`](design.md#open-closed): Extend stable modules through existing interfaces; don't add extension points preemptively.
+    - [`least-surprise`](design.md#least-surprise): Names, types, and APIs behave as they suggest; prefer conventions users already know from Rust and Linux.
+    - [`coupling-cohesion`](design.md#coupling-cohesion): Keep inter-module connections small and visible; keep each module focused on one purpose.
+    - [`consistency`](design.md#consistency): Do similar things the same way; follow an existing convention rather than coining a competing one.
+    - [`rust-native`](design.md#rust-native): Learn from Linux's design, not its C idioms; write idiomatic Rust.
+
+    **[Process](process.md)**
+    - [`imperative-subject`](process.md#imperative-subject): Write each commit subject in the imperative mood, ≤72 chars, verb-first ("Fix", "Add", "Remove"); backtick identifiers.
+    - [`atomic-commits`](process.md#atomic-commits): One logical change per commit; don't mix unrelated changes.
+    - [`refactor-then-feature`](process.md#refactor-then-feature): Put preparatory refactoring in its own earlier commit(s), separate from the feature.
+    - [`focused-prs`](process.md#focused-prs): Keep a PR on a single topic; ensure CI passes before requesting review.
+
+    **[Naming](naming.md)**
+    - [`descriptive-names`](naming.md#descriptive-names): Names convey meaning at the point of use; avoid single letters and ambiguous abbreviations.
+    - [`accurate-names`](naming.md#accurate-names): Avoid names that mislead about meaning, behavior, or side effects.
+    - [`no-magic-number`](naming.md#no-magic-number): Give semantic names to numbers that encode rules, limits, units, masks, or external constants.
+    - [`encode-units`](naming.md#encode-units): When the type doesn't carry the unit, put it in the name (`timeout_ns`, `size_pages`).
+    - [`bool-names`](naming.md#bool-names): Name booleans as positive assertions (`is_`/`has_`/`can_`/…); avoid negation.
+    - [`error-message-format`](naming.md#error-message-format): Lowercase start (unless a proper noun), specific, Linux man-page style for syscall errors.
+
+    **[Layout](layout.md)**
+    - [`top-down-reading`](layout.md#top-down-reading): Order a file top-down: entry points and core flow first, detail below.
+    - [`logical-paragraphs`](layout.md#logical-paragraphs): Group related statements into blank-line-separated paragraphs, each one sub-step.
+
+    **[Comments](comments.md)**
+    - [`explain-why`](comments.md#explain-why): Comments explain intent (why), not what the code does; if you must explain "what", rewrite the code.
+    - [`design-decisions`](comments.md#design-decisions): Document non-obvious choices, with rationale and alternatives considered.
+    - [`cite-sources`](comments.md#cite-sources): Cite the source (POSIX, Linux man page, hardware manual, paper) for spec/algorithm behavior.
+
+    **[Rust-Specific](rust-specific/)**
+    - [Naming](rust-specific/naming.md)
+        - [`camel-case-acronyms`](rust-specific/naming.md#camel-case-acronyms): Use Rust CamelCase with title-cased acronyms (`Nvme`, not `NVME`).
+        - [`closure-fn-suffix`](rust-specific/naming.md#closure-fn-suffix): End a variable holding a closure or fn pointer with `_fn`.
+    - [Crates & Modules](rust-specific/crates-and-modules.md)
+        - [`workspace-deps`](rust-specific/crates-and-modules.md#workspace-deps): Declare shared dependencies in `[workspace.dependencies]` and reference them with `.workspace = true`.
+        - [`module-docs`](rust-specific/crates-and-modules.md#module-docs): Open a major module with a `//!` doc: purpose, key types, relation to neighbors.
+        - [`narrow-visibility`](rust-specific/crates-and-modules.md#narrow-visibility): Start private; widen visibility only when an actual consumer requires it.
+        - [`qualified-fn-imports`](rust-specific/crates-and-modules.md#qualified-fn-imports): Import the parent module and call free functions/statics through it, not by bare name.
+    - [Types & Traits](rust-specific/types-and-traits.md)
+        - [`rust-type-invariants`](rust-specific/types-and-traits.md#rust-type-invariants): Use the type system (newtypes, enums, generics) to make illegal states unrepresentable.
+        - [`enum-over-dyn`](rust-specific/types-and-traits.md#enum-over-dyn): For a closed set of variants, prefer an `enum` over `Box<dyn Trait>`.
+        - [`getter-encapsulation`](rust-specific/types-and-traits.md#getter-encapsulation): Prefer a getter over a public field; it preserves naming freedom and room for invariants.
+    - [Functions & Methods](rust-specific/functions-and-methods.md)
+        - [`no-bool-args`](rust-specific/functions-and-methods.md#no-bool-args): Avoid boolean parameters that select behavior; split the function or use a typed enum.
+        - [`block-expressions`](rust-specific/functions-and-methods.md#block-expressions): Use a block expression to scope temporary state that only produces one value.
+        - [`minimize-nesting`](rust-specific/functions-and-methods.md#minimize-nesting): Flatten nesting past ~3 levels with early returns, guard clauses, `let…else`, `?`, `continue`.
+        - [`explain-variables`](rust-specific/functions-and-methods.md#explain-variables): Bind intermediate results of a complex expression to well-named variables.
+    - [Attributes & Macros](rust-specific/attributes-and-macros.md)
+        - [`expect-dead-code`](rust-specific/attributes-and-macros.md#expect-dead-code): Allow `#[expect(dead_code)]` only for a planned, clear, simple future use.
+        - [`alphabetical-attrs`](rust-specific/attributes-and-macros.md#alphabetical-attrs): Sort outer attributes alphabetically; place `#[derive(...)]` last with sorted traits.
+        - [`narrow-lint-suppression`](rust-specific/attributes-and-macros.md#narrow-lint-suppression): Suppress a lint at the narrowest scope (item/method), not a whole type or module.
+        - [`macros-as-last-resort`](rust-specific/attributes-and-macros.md#macros-as-last-resort): Prefer functions and generics; use a macro only when the type system can't express the need.
+    - [Comments](rust-specific/comments.md)
+        - [`rfc1574-summary`](rust-specific/comments.md#rfc1574-summary): First doc line is one sentence — a third-person verb for functions, a noun phrase for types/modules.
+        - [`comment-punctuation`](rust-specific/comments.md#comment-punctuation): End full-sentence comments with terminal punctuation.
+        - [`backtick-identifiers`](rust-specific/comments.md#backtick-identifiers): Wrap identifiers in doc comments in backticks; prefer rustdoc links where possible.
+        - [`no-impl-in-docs`](rust-specific/comments.md#no-impl-in-docs): Doc comments describe what an API does and how to use it, not its internal implementation.
+
+    No **path-specific** guidelines yet.
+
+
+    --- guideline subpage (book/src/to-contribute/coding-guidelines/for-maintainability/design.md) ---
+
+    # Design
+
+    ### Give each unit a single responsibility (`single-responsibility`) {#single-responsibility}
+
+    Each module, type, or function
+    should have one, and only one, reason to change.
+    If you cannot describe what a unit does
+    without the words "and," "or," or "but,"
+    it has too many responsibilities.
+
+    This applies at every scale:
+
+    - **Functions** should do one thing, do it well, and do it only.
+    If you can extract another function from it
+    with a name that is not merely a restatement of its implementation,
+    the original function is doing more than one thing.
+    Do not mix levels of abstraction:
+    a syscall handler should read like a specification,
+    while byte-level manipulation belongs in a helper.
+    - **Files** should hold one concept.
+    When a file grows long or contains multiple distinct concepts,
+    split it — each major data structure, subsystem entry point,
+    or significant abstraction deserves its own file.
+
+    ```rust
+    // Good — each function operates at one level of abstraction
+    pub fn sys_connect(sockfd: i32, addr: Vaddr, len: u32) -> Result<()> {
+        let socket = get_socket(sockfd)?;
+        let remote_addr = parse_socket_addr(addr, len)?;
+        socket.connect(remote_addr)
+    }
+
+    // Bad — mixes high-level logic with low-level details
+    pub fn sys_connect(sockfd: i32, addr: Vaddr, len: u32) -> Result<()> {
+        let fd_table = current_process().fd_table().lock();
+        let file = fd_table.get(sockfd).ok_or(Errno::EBADF)?;
+        let socket = file.downcast_ref::<Socket>().ok_or(Errno::ENOTSOCK)?;
+        let bytes = read_bytes_from_user(addr, len as usize)?;
+        let family = u16::from_ne_bytes([bytes[0], bytes[1]]);
+        // ... 30 more lines of byte parsing ...
+    }
+    ```
+
+    See also:
+    _Clean Code_, Chapter 3 "Functions";
+    PR [#639](https://github.com/asterinas/asterinas/pull/639#discussion_r1524629393).
+
+    ### Don't repeat yourself (`dry`) {#dry}
+
+    Every piece of knowledge
+    should have a single, unambiguous representation.
+    Duplication harms readability and maintainability.
+    When the same pattern appears three or more times,
+    eliminate the duplication (e.g., by adding a helper function).
+
+    ### Hide details behind interfaces (`information-hiding`) {#information-hiding}
+
+    Hide details behind well-defined interfaces.
+    A module's public surface should contain
+    only what its consumers need.
+    Internal data structures, helper types,
+    and bookkeeping fields should remain private,
+    and implementation details should not leak
+    through public APIs (including their documentation).
+
+    See also:
+    [`narrow-visibility`](rust-specific/crates-and-modules.md#narrow-visibility)
+    for Rust-specific visibility rules;
+    PR [#2951](https://github.com/asterinas/asterinas/pull/2951#discussion_r2786925410).
+
+    ### Be open for extension, closed for modification (`open-closed`) {#open-closed}
+
+    Stable modules and APIs should be
+    open to extension
+    but closed to breaking modification.
+    Prefer adding new behavior
+    through existing interfaces
+    (traits, enums, and pluggable components)
+    instead of repeatedly editing established call paths.
+    Do not introduce extension points preemptively;
+    add them when there is a concrete extension need.
+
+    ### Follow the principle of least surprise (`least-surprise`) {#least-surprise}
+
+    Functions, types, and APIs should behave
+    as their names and signatures suggest.
+    When an obvious behavior is not implemented,
+    readers lose trust in the codebase
+    and must fall back on reading implementation details.
+    Prefer names and API shapes
+    that users already know from Rust and Linux;
+    do not invent new terms for well-known operations.
+
+    ```rust
+    // Good — follows common Rust naming conventions
+    pub fn len(&self) -> usize { ... }
+    pub fn as_ptr(&self) -> *const u8 { ... }
+
+    // Bad — unfamiliar synonyms for common operations
+    pub fn length(&self) -> usize { ... }
+    pub fn to_pointer(&self) -> *const u8 { ... }
+    ```
+
+    ### Aim for loose coupling and strong cohesion (`coupling-cohesion`) {#coupling-cohesion}
+
+    Connections between modules should be
+    small, visible, and flexible.
+    Within a module, every part should contribute
+    to a single, well-defined purpose.
+
+    ### Be consistent (`consistency`) {#consistency}
+
+    Do similar things the same way throughout the codebase.
+    Consistency reduces surprise and cognitive load
+    even when neither approach is objectively superior.
+    When a convention already exists, follow it;
+    do not introduce a competing convention
+    without compelling justification.
+
+    ### Take a Rust-native approach (`rust-native`) {#rust-native}
+
+    Asterinas is inspired by Linux but is not a C port.
+    The language shapes how we think about problems:
+    where C code relies on conventions and manual discipline
+    (return-code checking, paired init/cleanup, header-file contracts),
+    Rust offers compiler-enforced, zero-cost abstractions
+    (the `?` operator, RAII, trait bounds).
+
+    Learn from Linux's design, not its idioms.
+    The result should read like idiomatic Rust,
+    not like C written in Rust syntax.
+
+
+    --- guideline subpage (book/src/to-contribute/coding-guidelines/for-maintainability/process.md) ---
+
+    # Process
+
+    ### Write imperative, descriptive subject lines (`imperative-subject`) {#imperative-subject}
+
+    Write commit messages in imperative mood
+    with the subject line at or below 72 characters.
+    Wrap identifiers in backticks.
+
+    Common prefixes used in the Asterinas commit log:
+
+    - `Fix` — correct a bug
+    - `Add` — introduce new functionality
+    - `Remove` — delete code or features
+    - `Refactor` — restructure without changing behavior
+    - `Rename` — change names of files, modules, or symbols
+    - `Implement` — add a new subsystem or feature
+    - `Enable` — turn on a previously disabled capability
+    - `Clean up` — minor tidying without functional change
+    - `Bump` — update a dependency version
+
+    Examples:
+
+    ```
+    Fix deadlock in `Vmar::protect` when holding the page table lock
+
+    Add initial support for the io_uring subsystem
+
+    Refactor `TcpSocket` to separate connection state from I/O logic
+    ```
+
+    If the commit requires further explanation,
+    add a blank line after the subject
+    followed by a body paragraph
+    describing the _why_ behind the change.
+
+    See also:
+    PR [#2877](https://github.com/asterinas/asterinas/pull/2877)
+    and [#2700](https://github.com/asterinas/asterinas/pull/2700).
+
+    ### One logical change per commit (`atomic-commits`) {#atomic-commits}
+
+    Each commit should represent one logical change.
+    Do not mix unrelated changes in a single commit.
+    When fixing an issue discovered during review
+    on a local or private branch,
+    use `git rebase -i` to amend the commit
+    that introduced the issue
+    rather than appending a fixup commit at the end.
+
+    See also:
+    PR [#2791](https://github.com/asterinas/asterinas/pull/2791)
+    and [#2260](https://github.com/asterinas/asterinas/pull/2260).
+
+    ### Separate refactoring from features (`refactor-then-feature`) {#refactor-then-feature}
+
+    If a feature requires preparatory refactoring,
+    put the refactoring in its own commit(s)
+    before the feature commit.
+    This makes each commit easier to review and bisect.
+
+    See also:
+    PR [#2877](https://github.com/asterinas/asterinas/pull/2877).
+
+    ### Keep pull requests focused (`focused-prs`) {#focused-prs}
+
+    Keep pull requests focused on a single topic.
+    A PR that mixes a bug fix, a refactoring,
+    and a new feature is difficult to review.
+
+    Ensure that CI passes before requesting review.
+    If CI fails on an unrelated flake,
+    note it in the PR description.
+
+
+    --- guideline subpage (book/src/to-contribute/coding-guidelines/for-maintainability/naming.md) ---
+
+    # Naming
+
+    ### Be descriptive (`descriptive-names`) {#descriptive-names}
+
+    Choose names that convey meaning at the point of use.
+    Avoid single-letter names and ambiguous abbreviations.
+    Prefer full words over cryptic shorthand
+    so that readers do not need surrounding context
+    to understand a variable's purpose.
+    Prefer names that are as short as possible
+    while still being unambiguous at the point of use.
+
+    ### Be accurate (`accurate-names`) {#accurate-names}
+
+    Avoid confusing names.
+    If a name can be misread
+    to imply the wrong meaning, behavior, or side effects,
+    it must be corrected immediately.
+
+    ```rust
+    // Good — clearly a count
+    nr_deleted_watches: usize,
+    // Bad — looks like a collection
+    // rather than a numeric counter
+    deleted_watches: usize
+    ```
+
+    Choose verbs that reflect the actual work being done.
+
+    ```rust
+    impl PciCommonDevice {
+        // Good — implies an MMIO read is involved
+        pub fn read_command(&self) -> Command { /* .. */ }
+        // Bad — looks like a plain field access
+        pub fn command(&self) -> Command { /* .. */ }
+    }
+    ```
+
+    ```rust
+    mod char_device {
+        // Good — implies an O(n) collection pass
+        pub fn collect_all() -> Vec<Arc<dyn Device>> { /* .. */ }
+        // Bad — sounds like an accessor returning a reference
+        pub fn get_all() -> Vec<Arc<dyn Device>> { /* .. */ }
+    }
+    ```
+
+    See also:
+    PR [#1488](https://github.com/asterinas/asterinas/pull/1488#discussion_r1825441287)
+    and [#2964](https://github.com/asterinas/asterinas/pull/2964#discussion_r2789739882).
+
+    ### Encode units and important attributes in names (`encode-units`) {#encode-units}
+
+    When the type does not encode the unit,
+    the name must.
+    Kernel code deals with bytes, pages, frames,
+    nanoseconds, ticks, and sectors —
+    ambiguous units are a source of real bugs.
+
+    ```text
+    // Good — unit is unambiguous
+    timeout_ns
+    offset_bytes
+    size_pages
+    delay_ms
+
+    // Bad — unit is ambiguous
+    timeout
+    offset
+    size
+    delay
+    ```
+
+    Where the language's type system can enforce units (e.g., newtypes),
+    prefer that.
+    Where it cannot, the name must carry the information.
+
+    See also:
+    PR [#2796](https://github.com/asterinas/asterinas/pull/2796#discussion_r2646889913).
+
+    ### No magic number (`no-magic-number`) {#no-magic-number}
+
+    Numeric literals must be meaningful at the point of use.
+    When a number represents a non-local invariant,
+    an external contract,
+    or a domain-specific meaning
+    beyond its immediate arithmetic value,
+    give that meaning a name.
+    Use a constant,
+    typed value,
+    enum variant,
+    or helper function,
+    whichever best expresses the invariant.
+
+    ```rust
+    // Good — the flag's meaning is explicit.
+    const NEEDS_ACK_FLAG: u8 = 0b0000_0100;
+    let needs_ack = (packet_flags & NEEDS_ACK_FLAG) != 0;
+
+    // Bad — the reader must infer why this bit is special.
+    let needs_ack = (packet_flags & 0b0000_0100) != 0;
+    ```
+
+    Prefer deriving related values from the named source
+    instead of repeating the same number in multiple places.
+    If the name alone does not explain where the value comes from,
+    add a short comment or cite the relevant specification.
+
+    Do not introduce names for numbers
+    whose meaning is already obvious locally,
+    such as `0`, `1`, or `2`
+    in ordinary arithmetic,
+    indexing,
+    small ranges,
+    or direct comparisons.
+
+    ### Use assertion-style boolean names (`bool-names`) {#bool-names}
+
+    Boolean variables and functions
+    should read as assertions of fact.
+    Use `is_`, `has_`, `can_`, `should_`, `was_`,
+    or `needs_` prefixes.
+    Never use negated names
+    (`is_not_empty`, `no_error`);
+    prefer the positive form
+    (`is_empty`, `ok` or `succeeded`).
+    A bare name like `found`, `done`, or `ready`
+    is acceptable when the context is unambiguous.
+
+    ```rust
+    // Good — reads as an assertion
+    fn is_page_aligned(&self) -> bool { ... }
+    fn has_permission(&self, perm: Permission) -> bool { ... }
+    let can_read = mode.is_readable();
+
+    // Bad — verb suggests an action, not a query
+    fn check_permission(&self, perm: Permission) -> bool { ... }
+    // Bad — negated name
+    let is_not_empty = !buf.is_empty();
+    ```
+
+    See also:
+    PR [#1488](https://github.com/asterinas/asterinas/pull/1488#discussion_r1841827039).
+
+    ### Format error messages consistently (`error-message-format`) {#error-message-format}
+
+    Start with a lowercase letter
+    (unless the first word is a proper noun or identifier).
+    Be specific:
+    prefer "`len` is too large" over "the argument is invalid".
+
+    For system call errors,
+    follow the style and descriptions in Linux man pages.
+
+
+    --- guideline subpage (book/src/to-contribute/coding-guidelines/for-maintainability/layout.md) ---
+
+    # Layout
+
+    ### Organize code for top-down reading (`top-down-reading`) {#top-down-reading}
+
+    A source file should read from top to bottom.
+    Start with high-level entry points and core flow.
+    Move implementation details downward
+    so readers can understand the big picture first
+    before diving into low-level helpers.
+
+    Within each visibility group (e.g., a module),
+    order methods so that callers appear before callees where possible,
+    enabling the file to be read top to bottom.
+    Place public methods before private helpers.
+
+    ### Group statements into logical paragraphs (`logical-paragraphs`) {#logical-paragraphs}
+
+    Within functions,
+    group related statements into logical paragraphs
+    separated by blank lines.
+    Each paragraph should represent one sub-step
+    of the function's overall purpose.
+
+    For long functions,
+    add a one-line summary comment
+    at the start of each paragraph
+    when the paragraph intent is not obvious.
+
+
+    --- guideline subpage (book/src/to-contribute/coding-guidelines/for-maintainability/comments.md) ---
+
+    # Comments
+
+    ### Explain why, not what (`explain-why`) {#explain-why}
+
+    Comments should explain the intent behind the code,
+    not restate what the code does.
+    If a comment merely paraphrases the code,
+    it adds noise without insight.
+
+    If a comment is needed to explain what code does,
+    first try to rewrite the code.
+    Do not write good comments to compensate for bad code —
+    rewrite it to be straightforward.
+
+    See also:
+    _The Art of Readable Code_, Chapter 6 "Knowing What to Comment";
+    PR [#2265](https://github.com/asterinas/asterinas/pull/2265#discussion_r2266220943)
+    and [#2050](https://github.com/asterinas/asterinas/pull/2050#discussion_r2224106025).
+
+    ### Document design decisions (`design-decisions`) {#design-decisions}
+
+    When the code makes a non-obvious choice —
+    a particular data structure, a locking strategy,
+    a deviation from Linux behavior —
+    add a comment explaining the rationale
+    and any alternatives considered.
+    Design-decision comments ("director's commentary")
+    are the most valuable kind of comment.
+
+    ```rust
+    // We use a radix tree rather than a HashMap
+    // because lookups must be O(log n) worst-case
+    // for the page fault handler.
+    // A HashMap gives O(1) amortized
+    // but O(n) worst-case due to rehashing,
+    // which is unacceptable on the page fault path.
+    ```
+
+    See also:
+    PR [#2265](https://github.com/asterinas/asterinas/pull/2265#discussion_r2266220943)
+    and [#2050](https://github.com/asterinas/asterinas/pull/2050#discussion_r2224106025).
+
+    ### Cite specifications and algorithm sources (`cite-sources`) {#cite-sources}
+
+    When implementing behavior defined by
+    an external specification or a non-trivial algorithm,
+    cite the source:
+    the relevant POSIX section, Linux man page,
+    hardware reference manual, or academic paper.
+
+    ```rust
+    /// Maximum number of bytes guaranteed to be written to a pipe atomically.
+    ///
+    /// For more details, see the description of `PIPE_BUF` in
+    /// <https://man7.org/linux/man-pages/man7/pipe.7.html>.
+    const PIPE_BUF: usize = 4096;
+    ```
+
+
+    --- guideline subpage (book/src/to-contribute/coding-guidelines/for-maintainability/rust-specific/README.md) ---
+
+    # Rust-Specific
+
+    Rust-specific maintainability guidelines, grouped by language item.
+
+    - [Naming](naming.md)
+    - [Crates & Modules](crates-and-modules.md)
+    - [Types & Traits](types-and-traits.md)
+    - [Functions & Methods](functions-and-methods.md)
+    - [Attributes & Macros](attributes-and-macros.md)
+    - [Comments](comments.md)
+
+
+    --- guideline subpage (book/src/to-contribute/coding-guidelines/for-maintainability/rust-specific/naming.md) ---
+
+    # Naming
+
+    ### Follow Rust CamelCase and acronym capitalization (`camel-case-acronyms`) {#camel-case-acronyms}
+
+    Type names follow Rust's CamelCase convention.
+    Acronyms are title-cased per the Rust API Guidelines:
+
+    ```rust
+    // Good
+    IoMemoryArea
+    PciDeviceLocation
+    Nvme
+    Tcp
+
+    // Bad
+    IOMemoryArea
+    PCIDeviceLocation
+    NVMe
+    TCP
+    ```
+
+    ### End closure variables with `_fn` (`closure-fn-suffix`) {#closure-fn-suffix}
+
+    Variables holding closures or function pointers
+    must signal they are callable by ending with `_fn`.
+    Treating a closure variable
+    as if it were a data object misleads readers.
+
+    ```rust
+    // Good — clearly a callable
+    let task_fn = self.func.take().unwrap();
+    let thread_fn = move || {
+        let _ = oops::catch_panics_as_oops(task_fn);
+        current_thread!().exit();
+    };
+
+    let expired_fn = move |_guard: TimerGuard| {
+        ticks.fetch_add(1, Ordering::Relaxed);
+        pollee.notify(IoEvents::IN);
+    };
+    ```
+
+    See also:
+    PR [#395](https://github.com/asterinas/asterinas/pull/395#discussion_r1402964415)
+    and [#783](https://github.com/asterinas/asterinas/pull/783#discussion_r1593335375).
+
+
+    --- guideline subpage (book/src/to-contribute/coding-guidelines/for-maintainability/rust-specific/crates-and-modules.md) ---
+
+    # Crates & Modules
+
+    ### Use workspace dependencies (`workspace-deps`) {#workspace-deps}
+
+    Always declare shared dependencies
+    in the workspace `[workspace.dependencies]` table
+    and reference them with `.workspace = true`
+    in member crates.
+
+    ```toml
+    # In the workspace root Cargo.toml
+    [workspace.dependencies]
+    ostd = { version = "0.17.0", path = "ostd" }
+    bitflags = "2.6"
+
+    # In a member crate's Cargo.toml
+    [dependencies]
+    ostd.workspace = true
+    bitflags.workspace = true
+    ```
+
+    ### Add module-level documentation for major components (`module-docs`) {#module-docs}
+
+    A module file that serves as
+    an important kernel component
+    (e.g., subsystem entry point, major data structure, driver)
+    should begin with a `//!` comment explaining:
+    1. What the module does
+    2. The key types it exposes
+    3. How it relates to neighboring modules
+
+    ```rust
+    //! Virtual memory area (VMA) management.
+    //!
+    //! This module defines [`VmMapping`] and associated types,
+    //! which represent contiguous regions of a process's virtual address space.
+    //! VMAs are managed by the [`Vmar`] tree in the parent module.
+    ```
+
+    ### Default to the narrowest visibility (`narrow-visibility`) {#narrow-visibility}
+
+    Start private,
+    then widen to `pub(super)`, `pub(crate)`, or `pub`
+    only when an actual external consumer requires it.
+
+    ```rust
+    // Good — restricted to the parent module
+    pub(super) static I8042_CONTROLLER:
+        Once<SpinLock<I8042Controller, LocalIrqDisabled>> = Once::new();
+
+    pub(super) fn init() -> Result<(), I8042ControllerError> {
+        // ...
+    }
+
+    // Bad — unnecessarily wide
+    pub static I8042_CONTROLLER: ...
+    ```
+
+    Inside the `aster-kernel` crate, `pub(crate)` and `pub` are equivalent,
+    as the crate has no downstream consumers.
+    Prefer the shorter `pub`.
+
+    See also:
+    PR [#2951](https://github.com/asterinas/asterinas/pull/2951),
+    [#2605](https://github.com/asterinas/asterinas/pull/2605#discussion_r2720506912),
+    and [#3154](https://github.com/asterinas/asterinas/pull/3154#discussion_r3100905375).
+
+    ### Qualify function calls with the parent module (`qualified-fn-imports`) {#qualified-fn-imports}
+
+    When importing a free function or a static/constant
+    from another module,
+    import the **parent module** and access the item
+    through it (`module::function()`, `module::CONSTANT`).
+    Do not import free functions or statics directly by name.
+
+    This convention is recommended by
+    [*The Rust Programming Language*](https://doc.rust-lang.org/book/ch07-04-bringing-paths-into-scope-with-the-use-keyword.html)
+    and followed by the Rust compiler codebase.
+    It serves two purposes:
+
+    1. The call site makes it clear
+    that an imported item is being used,
+    not a local one.
+    2. The module name provides context
+    that complements the item name.
+
+    ```rust
+    // Good — module-qualified function call
+    use ostd::irq;
+
+    let guard = irq::disable_local();
+
+    // Good — module-qualified static access
+    use ostd::mm::kspace;
+
+    let base = kspace::LINEAR_MAPPING_BASE_VADDR;
+
+    // Bad — bare function name; unclear origin at call site
+    use ostd::irq::disable_local;
+
+    let guard = disable_local();
+
+    // Bad — bare static name; could be mistaken for a local constant
+    use ostd::mm::kspace::LINEAR_MAPPING_BASE_VADDR;
+
+    let base = LINEAR_MAPPING_BASE_VADDR;
+    ```
+
+    This guideline applies to **free functions and statics/constants**.
+    Types, traits, and enum variants
+    should still be imported directly by name,
+    following the standard Rust convention.
+
+
+    --- guideline subpage (book/src/to-contribute/coding-guidelines/for-maintainability/rust-specific/types-and-traits.md) ---
+
+    # Types & Traits
+
+    ### Use types to enforce invariants (`rust-type-invariants`) {#rust-type-invariants}
+
+    Leverage the type system
+    to make illegal states _unrepresentable_.
+
+    Define newtypes to encode domain constraints.
+
+    ```rust
+    // Good — a `Nice` value is guaranteed to be valid
+    pub struct Nice(NiceValue);
+    type NiceValue = RangedI8<-20, 19>;
+
+    // Bad — `i8` admits invalid values for nice levels
+    pub type Nice = i8;
+    ```
+
+    Prefer enums over bare integers and boolean flags.
+
+    ```rust
+    // Good — access mode is constrained by the enum
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum AccessMode {
+        O_RDONLY = 0,
+        O_WRONLY = 1,
+        O_RDWR = 2,
+    }
+
+    // Bad — `u8` admits invalid values
+    pub type AccessMode = u8;
+    ```
+
+    Encode invariants in generic parameters where needed.
+
+    ```rust
+    impl IoMem<Sensitive> {
+        // Good — only unsafe code can write to sensitive MMIO
+        pub unsafe fn write_u32(&self, offset: usize, new_val: u32) { /* .. */ }
+    }
+
+    impl IoMem<Insensitive> {
+        // Good — safe code can write to insensitive MMIO
+        pub fn write_u32(&self, offset: usize, new_val: u32) { /* .. */ }
+    }
+
+    pub enum Sensitive {}
+    pub enum Insensitive {}
+    ```
+
+    Asterinas uses this pattern widely,
+    for example with newtypes such as `CpuId`
+    and `AlignedUsize<const N: u16>`.
+
+    See also:
+    PR [#2265](https://github.com/asterinas/asterinas/pull/2265#discussion_r2266214191)
+    and [#2514](https://github.com/asterinas/asterinas/pull/2514).
+
+    ### Prefer enum over trait objects for closed sets (`enum-over-dyn`) {#enum-over-dyn}
+
+    When the set of variants is known and closed,
+    an enum is often preferable to `Box<dyn Trait>`
+    for both performance and pattern-matching expressiveness.
+
+    ```rust
+    // Good — closed set modeled as an enum
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TermStatus {
+        Exited(u8),
+        Killed(SigNum),
+    }
+    ```
+
+    ### Encapsulate fields behind getters (`getter-encapsulation`) {#getter-encapsulation}
+
+    Do not make fields public
+    when a simple getter method would do.
+    A getter preserves naming flexibility
+    and leaves room for future invariants.
+
+    ```rust
+    // Good — field is private, accessed via getter
+    pub struct Vma {
+        perms: VmPerms,
+    }
+
+    impl Vma {
+        pub fn perms(&self) -> VmPerms {
+            self.perms
+        }
+    }
+
+    // Bad — public field exposes representation
+    pub struct Vma {
+        pub perms: VmPerms,
+    }
+    ```
+
+
+    --- guideline subpage (book/src/to-contribute/coding-guidelines/for-maintainability/rust-specific/functions-and-methods.md) ---
+
+    # Functions & Methods
+
+    ### Avoid boolean arguments (`no-bool-args`) {#no-bool-args}
+
+    A boolean parameter that selects between
+    two behaviors signals the function does two things.
+    Split it into two functions
+    or use a typed enum.
+
+    ```rust
+    // Good — two separate functions
+    fn read(&self, buf: &mut [u8]) -> Result<usize> { ... }
+    fn read_nonblocking(&self, buf: &mut [u8]) -> Result<usize> { ... }
+
+    // Good — typed enum
+    enum ReadMode { Blocking, NonBlocking }
+    fn read(&self, buf: &mut [u8], mode: ReadMode) -> Result<usize> { ... }
+
+    // Bad — boolean argument
+    fn read(&self, buf: &mut [u8], blocking: bool) -> Result<usize> { ... }
+    ```
+
+    See also:
+    _Clean Code_, Chapter 3 "Flag Arguments".
+
+    ### Use block expressions to scope temporary state (`block-expressions`) {#block-expressions}
+
+    Use block expressions
+    when temporary variables are only needed
+    to produce one final value.
+    This keeps temporary state local
+    and avoids leaking one-off names into outer scope.
+
+    ```rust
+    // Good — intermediate values are scoped to the block
+    let socket_addr = {
+        let bytes = read_bytes_from_user(addr, len as usize)?;
+        parse_socket_addr(&bytes)?
+    };
+    connect(socket_addr)?;
+
+    // Bad — temporary variables leak into outer scope
+    let bytes = read_bytes_from_user(addr, len as usize)?;
+    let socket_addr = parse_socket_addr(&bytes)?;
+    connect(socket_addr)?;
+    ```
+
+    ### Minimize nesting (`minimize-nesting`) {#minimize-nesting}
+
+    Minimize nesting depth.
+    Code nested more than three levels deep
+    should be reviewed for refactoring opportunities.
+    Each nesting level multiplies the reader's cognitive load.
+
+    Techniques for flattening nesting:
+    - Early returns and guard clauses for error paths.
+    - `let...else` to collapse `if let` chains.
+    - The `?` operator for error propagation.
+    - `continue` to skip loop iterations.
+    - Extracting the nested body into a helper function.
+
+    The normal/expected code path
+    should be the first visible path;
+    error and edge cases
+    should be handled and dismissed early.
+
+    ```rust
+    pub(crate) fn init() {
+        let Some(framebuffer_arg) = boot_info().framebuffer_arg else {
+            warn!("Framebuffer not found");
+            return;
+        };
+        // ... main logic at the top level
+    }
+    ```
+
+    See also:
+    PR [#2877](https://github.com/asterinas/asterinas/pull/2877#discussion_r2685861741).
+
+    ### Introduce explaining variables (`explain-variables`) {#explain-variables}
+
+    Break down complex expressions
+    by assigning intermediate results to well-named variables.
+    An explaining variable turns an opaque expression
+    into self-documenting code:
+
+    ```rust
+    // Good — intent is clear
+    let is_page_aligned = addr % PAGE_SIZE == 0;
+    let is_within_range = addr < max_addr;
+    debug_assert!(is_page_aligned && is_within_range);
+
+    // Bad — reader must parse the whole expression
+    debug_assert!(addr % PAGE_SIZE == 0 && addr < max_addr);
+    ```
+
+    See also:
+    _The Art of Readable Code_, Chapter 8 "Breaking Down Giant Expressions";
+    PR [#2083](https://github.com/asterinas/asterinas/pull/2083#discussion_r2512772091)
+    and [#643](https://github.com/asterinas/asterinas/pull/643#discussion_r1497243812).
+
+
+    --- guideline subpage (book/src/to-contribute/coding-guidelines/for-maintainability/rust-specific/attributes-and-macros.md) ---
+
+    # Attributes & Macros
+
+    ### Use `#[expect(dead_code)]` with restraint (`expect-dead-code`) {#expect-dead-code}
+
+    In general, dead code should be avoided because
+    _(i)_ it introduces unnecessary maintenance overhead, and
+    _(ii)_ its correctness can only be guaranteed
+    by manual and error-prone review.
+
+    Dead code is acceptable only when all of these hold:
+
+    1. A _concrete case_ will be implemented in the future
+    that turns the dead code into used code.
+    2. The semantics are _clear_ enough,
+    even without the use case.
+    3. The dead code is _simple_ enough
+    that both the committer and the reviewer
+    can be confident it is correct without testing.
+    4. It serves as a counterpart to existing non-dead code.
+
+    For example, it is fine to add ABI constants
+    that are unused because the corresponding feature
+    is partially implemented.
+
+    See also:
+    [Rust Reference: Diagnostic attributes](https://doc.rust-lang.org/reference/attributes/diagnostics.html)
+    and rustc [`unfulfilled_lint_expectations`](https://doc.rust-lang.org/rustc/lints/listing/warn-by-default.html#unfulfilled-lint-expectations).
+
+    ### Sort attributes and derive traits alphabetically (`alphabetical-attrs`) {#alphabetical-attrs}
+
+    When an item carries multiple outer attributes,
+    list non-derive attributes in **alphabetical order** by name
+    and place `#[derive(...)]` **last**.
+    Within `#[derive(...)]`,
+    list the traits **alphabetically** as well.
+
+    ```rust
+    // Good — non-derive attributes sorted; derive is last with sorted traits
+    #[cfg(feature = "alloc")]
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Pod)]
+    pub struct Foo { ... }
+
+    // Bad — arbitrary ordering
+    #[derive(Debug, Default, Clone, Copy, Pod)]
+    #[cfg(feature = "alloc")]
+    #[repr(C)]
+    pub struct Foo { ... }
+    ```
+
+    Placing `#[derive(...)]` last ensures
+    that derive macros always see the item
+    after all attribute macros
+    (e.g., `#[padding_struct]`, `#[pod_union]`)
+    have transformed it.
+    Derive helper attributes
+    (e.g., `#[serde(...)]`, `#[clap(...)]`)
+    stay immediately after `#[derive(...)]`.
+    Sorting the remaining attributes alphabetically
+    eliminates hesitation over placement
+    and reduces noise in diffs.
+
+    See also:
+    PR [#3080](https://github.com/asterinas/asterinas/pull/3080#discussion_r3031834321)
+    (motivating discussion)
+    and PR [#2898](https://github.com/asterinas/asterinas/pull/2898#discussion_r2763969731)
+    (earlier ad-hoc ordering choice).
+
+    ### Suppress lints at the narrowest scope (`narrow-lint-suppression`) {#narrow-lint-suppression}
+
+    When suppressing lints,
+    the suppression should affect as little scope as possible.
+    This makes readers aware
+    of the exact places where the lint is generated
+    and makes it easier for subsequent committers
+    to maintain the suppression.
+
+    ```rust
+    // Good — each method is individually marked
+    trait SomeTrait {
+        #[expect(dead_code)]
+        fn foo();
+
+        #[expect(dead_code)]
+        fn bar();
+
+        fn baz();
+    }
+
+    // Bad — the entire trait is suppressed
+    #[expect(dead_code)]
+    trait SomeTrait { ... }
+    ```
+
+    There is one exception:
+    if it is clear enough
+    that every member will trigger the lint,
+    it is reasonable to expect the lint at the type level.
+
+    ```rust
+    #[expect(non_camel_case_types)]
+    enum SomeEnum {
+        FOO_ABC,
+        BAR_DEF,
+    }
+    ```
+
+    See also:
+    [Clippy `allow_attributes`](https://rust-lang.github.io/rust-clippy/master/#allow_attributes),
+    [Clippy `allow_attributes_without_reason`](https://rust-lang.github.io/rust-clippy/master/#allow_attributes_without_reason),
+    and rustc [`unfulfilled_lint_expectations`](https://doc.rust-lang.org/rustc/lints/listing/warn-by-default.html#unfulfilled-lint-expectations).
+
+    ### Prefer functions over macros (`macros-as-last-resort`) {#macros-as-last-resort}
+
+    Prefer functions and generics over macros.
+    Macros are powerful
+    but harder to understand, debug, test, and format.
+    Reach for a macro only when
+    the type system or generics cannot express
+    what you need
+    (e.g., variadic arguments, compile-time code generation,
+    or DSL syntax).
+
+    ```rust
+    // Good — a generic function covers all types
+    fn align_up<T: Into<usize>>(val: T, align: usize) -> usize {
+        let val = val.into();
+        (val + align - 1) & !(align - 1)
+    }
+
+    // Bad — a macro where a function would suffice
+    macro_rules! align_up {
+        ($val:expr, $align:expr) => {
+            ($val + $align - 1) & !($align - 1)
+        };
+    }
+    ```
+
+    See also:
+    _The Rust Programming Language_, Chapter 20.5 "Macros";
+    [Rust by Example: Macros](https://doc.rust-lang.org/rust-by-example/macros.html).
+
+
+    --- guideline subpage (book/src/to-contribute/coding-guidelines/for-maintainability/rust-specific/comments.md) ---
+
+    # Comments
+
+    ### Follow RFC 1574 summary line conventions (`rfc1574-summary`) {#rfc1574-summary}
+
+    The first line of a doc comment should be concise and one sentence.
+    Its grammatical form depends on what the item is:
+
+    - **Functions and methods** — third-person singular present indicative verb
+    ("Returns", "Creates", "Acquires"), describing the action performed.
+    - **Types (structs, enums, traits, type aliases), modules, and fields** —
+    a noun phrase naming the thing, not describing an action.
+    This matches the Rust standard library convention
+    (e.g., `Vec` is "A contiguous growable array type").
+
+    ```rust
+    /// Returns the mapping's start address.
+    pub fn map_to_addr(&self) -> Vaddr {
+        self.map_to_addr
+    }
+
+    /// A policy for how [`FsPath::from_fd_at`] treats an empty `path_str`.
+    pub enum EmptyPathStr { /* ... */ }
+
+    /// A guard that releases a [`SpinLock`] when dropped.
+    pub struct SpinLockGuard<'a, T> { /* ... */ }
+    ```
+
+    ### End sentence comments with punctuation (`comment-punctuation`) {#comment-punctuation}
+
+    If a comment line is a full sentence,
+    end it with proper punctuation.
+    This improves readability in dense code
+    and avoids fragmented prose.
+
+    ```rust
+    // Good — complete sentence with punctuation.
+    // SAFETY: The pointer is derived from a live allocation.
+
+    // Bad — complete sentence without punctuation
+    // SAFETY: The pointer is derived from a live allocation
+    ```
+
+    ### Wrap identifiers in backticks (`backtick-identifiers`) {#backtick-identifiers}
+
+    Type names, method names,
+    and code identifiers in doc comments
+    should be wrapped in backticks for rustdoc rendering.
+    When referring to types,
+    prefer rustdoc links (`[TypeName]`) where possible.
+
+    ```rust
+    /// Acquires the [`SpinLock`] and returns a guard
+    /// that releases the lock on [`Drop`].
+    ///
+    /// Callers must not call `acquire` while holding
+    /// a [`RwMutex`] to avoid deadlock.
+    pub fn acquire(&self) -> SpinLockGuard<'_, T> { ... }
+    ```
+
+    ### Do not disclose implementation details in doc comments (`no-impl-in-docs`) {#no-impl-in-docs}
+
+    Doc comments should describe _what_ the API does
+    and _how to use it_,
+    not _how it is implemented internally_.
+
+    ```rust
+    // Good — behavior-oriented
+    /// Returns the number of active connections.
+
+    // Bad — leaks implementation details
+    /// Returns the length of the internal `HashMap`
+    /// that tracks connections by socket address.
+    ```
+
+    ===== REVIEW INPUT =====
+
+
+    ===== commit 3749ab332 =====
+
+    [commit message]
+    Make tmpfs visible to statfs-based filesystem probes
+
+    [changes]
+
+
+    diff --git a/kernel/src/fs/fs_impls/tmpfs/fs.rs b/kernel/src/fs/fs_impls/tmpfs/fs.rs
+    index f6547a8b5..baa4deb39 100644
+    --- a/kernel/src/fs/fs_impls/tmpfs/fs.rs
+    +++ b/kernel/src/fs/fs_impls/tmpfs/fs.rs
+    @@ -1,5 +1,6 @@
+    // SPDX-License-Identifier: MPL-2.0
+    
+    +use super::TMPFS_MAGIC;
+    use crate::{
+        fs::{
+            ramfs::RamFs,
+    @@ -44,7 +45,20 @@ impl FileSystem for TmpFs {
+        }
+    
+        fn sb(&self) -> SuperBlock {
+    -        self.inner.sb()
+    +        // TODO: Tmpfs currently wraps RamFs, whose inodes still point to the
+    +        // inner RamFs. Override statfs-visible fields here as a workaround
+    +        // rather than changing the semantics of ordinary RamFs instances.
+    +        let mut sb = self.inner.sb();
+    +        let max_blocks = default_max_blocks();
+    +        let max_inodes = default_max_inodes();
+    +
+    +        sb.magic = TMPFS_MAGIC;
+    +        sb.blocks = max_blocks;
+    +        sb.bfree = max_blocks;
+    +        sb.bavail = max_blocks;
+    +        sb.files = max_inodes;
+    +        sb.ffree = max_inodes;
+    +        sb
+        }
+    
+        fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
+    @@ -52,6 +66,14 @@ impl FileSystem for TmpFs {
+        }
+    }
+    
+    +fn default_max_blocks() -> usize {
+    +    crate::vm::mem_total() / PAGE_SIZE / 2
+    +}
+    +
+    +fn default_max_inodes() -> usize {
+    +    crate::vm::mem_total() / PAGE_SIZE / 2
+    +}
+    +
+    pub(super) struct TmpFsType;
+    
+    impl FsType for TmpFsType {
+    diff --git a/kernel/src/fs/fs_impls/tmpfs/mod.rs b/kernel/src/fs/fs_impls/tmpfs/mod.rs
+    index dc5b7a3b0..fa41d029e 100644
+    --- a/kernel/src/fs/fs_impls/tmpfs/mod.rs
+    +++ b/kernel/src/fs/fs_impls/tmpfs/mod.rs
+    @@ -7,7 +7,6 @@ use fs::TmpFsType;
+    
+    mod fs;
+    
+    -#[expect(dead_code)]
+    const TMPFS_MAGIC: u64 = 0x0102_1994;
+    
+    pub(super) fn init() {
+    diff --git a/kernel/src/fs/vfs/path/mod.rs b/kernel/src/fs/vfs/path/mod.rs
+    index 0aeb3a000..5bc0be5e7 100644
+    --- a/kernel/src/fs/vfs/path/mod.rs
+    +++ b/kernel/src/fs/vfs/path/mod.rs
+    @@ -100,6 +100,11 @@ impl Path {
+            &self.dentry
+        }
+    
+    +    // Gets the file system of current `Path`.
+    +    pub fn fs(&self) -> &Arc<dyn FileSystem> {
+    +        self.mount.fs()
+    +    }
+    +
+        /// Returns true if the current `Path` is the root of its mount.
+        pub fn is_mount_root(&self) -> bool {
+            Arc::ptr_eq(&self.dentry, self.mount.root_dentry())
+    @@ -537,7 +542,6 @@ impl Path {
+    // Methods inherited from `Inode`.
+    #[inherit_methods(from = "self.inode()")]
+    impl Path {
+    -    pub fn fs(&self) -> Arc<dyn FileSystem>;
+        pub fn sync_all(&self) -> Result<()>;
+        pub fn sync_data(&self) -> Result<()>;
+        pub fn metadata(&self) -> Metadata;
+    diff --git a/kernel/src/syscall/statfs.rs b/kernel/src/syscall/statfs.rs
+    index d5d140921..dc3544a75 100644
+    --- a/kernel/src/syscall/statfs.rs
+    +++ b/kernel/src/syscall/statfs.rs
+    @@ -20,7 +20,7 @@ pub fn sys_statfs(path_ptr: Vaddr, statfs_buf_ptr: Vaddr, ctx: &Context) -> Resu
+            path_name, statfs_buf_ptr,
+        );
+    
+    -    let fs = {
+    +    let sb = {
+            let path_name = path_name.to_string_lossy();
+            let fs_path = FsPath::try_from(path_name.as_ref())?;
+            let path = ctx
+    @@ -29,10 +29,10 @@ pub fn sys_statfs(path_ptr: Vaddr, statfs_buf_ptr: Vaddr, ctx: &Context) -> Resu
+                .resolver()
+                .read()
+                .lookup(&fs_path)?;
+    -        path.fs()
+    +        path.fs().sb()
+        };
+    
+    -    let statfs = Statfs::from(fs.sb());
+    +    let statfs = Statfs::from(sb);
+        user_space.write_val(statfs_buf_ptr, &statfs)?;
+        Ok(SyscallReturn::Return(0))
+    }
+    @@ -47,13 +47,13 @@ pub fn sys_fstatfs(
+            raw_fd, statfs_buf_ptr
+        );
+    
+    -    let fs = {
+    +    let sb = {
+            let mut file_table = ctx.thread_local.borrow_file_table_mut();
+            let file = get_file_fast!(&mut file_table, raw_fd.try_into()?);
+    -        file.path().fs()
+    +        file.path().fs().sb()
+        };
+    
+    -    let statfs = Statfs::from(fs.sb());
+    +    let statfs = Statfs::from(sb);
+        ctx.user_space().write_val(statfs_buf_ptr, &statfs)?;
+        Ok(SyscallReturn::Return(0))
+    }
+
+    warning: Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.
+    codex
+    Using the `aster-code-review` skill for this maintainability-only review.
+    exec
+    /bin/bash -lc "sed -n '1,240p' .agents/skills/aster-code-review/SKILL.md" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0009/scratch/work/wt1
+    succeeded in 0ms:
+    ---
+    name: aster-code-review
+    description: Review code against Asterinas's persona-keyed coding guidelines and write a Markdown review file. Use when asked to review a Git change (diff mode) or a set of target files (files mode) for defects, or inside a write-test-review loop.
+    ---
+
+    # aster-code-review
+
+    Review code against Asterinas's coding guidelines
+    — the persona-keyed pages under `book/src/to-contribute/coding-guidelines/`
+    — and write one Markdown review file.
+    The review is **recall-first**: miss as few real defects as possible.
+    It makes both objective calls (undeniable bugs) and subjective calls (guideline violations, each grounded in a cited rule).
+
+    There are two review modes, both **anchored at the current checkout (HEAD)**:
+
+    - **`diff <base>`** — a Git change:
+    the **commit series** the branch adds over its merge-base with `<base>`
+    — each commit's message *and* its diff,
+    so the review covers per-commit intent and commit hygiene, not just the net change.
+    (Commit first; uncommitted edits are not reviewed in diff mode.)
+    - **`files <path[:lines] ...>`**
+    — target code: the working-tree contents of the named files,
+    optionally narrowed to line ranges.
+
+    To review at a specific commit, check it out first (it becomes HEAD).
+
+    This skill is agent-agnostic (Claude Code and Codex).
+    Only step 3's spawn primitive differs between agents;
+    everything else is identical.
+
+    ## Interface
+
+    However the skill is triggered,
+    it receives ONE raw argument string that begins with a mode word:
+
+    ```
+    diff   <base>              <output> [--overwrite] [--per-persona-context=auto|yes|no]
+    files  <path[:lines] ...>  <output> [--overwrite] [--per-persona-context=auto|yes|no]
+    ```
+
+    - `<base>` (diff) — **required**,
+    any ref or SHA;
+    reviews the commit series `merge-base(<base>, HEAD)..HEAD` (each commit's message + diff).
+    - `<path[:lines] ...>` (files) — **required**, one or more targets in the working tree.
+    A target is a path, optionally `path:N-M` or `path:N-M,K-L` (1-based, inclusive);
+    repeat a path to add ranges.
+    Wrap a path in double quotes to allow spaces or colons (`"a: b.rs":10-20`).
+    - `<output>` — **required, last positional** (`cp src... dest` style);
+    refuse to overwrite unless `--overwrite`.
+    - `--overwrite` — replace the output file if it already exists.
+    - `--per-persona-context` — `yes`: fan out one isolated agent per persona (best recall).
+    `no`: one combined agent reviews all personas (cheaper, lower recall).
+    `auto` (default) currently resolves to `yes`;
+    it will become a benchmark-driven heuristic.
+    Controls step 3 only.
+
+    **Do not pre-split the argument string yourself.**
+    Pass it verbatim, as a single quoted argument,
+    to `resolve_target.sh` (step 1)
+    — the script self-tokenizes (whitespace-split except inside double quotes),
+    which keeps the parse deterministic and identical across agents.
+
+    ## Pipeline
+
+    Run these steps in order.
+    Steps 1 and 5 are deterministic scripts;
+    steps 6–8 use the model.
+
+    The helper scripts live in the skill's own `scripts/` directory,
+    at `.agents/skills/aster-code-review/scripts/` inside the repository under review.
+    **Invoke every script by its absolute path**
+    — the working directory is the code under review (the repo root), *not* the skill directory,
+    so a bare `scripts/…` is not found (notably on Codex, which runs commands from the repo root; do not `cd` into the skill dir either — `resolve_target.sh` needs the repo as its cwd).
+    Shells do not persist between commands,
+    so **set `SKILL` at the start of each command that uses it** (or inline the `$(git rev-parse …)`):
+
+    ```sh
+    SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/resolve_target.sh" '<raw args>'
+    ```
+
+    The steps below write `$SKILL/scripts/…` as shorthand for that absolute path.
+
+    1. **Resolve the target.**
+    `"$SKILL/scripts/resolve_target.sh" '<raw args>'` prints the canonical review input
+    — the commit series (each commit's message + diff) in `diff` mode,
+    annotated file excerpts in `files` mode;
+    save it to a temp file.
+    Run it again with `--meta` first (`"$SKILL/scripts/resolve_target.sh" --meta '<raw args>'`) to get
+    `mode=`, `base=`/`files=`, `head=`, `branch=`, `output=`, `overwrite=`, `per_persona_context=`;
+    add `date=` (today) and an optional `title=` to make the meta file.
+    Pass the raw argument string as a single quoted argument
+    so the script's tokenizer sees it intact.
+    2. **Activate personas.**
+    Pick which of the five personas run,
+    from the reviewed paths — changed paths in `diff` mode,
+    named paths in `files` mode (see *Activation*).
+    3. **Fan out.**
+    Spawn the persona passes (see *Spawning*).
+    With `per_persona_context` = `yes` or `auto` (the default),
+    run **one isolated PASS per activated persona** — best recall.
+    With `no`, run **one combined PASS** over all activated personas in a single context
+    — cheaper, lower recall.
+    Build each pass's prompt deterministically with `"$SKILL/scripts/build_pass_prompt.sh" <input-file> <persona>...`
+    — one persona for fan-out, all activated personas for combined
+    — and spawn the sub-agent with **that exact text**.
+    Each pass returns a JSON array of comments;
+    file each under its persona's `<fragdir>/<persona>.json` (the comment's `persona` field says which),
+    so step 5 is unchanged.
+    4. **Collect** the per-persona JSON fragments.
+    5. **Assemble.**
+    `"$SKILL/scripts/assemble_review.sh" [--overwrite] <meta> <fragdir> <output>` performs the deterministic merge (group by persona in fixed order, sort by file→line, drop exact duplicates *within a persona*, write frontmatter, leave a `<!-- SUMMARY -->` placeholder).
+    Pass `--overwrite` only if the user gave it;
+    otherwise the script refuses to clobber an existing `<output>`.
+    6. **Verify** (see *Verification*).
+    7. **Consolidate** (see *Consolidation*).
+    8. **Summary.**
+    Replace `<!-- SUMMARY -->` with a constructive summary over the final comments:
+    what the code does well, the top issues ranked by severity,
+    any structural recommendations.
+
+    ## Activation
+
+    A persona runs unless the reviewed paths *provably* contain nothing in its remit (reviewed paths = changed paths in `diff` mode, named paths in `files` mode):
+
+    - **maintainability, development, security** — any reviewed code.
+    - **hardware** — a reviewed path is assembly (`*.S`, `*.asm`),
+    an architecture directory (`.../arch/...`), or contains `asm!` / `global_asm!`.
+    - **documentation** — a reviewed path is `book/`, any `*.md`,
+    syscall-coverage files (`*.scml`), or a user-facing API surface (a syscall or kernel parameter).
+
+    Activation is path-based and deterministic;
+    do not use a model to triage (a wrongly-skipped persona is a silent recall hole).
+
+    ## Pass contract
+
+    The shared reviewer contract
+    — the review methodology and the JSON comment schema every pass must follow
+    — lives in [`scripts/pass_contract.md`](scripts/pass_contract.md),
+    inlined as the **stable head** of every pass prompt by `build_pass_prompt.sh` (step 3).
+    Do not paraphrase it into the prompt yourself:
+    retyping it breaks the byte-identical prefix the prompt cache relies on (see [`execution_model.md`](spec/execution_model.md)).
+    A pass reads only the persona block(s) it is given (selective exposure),
+    reviews the **REVIEW INPUT** at the foot of the prompt,
+    and returns a JSON array of comments per that schema.
+
+    ## Spawning a pass
+
+    Build every pass prompt with `"$SKILL/scripts/build_pass_prompt.sh" <input-file> <persona>...`
+    and spawn the sub-agent with its **exact** output
+    — only a script keeps the prompt's stable head (contract + guideline) byte-identical across passes and reviews,
+    which is what lets the prompt cache reuse it (see [`execution_model.md`](spec/execution_model.md)).
+
+    **Default (`per_persona_context` = `yes`/`auto`)**
+    — one pass per activated persona,
+    each in a CLEAN context with only its own persona block (selective exposure):
+
+    - **Claude Code** — spawn a Task sub-agent per persona.
+    - **Codex** — run `codex exec "<build_pass_prompt.sh output>"` per persona
+    (pass the built PROMPT TEXT as the argument).
+
+    **Never spawn a pass by re-running `aster_code_review.sh` / `run_agent.sh`,
+    nor by re-issuing the skill's own arguments** (e.g. `codex exec … diff <base> <out>`).
+    A pass is a *reviewer* invocation whose input is the `build_pass_prompt.sh` text
+    — not another run of this skill.
+    Re-entering the launcher spawns another orchestrator that spawns another … , an infinite fork bomb;
+    the launcher now refuses it (`ACR_AGENT_RUNNING`).
+
+    Passes are independent;
+    order does not matter.
+    Collect each pass's JSON.
+
+    **Combined (`per_persona_context` = `no`)**
+    — build ONE prompt with all activated personas (`"$SKILL/scripts/build_pass_prompt.sh" <input> <p1> <p2> ...`)
+    and run a single pass;
+    it reviews through every lens at once and tags each comment with its `persona`.
+    The input and spawn overhead are paid once,
+    so it is cheaper
+    — but a larger shared context dilutes focus,
+    so it finds fewer defects.
+    The default stays fan-out:
+    recall comes first,
+    and `no` is an explicit, opt-in concession.
+
+    ## Verification (step 6)
+
+    For each comment, isolate the key premise it rests on
+    — especially an external-system fact (Linux/POSIX behaviour, the System V ABI, Rust semantics).
+    Try to **refute** it:
+    re-read the cited code and consult an authoritative source.
+    Assign a verdict:
+
+    - **confirmed** — keep the comment unchanged.
+    - **uncertain** — keep it, but prefix `problem` with `(unverified) `.
+    - **refuted** — remove the comment,
+    and append it to a `## Retracted by verification` list at the foot of the file with a one-line reason.
+
+    Remove **only** on confident refutation;
+    an unsure check is `uncertain`, not `refuted`.
+    This is the only step that may remove a comment, and only false positives.
+
+    ## Consolidation (step 7)
+
+    Find clusters of comments that share one root cause or one fix
+    (e.g. several manual lock/unlock pairs that all want RAII).
+    For each cluster, write a single unified fix
+    and repoint each member's `**Fix.**` at it ("Shared with the other `raii` comments: …").
+    **Never remove a comment**
+    — every symptom stays at its own location.
+
+    ## Output format
+
+    The assembled file is:
+    frontmatter (`date`, `mode`, `base` or `files`, `head`, `branch`, optional `title`),
+    a `# Summary`,
+    then a `## <section>` per persona in the order **Maintainability, Correctness, Security, Hardware, Documentation** (Correctness is the Development persona's section).
+    Each comment is a `### \`file\` line N` subsection:
+    a quoted ` ```diff ` snippet,
+    then a prose line `` `<grounding>` (<severity>): <problem> ``,
+    then a `**Fix.**` paragraph.
+    Do not restructure what the script emits;
+    only fill the summary and apply the verify/consolidate edits.
+
+codex
+I’m checking the changed files around the diff so the maintainability comments can anchor to the post-change code, not just the excerpt.
+exec
+/bin/bash -lc "nl -ba kernel/src/fs/fs_impls/tmpfs/mod.rs | sed -n '1,80p'" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0009/scratch/work/wt1
+ succeeded in 0ms:
+     1	// SPDX-License-Identifier: MPL-2.0
+     2	
+     3	//! Temporary file system (tmpfs) based on ramfs.
+     4	
+     5	pub(super) use fs::TmpFs;
+     6	use fs::TmpFsType;
+     7	
+     8	mod fs;
+     9	
+    10	const TMPFS_MAGIC: u64 = 0x0102_1994;
+    11	
+    12	pub(super) fn init() {
+    13	    crate::fs::vfs::registry::register(&TmpFsType).unwrap();
+    14	}
+
+exec
+/bin/bash -lc "nl -ba kernel/src/fs/fs_impls/tmpfs/fs.rs | sed -n '1,120p'" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0009/scratch/work/wt1
+ succeeded in 0ms:
+     1	// SPDX-License-Identifier: MPL-2.0
+     2	
+     3	use super::TMPFS_MAGIC;
+     4	use crate::{
+     5	    fs::{
+     6	        ramfs::RamFs,
+     7	        vfs::{
+     8	            file_system::{FileSystem, FsEventSubscriberStats, SuperBlock},
+     9	            inode::Inode,
+    10	            registry::{FsCreationCtx, FsProperties, FsType},
+    11	        },
+    12	    },
+    13	    prelude::*,
+    14	};
+    15	
+    16	/// The temporary file system (tmpfs) structure.
+    17	//
+    18	// TODO: Currently, tmpfs is implemented as a thin wrapper around ramfs.
+    19	// In the future we need to implement tmpfs-specific features such as
+    20	// memory limits and swap support.
+    21	pub struct TmpFs {
+    22	    inner: Arc<RamFs>,
+    23	}
+    24	
+    25	impl TmpFs {
+    26	    pub fn new() -> Arc<Self> {
+    27	        Arc::new(TmpFs {
+    28	            inner: RamFs::new(),
+    29	        })
+    30	    }
+    31	}
+    32	
+    33	impl FileSystem for TmpFs {
+    34	    fn name(&self) -> &'static str {
+    35	        "tmpfs"
+    36	    }
+    37	
+    38	    fn sync(&self) -> Result<()> {
+    39	        // do nothing
+    40	        Ok(())
+    41	    }
+    42	
+    43	    fn root_inode(&self) -> Arc<dyn Inode> {
+    44	        self.inner.root_inode()
+    45	    }
+    46	
+    47	    fn sb(&self) -> SuperBlock {
+    48	        // TODO: Tmpfs currently wraps RamFs, whose inodes still point to the
+    49	        // inner RamFs. Override statfs-visible fields here as a workaround
+    50	        // rather than changing the semantics of ordinary RamFs instances.
+    51	        let mut sb = self.inner.sb();
+    52	        let max_blocks = default_max_blocks();
+    53	        let max_inodes = default_max_inodes();
+    54	
+    55	        sb.magic = TMPFS_MAGIC;
+    56	        sb.blocks = max_blocks;
+    57	        sb.bfree = max_blocks;
+    58	        sb.bavail = max_blocks;
+    59	        sb.files = max_inodes;
+    60	        sb.ffree = max_inodes;
+    61	        sb
+    62	    }
+    63	
+    64	    fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
+    65	        self.inner.fs_event_subscriber_stats()
+    66	    }
+    67	}
+    68	
+    69	fn default_max_blocks() -> usize {
+    70	    crate::vm::mem_total() / PAGE_SIZE / 2
+    71	}
+    72	
+    73	fn default_max_inodes() -> usize {
+    74	    crate::vm::mem_total() / PAGE_SIZE / 2
+    75	}
+    76	
+    77	pub(super) struct TmpFsType;
+    78	
+    79	impl FsType for TmpFsType {
+    80	    fn name(&self) -> &'static str {
+    81	        "tmpfs"
+    82	    }
+    83	
+    84	    fn properties(&self) -> FsProperties {
+    85	        FsProperties::empty()
+    86	    }
+    87	
+    88	    fn create(&self, _fs_creation_ctx: &FsCreationCtx) -> Result<Arc<dyn FileSystem>> {
+    89	        Ok(TmpFs::new())
+    90	    }
+    91	
+    92	    fn sysnode(&self) -> Option<Arc<dyn aster_systree::SysNode>> {
+    93	        None
+    94	    }
+    95	}
+
+exec
+/bin/bash -lc "nl -ba kernel/src/syscall/statfs.rs | sed -n '1,90p'" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0009/scratch/work/wt1
+ succeeded in 0ms:
+     1	// SPDX-License-Identifier: MPL-2.0
+     2	
+     3	use ostd::mm::VmIo;
+     4	
+     5	use super::SyscallReturn;
+     6	use crate::{
+     7	    fs::{
+     8	        file::file_table::{RawFileDesc, get_file_fast},
+     9	        utils::PATH_MAX,
+    10	        vfs::{file_system::SuperBlock, path::FsPath},
+    11	    },
+    12	    prelude::*,
+    13	};
+    14	
+    15	pub fn sys_statfs(path_ptr: Vaddr, statfs_buf_ptr: Vaddr, ctx: &Context) -> Result<SyscallReturn> {
+    16	    let user_space = ctx.user_space();
+    17	    let path_name = user_space.read_cstring(path_ptr, PATH_MAX)?;
+    18	    debug!(
+    19	        "path = {:?}, statfs_buf_ptr = 0x{:x}",
+    20	        path_name, statfs_buf_ptr,
+    21	    );
+    22	
+    23	    let sb = {
+    24	        let path_name = path_name.to_string_lossy();
+    25	        let fs_path = FsPath::try_from(path_name.as_ref())?;
+    26	        let path = ctx
+    27	            .thread_local
+    28	            .borrow_fs()
+    29	            .resolver()
+    30	            .read()
+    31	            .lookup(&fs_path)?;
+    32	        path.fs().sb()
+    33	    };
+    34	
+    35	    let statfs = Statfs::from(sb);
+    36	    user_space.write_val(statfs_buf_ptr, &statfs)?;
+    37	    Ok(SyscallReturn::Return(0))
+    38	}
+    39	
+    40	pub fn sys_fstatfs(
+    41	    raw_fd: RawFileDesc,
+    42	    statfs_buf_ptr: Vaddr,
+    43	    ctx: &Context,
+    44	) -> Result<SyscallReturn> {
+    45	    debug!(
+    46	        "raw_fd = {}, statfs_buf_addr = 0x{:x}",
+    47	        raw_fd, statfs_buf_ptr
+    48	    );
+    49	
+    50	    let sb = {
+    51	        let mut file_table = ctx.thread_local.borrow_file_table_mut();
+    52	        let file = get_file_fast!(&mut file_table, raw_fd.try_into()?);
+    53	        file.path().fs().sb()
+    54	    };
+    55	
+    56	    let statfs = Statfs::from(sb);
+    57	    ctx.user_space().write_val(statfs_buf_ptr, &statfs)?;
+    58	    Ok(SyscallReturn::Return(0))
+    59	}
+    60	
+    61	/// FS Stat
+    62	#[repr(C)]
+    63	#[derive(Clone, Copy, Debug, Default, Pod)]
+    64	struct Statfs {
+    65	    /// Type of filesystem
+    66	    f_type: u64,
+    67	    /// Optimal transfer block size
+    68	    f_bsize: usize,
+    69	    /// Total data blocks in filesystem
+    70	    f_blocks: usize,
+    71	    /// Free blocks in filesystem
+    72	    f_bfree: usize,
+    73	    /// Free blocks available to unprivileged user
+    74	    f_bavail: usize,
+    75	    /// Total inodes in filesystem
+    76	    f_files: usize,
+    77	    /// Free inodes in filesystem
+    78	    f_ffree: usize,
+    79	    /// Filesystem ID
+    80	    f_fsid: u64,
+    81	    /// Maximum length of filenames
+    82	    f_namelen: usize,
+    83	    /// Fragment size
+    84	    f_frsize: usize,
+    85	    /// Mount flags of filesystem
+    86	    f_flags: u64,
+    87	    /// Padding bytes reserved for future use
+    88	    f_spare: [u64; 4],
+    89	}
+    90	
+
+exec
+/bin/bash -lc "nl -ba kernel/src/fs/vfs/path/mod.rs | sed -n '80,125p'" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0009/scratch/work/wt1
+ succeeded in 0ms:
+    80	    pub(in crate::fs) fn new_pseudo(
+    81	        mount: Arc<Mount>,
+    82	        inode: Arc<dyn Inode>,
+    83	        name_fn: fn(&dyn Inode) -> String,
+    84	    ) -> Self {
+    85	        let dentry = Dentry::new_pseudo(inode, name_fn);
+    86	        Self::new(mount, dentry)
+    87	    }
+    88	
+    89	    pub(in crate::fs) fn new(mount: Arc<Mount>, dentry: Arc<Dentry>) -> Self {
+    90	        Self { mount, dentry }
+    91	    }
+    92	
+    93	    /// Gets the mount node of current `Path`.
+    94	    pub fn mount_node(&self) -> &Arc<Mount> {
+    95	        &self.mount
+    96	    }
+    97	
+    98	    /// Gets the dentry of current `Path`.
+    99	    pub(in crate::fs) fn dentry(&self) -> &Arc<Dentry> {
+   100	        &self.dentry
+   101	    }
+   102	
+   103	    // Gets the file system of current `Path`.
+   104	    pub fn fs(&self) -> &Arc<dyn FileSystem> {
+   105	        self.mount.fs()
+   106	    }
+   107	
+   108	    /// Returns true if the current `Path` is the root of its mount.
+   109	    pub fn is_mount_root(&self) -> bool {
+   110	        Arc::ptr_eq(&self.dentry, self.mount.root_dentry())
+   111	    }
+   112	
+   113	    /// Opens the `Path` with the given `OpenArgs`.
+   114	    ///
+   115	    /// Returns an `InodeHandle` on success.
+   116	    pub fn open(&self, open_args: OpenArgs) -> Result<InodeHandle> {
+   117	        let inode = self.inode().as_ref();
+   118	        let inode_type = inode.type_();
+   119	        let creation_flags = &open_args.creation_flags;
+   120	        let status_flags = &open_args.status_flags;
+   121	
+   122	        if creation_flags.contains(CreationFlags::O_CREAT)
+   123	            && creation_flags.contains(CreationFlags::O_EXCL)
+   124	        {
+   125	            return_errno_with_message!(Errno::EEXIST, "the file already exists");
+
+codex
+The main maintainability signal so far is the new public `Path::fs` API surface. I’m checking surrounding conventions before deciding whether that is worth a review comment.
+exec
+/bin/bash -lc "rg \"fn fs\\(&self\\)\" -n kernel/src | head -50" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0009/scratch/work/wt1
+ succeeded in 0ms:
+kernel/src/fs/vfs/path/mod.rs:104:    pub fn fs(&self) -> &Arc<dyn FileSystem> {
+kernel/src/fs/vfs/path/mount.rs:552:    pub(in crate::fs) fn fs(&self) -> &Arc<dyn FileSystem> {
+kernel/src/fs/vfs/fs_apis/inode.rs:420:    fn fs(&self) -> Arc<dyn FileSystem>;
+kernel/src/fs/fs_impls/devpts/slave.rs:140:    fn fs(&self) -> Arc<dyn FileSystem> {
+kernel/src/fs/fs_impls/devpts/mod.rs:357:    fn fs(&self) -> Arc<dyn FileSystem> {
+kernel/src/fs/fs_impls/devpts/ptmx.rs:154:    fn fs(&self) -> Arc<dyn FileSystem> {
+kernel/src/fs/fs_impls/sysfs/inode.rs:95:    fn fs(&self) -> Arc<dyn FileSystem> {
+kernel/src/fs/fs_impls/overlayfs/fs.rs:217:    fn fs(&self) -> Arc<OverlayFs> {
+kernel/src/fs/fs_impls/overlayfs/fs.rs:451:    pub fn fs(&self) -> Arc<dyn FileSystem> {
+kernel/src/fs/fs_impls/overlayfs/fs.rs:1002:    fn fs(&self) -> Arc<dyn FileSystem>;
+kernel/src/fs/fs_impls/configfs/inode.rs:87:    fn fs(&self) -> Arc<dyn FileSystem> {
+kernel/src/fs/fs_impls/pseudofs/nsfs.rs:118:    fn fs(&self) -> Arc<dyn FileSystem>;
+kernel/src/fs/fs_impls/pseudofs/mod.rs:358:    fn fs(&self) -> Arc<dyn FileSystem> {
+kernel/src/fs/fs_impls/ext2/block_group.rs:304:    fn fs(&self) -> Arc<Ext2> {
+kernel/src/fs/fs_impls/ext2/xattr.rs:351:    fn fs(&self) -> Arc<Ext2> {
+kernel/src/fs/fs_impls/procfs/template/file.rs:88:    fn fs(&self) -> Arc<dyn FileSystem>;
+kernel/src/fs/fs_impls/procfs/template/sym.rs:85:    fn fs(&self) -> Arc<dyn FileSystem>;
+kernel/src/fs/fs_impls/exfat/bitmap.rs:85:    fn fs(&self) -> Arc<ExfatFs> {
+kernel/src/fs/fs_impls/exfat/fat.rs:121:    fn fs(&self) -> Arc<ExfatFs> {
+kernel/src/fs/fs_impls/ext2/inode.rs:99:    pub fn fs(&self) -> Arc<Ext2> {
+kernel/src/fs/fs_impls/ext2/inode.rs:1250:    pub fn fs(&self) -> Arc<Ext2> {
+kernel/src/fs/fs_impls/ext2/inode.rs:1965:    pub fn fs(&self) -> Arc<Ext2> {
+kernel/src/fs/fs_impls/procfs/template/mod.rs:51:    fn fs(&self) -> Arc<dyn FileSystem> {
+kernel/src/fs/pipe/anon_pipe.rs:97:    fn fs(&self) -> Arc<dyn FileSystem>;
+kernel/src/fs/fs_impls/procfs/template/dir.rs:131:    fn fs(&self) -> Arc<dyn FileSystem>;
+kernel/src/fs/fs_impls/exfat/inode.rs:235:    fn fs(&self) -> Arc<ExfatFs> {
+kernel/src/fs/fs_impls/exfat/inode.rs:1446:    fn fs(&self) -> alloc::sync::Arc<dyn FileSystem> {
+kernel/src/fs/fs_impls/ramfs/fs.rs:1228:    fn fs(&self) -> Arc<dyn FileSystem> {
+kernel/src/fs/fs_impls/cgroupfs/inode.rs:91:    fn fs(&self) -> Arc<dyn FileSystem> {
+kernel/src/fs/fs_impls/ramfs/memfd.rs:223:    fn fs(&self) -> Arc<dyn FileSystem> {
+kernel/src/fs/fs_impls/ext2/impl_for_vfs/inode.rs:237:    fn fs(&self) -> Arc<dyn FileSystem> {
+kernel/src/fs/fs_impls/ext2/indirect_block_cache.rs:131:    fn fs(&self) -> Arc<Ext2> {
+kernel/src/fs/utils/systree_inode.rs:422:    default fn fs(&self) -> Arc<dyn FileSystem> {
+
+codex
+The new method is returning the mounted filesystem instead of the inode’s filesystem, which matches the commit’s intent. I’m also checking whether that exposed accessor matches the local API style and visibility patterns.
+exec
+/bin/bash -lc "nl -ba kernel/src/fs/vfs/path/mount.rs | sed -n '525,565p'" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0009/scratch/work/wt1
+ succeeded in 0ms:
+   525	
+   526	    /// Gets the parent mount node if any.
+   527	    pub(in crate::fs) fn parent(&self) -> Option<Weak<Self>> {
+   528	        self.parent.read().as_ref().cloned()
+   529	    }
+   530	
+   531	    /// Returns whether `self` is `ancestor` or a descendant of it in the mount tree.
+   532	    pub(super) fn is_equal_or_descendant_of(&self, ancestor: &Arc<Self>) -> bool {
+   533	        let mut current = self.this();
+   534	        loop {
+   535	            if Arc::ptr_eq(&current, ancestor) {
+   536	                return true;
+   537	            }
+   538	
+   539	            let Some(parent) = current.parent().and_then(|parent| parent.upgrade()) else {
+   540	                return false;
+   541	            };
+   542	            current = parent;
+   543	        }
+   544	    }
+   545	
+   546	    /// Gets the associated mount namespace.
+   547	    pub(super) fn mnt_ns(&self) -> &Weak<MountNamespace> {
+   548	        &self.mnt_ns
+   549	    }
+   550	
+   551	    /// Gets the associated FS.
+   552	    pub(in crate::fs) fn fs(&self) -> &Arc<dyn FileSystem> {
+   553	        &self.fs
+   554	    }
+   555	
+   556	    pub(in crate::fs) fn flags(&self) -> PerMountFlags {
+   557	        self.flags.load(Ordering::Relaxed)
+   558	    }
+   559	
+   560	    /// Sets the parent mount node.
+   561	    ///
+   562	    /// In some cases we may need to reset the parent of
+   563	    /// the created Mount, such as move mount.
+   564	    pub(super) fn set_parent(&self, mount: Option<&Arc<Mount>>) {
+   565	        let mut parent = self.parent.write();
+
+ERROR: Reconnecting... 1/5
+codex
+There’s one maintainability issue in the tmpfs accounting helpers: the new default limit policy is encoded as a bare divisor in two places. I’m verifying the surrounding `SuperBlock` fields before anchoring it.
+exec
+/bin/bash -lc 'rg "struct SuperBlock|bsize|PAGE_SIZE" -n kernel/src/fs/vfs kernel/src/fs/fs_impls/ramfs/fs.rs kernel/src/fs/fs_impls/tmpfs/fs.rs' in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0009/scratch/work/wt1
+ succeeded in 0ms:
+kernel/src/fs/fs_impls/tmpfs/fs.rs:70:    crate::vm::mem_total() / PAGE_SIZE / 2
+kernel/src/fs/fs_impls/tmpfs/fs.rs:74:    crate::vm::mem_total() / PAGE_SIZE / 2
+kernel/src/fs/vfs/fs_apis/file_system.rs:69:pub struct SuperBlock {
+kernel/src/fs/vfs/fs_apis/file_system.rs:71:    pub bsize: usize,
+kernel/src/fs/vfs/fs_apis/file_system.rs:88:            bsize: block_size,
+kernel/src/fs/vfs/page_cache.rs:80:        if old_size > new_size && !new_size.is_multiple_of(PAGE_SIZE) {
+kernel/src/fs/vfs/page_cache.rs:81:            let gap_size = old_size.min(new_size.align_up(PAGE_SIZE)) - new_size;
+kernel/src/fs/vfs/page_cache.rs:97:        let first_page_end = start.align_up(PAGE_SIZE);
+kernel/src/fs/vfs/page_cache.rs:104:        let last_page_start = end.align_down(PAGE_SIZE);
+kernel/src/fs/vfs/page_cache.rs:110:        for offset in (first_page_end..last_page_start).step_by(PAGE_SIZE) {
+kernel/src/fs/vfs/page_cache.rs:111:            self.pages().fill_zeros(offset, PAGE_SIZE)?;
+
+codex
+The divisor is indeed a policy value, not just local arithmetic; naming it would make the tmpfs default visible at the point of use. I’m doing a final pass for other maintainability-only concerns before producing the JSON.
+exec
+/bin/bash -lc "nl -ba kernel/src/fs/vfs/fs_apis/file_system.rs | sed -n '55,105p' && rg \"fn sb\\(&self\\) -> SuperBlock\" -n kernel/src/fs/fs_impls | head -30" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0009/scratch/work/wt1
+ succeeded in 0ms:
+    55	        (self as &dyn Any).downcast_ref::<T>()
+    56	    }
+    57	}
+    58	
+    59	impl Debug for dyn FileSystem {
+    60	    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+    61	        f.debug_struct("FileSystem")
+    62	            .field("super_block", &self.sb())
+    63	            .field("flags", &self.flags())
+    64	            .finish()
+    65	    }
+    66	}
+    67	
+    68	#[derive(Clone, Debug)]
+    69	pub struct SuperBlock {
+    70	    pub magic: u64,
+    71	    pub bsize: usize,
+    72	    pub blocks: usize,
+    73	    pub bfree: usize,
+    74	    pub bavail: usize,
+    75	    pub files: usize,
+    76	    pub ffree: usize,
+    77	    pub fsid: u64,
+    78	    pub namelen: usize,
+    79	    pub frsize: usize,
+    80	    pub flags: u64,
+    81	    pub container_dev_id: DeviceId,
+    82	}
+    83	
+    84	impl SuperBlock {
+    85	    pub fn new(magic: u64, block_size: usize, name_max_len: usize, dev_id: DeviceId) -> Self {
+    86	        Self {
+    87	            magic,
+    88	            bsize: block_size,
+    89	            blocks: 0,
+    90	            bfree: 0,
+    91	            bavail: 0,
+    92	            files: 0,
+    93	            ffree: 0,
+    94	            fsid: 0,
+    95	            namelen: name_max_len,
+    96	            frsize: block_size,
+    97	            flags: 0,
+    98	            container_dev_id: dev_id,
+    99	        }
+   100	    }
+   101	}
+   102	
+   103	bitflags! {
+   104	    /// Flags for per file system.
+   105	    pub struct FsFlags: u32 {
+kernel/src/fs/fs_impls/devpts/mod.rs:116:    fn sb(&self) -> SuperBlock {
+kernel/src/fs/fs_impls/sysfs/fs.rs:75:    fn sb(&self) -> SuperBlock {
+kernel/src/fs/fs_impls/configfs/fs.rs:76:    fn sb(&self) -> SuperBlock {
+kernel/src/fs/fs_impls/exfat/fs.rs:429:    fn sb(&self) -> SuperBlock {
+kernel/src/fs/fs_impls/procfs/mod.rs:112:    fn sb(&self) -> SuperBlock {
+kernel/src/fs/fs_impls/cgroupfs/fs.rs:76:    fn sb(&self) -> SuperBlock {
+kernel/src/fs/fs_impls/tmpfs/fs.rs:47:    fn sb(&self) -> SuperBlock {
+kernel/src/fs/fs_impls/ramfs/fs.rs:110:    fn sb(&self) -> SuperBlock {
+kernel/src/fs/fs_impls/pseudofs/mod.rs:85:    fn sb(&self) -> SuperBlock {
+kernel/src/fs/fs_impls/overlayfs/fs.rs:201:    fn sb(&self) -> SuperBlock {
+kernel/src/fs/fs_impls/ext2/impl_for_vfs/fs.rs:32:    fn sb(&self) -> SuperBlock {
+
+codex
+[{"file":"kernel/src/fs/fs_impls/tmpfs/fs.rs","line":3,"persona":"maintainability","grounding":"qualified-fn-imports","severity":"nit","problem":"`TMPFS_MAGIC` is imported directly from `super`, so the later `sb.magic = TMPFS_MAGIC` assignment reads like it may be a local constant instead of a value from the parent `tmpfs` module.","fix":"Remove the direct import and qualify the use as `super::TMPFS_MAGIC`, or move the constant into this module if it is only meaningful here.","diff":"+use super::TMPFS_MAGIC;\n use crate::{\n@@\n-        sb.magic = TMPFS_MAGIC;\n+        sb.magic = super::TMPFS_MAGIC;"},{"file":"kernel/src/fs/fs_impls/tmpfs/fs.rs","line":70,"persona":"maintainability","grounding":"no-magic-number","severity":"minor","problem":"The `/ 2` divisor encodes the new `tmpfs` default limit policy, but the meaning is hidden at both `default_max_blocks` and `default_max_inodes`. A reader has to infer that `tmpfs` is being capped at half of total memory.","fix":"Name the policy once and reuse it, for example `const DEFAULT_MAX_USAGE_DIVISOR: usize = 2;`, or introduce a shared helper such as `default_max_pages()` that documents the half-memory default.","diff":"+fn default_max_blocks() -> usize {\n+    crate::vm::mem_total() / PAGE_SIZE / 2\n+}\n+\n+fn default_max_inodes() -> usize {\n+    crate::vm::mem_total() / PAGE_SIZE / 2\n+}"},{"file":"kernel/src/fs/vfs/path/mod.rs","line":104,"persona":"maintainability","grounding":"rfc1574-summary","severity":"nit","problem":"`Path::fs` is a new public accessor, but it is preceded by a plain `//` comment instead of a rustdoc `///` summary, so generated API docs omit the method’s purpose while neighboring public methods are documented.","fix":"Use a rustdoc summary in the local style, for example `/// Returns the file system mounted at this path.`","diff":"+    // Gets the file system of current `Path`.\n+    pub fn fs(&self) -> &Arc<dyn FileSystem> {\n+        self.mount.fs()\n+    }"}]
+tokens used
+43,012codex\n\[

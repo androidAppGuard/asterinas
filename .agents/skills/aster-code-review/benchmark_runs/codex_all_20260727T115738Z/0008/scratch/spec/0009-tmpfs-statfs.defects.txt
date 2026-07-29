@@ -1,0 +1,13 @@
+# Expected defects
+
+1. location: kernel/src/fs/fs_impls/tmpfs/fs.rs (persona: maintainability, grounding: no-magic-number, severity: minor)
+   defect: The literal `2` encodes the tmpfs default capacity policy in both `default_max_blocks` and `default_max_inodes`, but the policy has no semantic name, making the "50% of memory" rule easy to miss or accidentally change inconsistently.
+   MATCH IF: A reviewer should flag the duplicated literal `2` in the tmpfs default block and inode limit helpers as an unnamed capacity policy and ask for a named constant.
+
+2. location: kernel/src/fs/fs_impls/tmpfs/fs.rs (persona: maintainability, grounding: backtick-identifiers, severity: minor)
+   defect: The new `TmpFs::sb` workaround comment names implementation concepts such as Tmpfs and RamFs as plain prose instead of formatting those identifiers with Markdown backticks, which makes the code-oriented comment inconsistent with the local comment style.
+   MATCH IF: A reviewer should flag that the new tmpfs workaround comment leaves code identifiers such as `RamFs` unformatted and ask for backticks around them.
+
+3. location: kernel/src/fs/vfs/path/mod.rs (persona: maintainability, grounding: consistency, severity: minor)
+   defect: `Path::fs` is a new public method, but its summary is written as a plain `//` comment, so it will not appear in rustdoc with the rest of the public `Path` API.
+   MATCH IF: A reviewer should flag that the public `Path::fs` method uses a plain `//` summary instead of `///` and ask for a rustdoc comment.

@@ -1,0 +1,5 @@
+# Expected defects
+
+1. location: ostd/src/arch/x86/trap/mod.rs (persona: hardware, grounding: 16b-align-rsp-before-call, severity: critical)
+   defect: `TrapFrame` is not a multiple of 16 bytes, so when the kernel trap path materializes one on the stack and `call`s the Rust trap handler, `%rsp` is misaligned by 8 at the call boundary, violating the System V AMD64 ABI (UB for SSE instructions such as `movaps`).
+   MATCH IF: A reviewer should flag the struct's size / stack misalignment against the trap-entry path as an ABI/soundness violation — reasoning from the code alone, since at this commit no comment or `const_assert!` points at the invariant. A matching comment may come from the Hardware persona or from the Security persona (as an `unsafe` / soundness hazard).

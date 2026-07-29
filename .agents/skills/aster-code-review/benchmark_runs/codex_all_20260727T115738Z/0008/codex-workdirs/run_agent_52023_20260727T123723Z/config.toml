@@ -1,0 +1,28 @@
+model_provider = "OpenAI"
+model = "gpt-5.5"
+model_reasoning_effort = "high"
+disable_response_storage = true
+preferred_auth_method = "apikey"
+approvals_reviewer = "user"
+
+[model_providers.OpenAI]
+name = "OpenAI"
+base_url = "https://api.tokenskingdom.com/v1"
+wire_api = "responses"
+
+# Least privilege the review still needs:
+# confine writes to the worktree + TMPDIR
+# (a derailed agent cannot touch $HOME, /etc, or other repos),
+# and never pause for approval.
+# This REPLACES the old `danger-full-access`,
+# which threw write-confinement away for mere convenience.
+# `network_access` (docs/spec lookups during verification)
+# belongs under a [sandbox_workspace_write] table,
+# but run_agent.sh's config seeder is flat-only,
+# so the profile's `codex exec` passes it on the CLI:
+# `-c sandbox_workspace_write.network_access=true` (see agent_profiles/codex/profile.json).
+sandbox_mode = "workspace-write"
+approval_policy = "never"
+
+[projects."/root/asterinas"]
+trust_level = "trusted"

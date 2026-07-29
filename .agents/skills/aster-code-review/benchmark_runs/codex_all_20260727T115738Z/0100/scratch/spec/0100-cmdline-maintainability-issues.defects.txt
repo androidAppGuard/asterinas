@@ -1,0 +1,13 @@
+# Expected defects
+
+1. location: kernel/comps/cmdline/Cargo.toml lines 13 (persona: maintainability, grounding: workspace-deps, severity: minor)
+   defect: `kernel/comps/cmdline/Cargo.toml` declares `inventory` directly with a Git URL and revision. Shared dependencies should be declared once in the workspace `[workspace.dependencies]` table and referenced from member crates with `.workspace = true`; this is especially important here because the same `inventory` crate is already used elsewhere with the same source.
+   MATCH IF: A reviewer should flag the direct `inventory` dependency in the member crate and ask for a workspace dependency referenced with `inventory.workspace = true`.
+
+2. location: kernel/comps/cmdline/src/types.rs lines 8 (persona: maintainability, grounding: narrow-lint-suppression, severity: minor)
+   defect: `kernel/comps/cmdline/src/types.rs` adds `#![allow(dead_code)]` at module scope, suppressing `dead_code` for every item in the new `types` module. That hides unused-code warnings not only for the currently intentional parser helpers, but also for future accidental additions to the module, making the lint suppression broader than the code that needs it.
+   MATCH IF: A reviewer should flag the module-wide `#![allow(dead_code)]` and ask for the `dead_code` suppression to be narrowed to the specific item that needs it.
+
+3. location: kernel/comps/cmdline/src/types.rs lines 31 (persona: maintainability, grounding: getter-encapsulation, severity: minor)
+   defect: `CpuListSegment` exposes `start`, `end`, `stride`, and `group` as public fields even though the parser enforces invariants such as `start <= end`, nonzero `stride`, and nonzero `group`. Public fields let external code construct invalid segments and make the representation part of the API.
+   MATCH IF: A reviewer should flag the public fields on `CpuListSegment` and ask for private fields with getters or another checked interface that preserves the parser invariants.

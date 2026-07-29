@@ -1,0 +1,5 @@
+# Expected defects
+
+1. location: <commit_message> (persona: maintainability, grounding: imperative-subject, severity: minor)
+   defect: The commit subject "made some changes to getcwd" is past-tense and vague: it does not summarize *what* the change does in the imperative mood, as Asterinas requires. (The code change itself — a clarifying comment — is fine; the message is the defect.)
+   MATCH IF: A reviewer should flag the non-imperative, non-descriptive subject and ask for a specific imperative summary.

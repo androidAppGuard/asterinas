@@ -1,0 +1,1761 @@
+codex
+I’ll use the `aster-code-review` skill for this maintainability-only pass, then inspect the changed files and commit metadata against the provided guideline remit.
+exec
+/bin/bash -lc "sed -n '1,240p' .agents/skills/aster-code-review/SKILL.md" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0100/scratch/work/wt1
+ succeeded in 0ms:
+---
+name: aster-code-review
+description: Review code against Asterinas's persona-keyed coding guidelines and write a Markdown review file. Use when asked to review a Git change (diff mode) or a set of target files (files mode) for defects, or inside a write-test-review loop.
+---
+
+# aster-code-review
+
+Review code against Asterinas's coding guidelines
+— the persona-keyed pages under `book/src/to-contribute/coding-guidelines/`
+— and write one Markdown review file.
+The review is **recall-first**: miss as few real defects as possible.
+It makes both objective calls (undeniable bugs) and subjective calls (guideline violations, each grounded in a cited rule).
+
+There are two review modes, both **anchored at the current checkout (HEAD)**:
+
+- **`diff <base>`** — a Git change:
+  the **commit series** the branch adds over its merge-base with `<base>`
+  — each commit's message *and* its diff,
+  so the review covers per-commit intent and commit hygiene, not just the net change.
+  (Commit first; uncommitted edits are not reviewed in diff mode.)
+- **`files <path[:lines] ...>`**
+  — target code: the working-tree contents of the named files,
+  optionally narrowed to line ranges.
+
+To review at a specific commit, check it out first (it becomes HEAD).
+
+This skill is agent-agnostic (Claude Code and Codex).
+Only step 3's spawn primitive differs between agents;
+everything else is identical.
+
+## Interface
+
+However the skill is triggered,
+it receives ONE raw argument string that begins with a mode word:
+
+```
+diff   <base>              <output> [--overwrite] [--per-persona-context=auto|yes|no]
+files  <path[:lines] ...>  <output> [--overwrite] [--per-persona-context=auto|yes|no]
+```
+
+- `<base>` (diff) — **required**,
+  any ref or SHA;
+  reviews the commit series `merge-base(<base>, HEAD)..HEAD` (each commit's message + diff).
+- `<path[:lines] ...>` (files) — **required**, one or more targets in the working tree.
+  A target is a path, optionally `path:N-M` or `path:N-M,K-L` (1-based, inclusive);
+  repeat a path to add ranges.
+  Wrap a path in double quotes to allow spaces or colons (`"a: b.rs":10-20`).
+- `<output>` — **required, last positional** (`cp src... dest` style);
+  refuse to overwrite unless `--overwrite`.
+- `--overwrite` — replace the output file if it already exists.
+- `--per-persona-context` — `yes`: fan out one isolated agent per persona (best recall).
+  `no`: one combined agent reviews all personas (cheaper, lower recall).
+  `auto` (default) currently resolves to `yes`;
+  it will become a benchmark-driven heuristic.
+  Controls step 3 only.
+
+**Do not pre-split the argument string yourself.**
+Pass it verbatim, as a single quoted argument,
+to `resolve_target.sh` (step 1)
+— the script self-tokenizes (whitespace-split except inside double quotes),
+which keeps the parse deterministic and identical across agents.
+
+## Pipeline
+
+Run these steps in order.
+Steps 1 and 5 are deterministic scripts;
+steps 6–8 use the model.
+
+The helper scripts live in the skill's own `scripts/` directory,
+at `.agents/skills/aster-code-review/scripts/` inside the repository under review.
+**Invoke every script by its absolute path**
+— the working directory is the code under review (the repo root), *not* the skill directory,
+so a bare `scripts/…` is not found (notably on Codex, which runs commands from the repo root; do not `cd` into the skill dir either — `resolve_target.sh` needs the repo as its cwd).
+Shells do not persist between commands,
+so **set `SKILL` at the start of each command that uses it** (or inline the `$(git rev-parse …)`):
+
+```sh
+SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/resolve_target.sh" '<raw args>'
+```
+
+The steps below write `$SKILL/scripts/…` as shorthand for that absolute path.
+
+1. **Resolve the target.**
+   `"$SKILL/scripts/resolve_target.sh" '<raw args>'` prints the canonical review input
+   — the commit series (each commit's message + diff) in `diff` mode,
+   annotated file excerpts in `files` mode;
+   save it to a temp file.
+   Run it again with `--meta` first (`"$SKILL/scripts/resolve_target.sh" --meta '<raw args>'`) to get
+   `mode=`, `base=`/`files=`, `head=`, `branch=`, `output=`, `overwrite=`, `per_persona_context=`;
+   add `date=` (today) and an optional `title=` to make the meta file.
+   Pass the raw argument string as a single quoted argument
+   so the script's tokenizer sees it intact.
+2. **Activate personas.**
+   Pick which of the five personas run,
+   from the reviewed paths — changed paths in `diff` mode,
+   named paths in `files` mode (see *Activation*).
+3. **Fan out.**
+   Spawn the persona passes (see *Spawning*).
+   With `per_persona_context` = `yes` or `auto` (the default),
+   run **one isolated PASS per activated persona** — best recall.
+   With `no`, run **one combined PASS** over all activated personas in a single context
+   — cheaper, lower recall.
+   Build each pass's prompt deterministically with `"$SKILL/scripts/build_pass_prompt.sh" <input-file> <persona>...`
+   — one persona for fan-out, all activated personas for combined
+   — and spawn the sub-agent with **that exact text**.
+   Each pass returns a JSON array of comments;
+   file each under its persona's `<fragdir>/<persona>.json` (the comment's `persona` field says which),
+   so step 5 is unchanged.
+4. **Collect** the per-persona JSON fragments.
+5. **Assemble.**
+   `"$SKILL/scripts/assemble_review.sh" [--overwrite] <meta> <fragdir> <output>` performs the deterministic merge (group by persona in fixed order, sort by file→line, drop exact duplicates *within a persona*, write frontmatter, leave a `<!-- SUMMARY -->` placeholder).
+   Pass `--overwrite` only if the user gave it;
+   otherwise the script refuses to clobber an existing `<output>`.
+6. **Verify** (see *Verification*).
+7. **Consolidate** (see *Consolidation*).
+8. **Summary.**
+   Replace `<!-- SUMMARY -->` with a constructive summary over the final comments:
+   what the code does well, the top issues ranked by severity,
+   any structural recommendations.
+
+## Activation
+
+A persona runs unless the reviewed paths *provably* contain nothing in its remit (reviewed paths = changed paths in `diff` mode, named paths in `files` mode):
+
+- **maintainability, development, security** — any reviewed code.
+- **hardware** — a reviewed path is assembly (`*.S`, `*.asm`),
+  an architecture directory (`.../arch/...`), or contains `asm!` / `global_asm!`.
+- **documentation** — a reviewed path is `book/`, any `*.md`,
+  syscall-coverage files (`*.scml`), or a user-facing API surface (a syscall or kernel parameter).
+
+Activation is path-based and deterministic;
+do not use a model to triage (a wrongly-skipped persona is a silent recall hole).
+
+## Pass contract
+
+The shared reviewer contract
+— the review methodology and the JSON comment schema every pass must follow
+— lives in [`scripts/pass_contract.md`](scripts/pass_contract.md),
+inlined as the **stable head** of every pass prompt by `build_pass_prompt.sh` (step 3).
+Do not paraphrase it into the prompt yourself:
+retyping it breaks the byte-identical prefix the prompt cache relies on (see [`execution_model.md`](spec/execution_model.md)).
+A pass reads only the persona block(s) it is given (selective exposure),
+reviews the **REVIEW INPUT** at the foot of the prompt,
+and returns a JSON array of comments per that schema.
+
+## Spawning a pass
+
+Build every pass prompt with `"$SKILL/scripts/build_pass_prompt.sh" <input-file> <persona>...`
+and spawn the sub-agent with its **exact** output
+— only a script keeps the prompt's stable head (contract + guideline) byte-identical across passes and reviews,
+which is what lets the prompt cache reuse it (see [`execution_model.md`](spec/execution_model.md)).
+
+**Default (`per_persona_context` = `yes`/`auto`)**
+— one pass per activated persona,
+each in a CLEAN context with only its own persona block (selective exposure):
+
+- **Claude Code** — spawn a Task sub-agent per persona.
+- **Codex** — run `codex exec "<build_pass_prompt.sh output>"` per persona
+  (pass the built PROMPT TEXT as the argument).
+
+**Never spawn a pass by re-running `aster_code_review.sh` / `run_agent.sh`,
+nor by re-issuing the skill's own arguments** (e.g. `codex exec … diff <base> <out>`).
+A pass is a *reviewer* invocation whose input is the `build_pass_prompt.sh` text
+— not another run of this skill.
+Re-entering the launcher spawns another orchestrator that spawns another … , an infinite fork bomb;
+the launcher now refuses it (`ACR_AGENT_RUNNING`).
+
+Passes are independent;
+order does not matter.
+Collect each pass's JSON.
+
+**Combined (`per_persona_context` = `no`)**
+— build ONE prompt with all activated personas (`"$SKILL/scripts/build_pass_prompt.sh" <input> <p1> <p2> ...`)
+and run a single pass;
+it reviews through every lens at once and tags each comment with its `persona`.
+The input and spawn overhead are paid once,
+so it is cheaper
+— but a larger shared context dilutes focus,
+so it finds fewer defects.
+The default stays fan-out:
+recall comes first,
+and `no` is an explicit, opt-in concession.
+
+## Verification (step 6)
+
+For each comment, isolate the key premise it rests on
+— especially an external-system fact (Linux/POSIX behaviour, the System V ABI, Rust semantics).
+Try to **refute** it:
+re-read the cited code and consult an authoritative source.
+Assign a verdict:
+
+- **confirmed** — keep the comment unchanged.
+- **uncertain** — keep it, but prefix `problem` with `(unverified) `.
+- **refuted** — remove the comment,
+  and append it to a `## Retracted by verification` list at the foot of the file with a one-line reason.
+
+Remove **only** on confident refutation;
+an unsure check is `uncertain`, not `refuted`.
+This is the only step that may remove a comment, and only false positives.
+
+## Consolidation (step 7)
+
+Find clusters of comments that share one root cause or one fix
+(e.g. several manual lock/unlock pairs that all want RAII).
+For each cluster, write a single unified fix
+and repoint each member's `**Fix.**` at it ("Shared with the other `raii` comments: …").
+**Never remove a comment**
+— every symptom stays at its own location.
+
+## Output format
+
+The assembled file is:
+frontmatter (`date`, `mode`, `base` or `files`, `head`, `branch`, optional `title`),
+a `# Summary`,
+then a `## <section>` per persona in the order **Maintainability, Correctness, Security, Hardware, Documentation** (Correctness is the Development persona's section).
+Each comment is a `### \`file\` line N` subsection:
+a quoted ` ```diff ` snippet,
+then a prose line `` `<grounding>` (<severity>): <problem> ``,
+then a `**Fix.**` paragraph.
+Do not restructure what the script emits;
+only fill the summary and apply the verify/consolidate edits.
+
+codex
+I’m checking the post-change files now so any comments can anchor to real line numbers and reflect the code as it stands, not just the diff excerpt.
+exec
+/bin/bash -lc "nl -ba kernel/comps/cmdline/src/lib.rs | sed -n '1,460p'" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0100/scratch/work/wt1
+ succeeded in 0ms:
+     1	// SPDX-License-Identifier: MPL-2.0
+     2	
+     3	//! The module to define and parse kernel command-line arguments.
+     4	//!
+     5	//! The format of the Asterinas command line string conforms
+     6	//! to the Linux kernel command line rules:
+     7	//!
+     8	//! <https://docs.kernel.org/admin-guide/kernel-parameters.html>
+     9	//!
+    10	#![no_std]
+    11	#![deny(unsafe_code)]
+    12	
+    13	extern crate alloc;
+    14	
+    15	use alloc::{
+    16	    collections::BTreeMap,
+    17	    ffi::CString,
+    18	    string::{String, ToString},
+    19	    vec::Vec,
+    20	};
+    21	use core::{
+    22	    str::FromStr,
+    23	    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering},
+    24	};
+    25	
+    26	use component::{ComponentInitError, init_component};
+    27	pub use inventory::submit;
+    28	use spin::Once;
+    29	
+    30	pub mod types;
+    31	
+    32	/// Defines a **single-value** `key=value` kernel command-line parameter.
+    33	///
+    34	/// During command-line parsing, all occurrences of `$name` are grouped and then
+    35	/// handled with **last-wins** semantics.
+    36	///
+    37	/// # Arguments
+    38	/// - `$name`: Parameter name (e.g. `"log_level"`).
+    39	/// - `$storage`: Storage location for the parsed value. Its type must implement
+    40	///   [`ParamStorage`] (e.g. [`spin::Once<T>`], [`AtomicU8`], [`AtomicU32`], [`AtomicBool`]).
+    41	///
+    42	/// # Parsing
+    43	/// The stored value type `S::Value` must implement [`ParseParamValue`].
+    44	/// By default, any type implementing [`core::str::FromStr`] automatically
+    45	/// implements [`ParseParamValue`].
+    46	///
+    47	/// # Example
+    48	/// ```ignore
+    49	/// static LOG_LEVEL: AtomicU8 = AtomicU8::new(0);
+    50	/// define_kv_param!("log_level", LOG_LEVEL);
+    51	/// ```
+    52	#[macro_export]
+    53	macro_rules! define_kv_param {
+    54	    ($name:expr, $storage:expr) => {
+    55	        $crate::__define_param!(@late, $name, $storage, $crate::setup_kv_param);
+    56	    };
+    57	}
+    58	
+    59	/// Defines an **early** `key=value` kernel command-line parameter.
+    60	///
+    61	/// Almost same as [`define_kv_param!`], but it is processed earlier in the boot sequence.
+    62	#[macro_export]
+    63	macro_rules! define_kv_param_early {
+    64	    ($name:expr, $storage:expr) => {
+    65	        $crate::__define_param!(@early, $name, $storage, $crate::setup_kv_param);
+    66	    };
+    67	}
+    68	
+    69	/// Defines a **repeatable** `key=value` kernel command-line parameter.
+    70	///
+    71	/// Unlike [`define_kv_param!`], this parameter may appear multiple times; the
+    72	/// framework collects **all** values and passes them to the parser in one shot.
+    73	///
+    74	/// # Arguments
+    75	/// - `$name`: Parameter name (e.g. `"console"`).
+    76	/// - `$storage`: Storage location for the parsed value. Its type must implement
+    77	///   [`ParamStorage`].
+    78	///
+    79	/// # Parsing
+    80	/// The stored value type `S::Value` must implement [`ParseRepeatableParamValue`].
+    81	/// This crate provides a default implementation for `Vec<T>` where `T: FromStr`.
+    82	///
+    83	/// # Example
+    84	/// ```ignore
+    85	/// static CONSOLES: Once<Vec<String>> = Once::new();
+    86	/// define_repeatable_kv_param!("console", CONSOLES);
+    87	/// ```
+    88	#[macro_export]
+    89	macro_rules! define_repeatable_kv_param {
+    90	    ($name:expr, $storage:expr) => {
+    91	        $crate::__define_param!(@late, $name, $storage, $crate::setup_repeatable_kv_param);
+    92	    };
+    93	}
+    94	
+    95	/// Defines an **early** `key=value` kernel command-line parameter.
+    96	///
+    97	/// Almost same as [`define_repeatable_kv_param!`], but it is processed earlier in the boot sequence.
+    98	#[macro_export]
+    99	macro_rules! define_repeatable_kv_param_early {
+   100	    ($name:expr, $storage:expr) => {
+   101	        $crate::__define_param!(@early, $name, $storage, $crate::setup_repeatable_kv_param);
+   102	    };
+   103	}
+   104	
+   105	/// Defines a **flag** kernel command-line parameter.
+   106	///
+   107	/// A flag may appear as a bare token (e.g. `debug`) or with an optional value
+   108	/// (e.g. `debug=1`). If the flag appears multiple times, the framework uses
+   109	/// **last-wins** semantics.
+   110	///
+   111	/// # Arguments
+   112	/// - `$name`: Flag name (e.g. `"debug"`).
+   113	/// - `$storage`: Storage location for the parsed value. Its type must implement
+   114	///   [`ParamStorage`].
+   115	///
+   116	/// # Parsing
+   117	/// The stored value type `S::Value` must implement [`ParseFlag`]. This crate
+   118	/// provides a default `bool` implementation:
+   119	/// - `flag` / `flag=1` / `flag=on|yes|true` => `true`
+   120	/// - `flag=0` / `flag=off|no|false` => `false`
+   121	///
+   122	/// # Example
+   123	/// ```ignore
+   124	/// static DEBUG: AtomicBool = AtomicBool::new(false);
+   125	/// define_flag_param!("debug", DEBUG);
+   126	/// ```
+   127	#[macro_export]
+   128	macro_rules! define_flag_param {
+   129	    ($name:expr, $storage:expr) => {
+   130	        $crate::__define_param!(@late, $name, $storage, $crate::setup_flag_param);
+   131	    };
+   132	}
+   133	
+   134	/// Defines an **early** `key=value` kernel command-line parameter.
+   135	///
+   136	/// Almost same as [`define_flag_param!`], but it is processed earlier in the boot sequence.
+   137	#[macro_export]
+   138	macro_rules! define_flag_param_early {
+   139	    ($name:expr, $storage:expr) => {
+   140	        $crate::__define_param!(@early, $name, $storage, $crate::setup_flag_param);
+   141	    };
+   142	}
+   143	
+   144	/// Helper for defining kernel command-line parameter.
+   145	#[macro_export]
+   146	macro_rules! __define_param {
+   147	    (@late, $name:expr, $storage:expr, $setup:path) => {
+   148	        const _: () = {
+   149	            fn __kparam_setup(occurrences: &[(&str, Option<&str>)]) {
+   150	                $setup(&$storage, occurrences, $name);
+   151	            }
+   152	            $crate::submit! {
+   153	                $crate::KernelParam { name: $name, setup: __kparam_setup, early: false }
+   154	            }
+   155	        };
+   156	    };
+   157	
+   158	    (@early, $name:expr, $storage:expr, $setup:path) => {
+   159	        const _: () = {
+   160	            fn __kparam_setup(occurrences: &[(&str, Option<&str>)]) {
+   161	                $setup(&$storage, occurrences, $name);
+   162	            }
+   163	            $crate::submit! {
+   164	                $crate::KernelParam { name: $name, setup: __kparam_setup, early: true }
+   165	            }
+   166	        };
+   167	    };
+   168	}
+   169	
+   170	/// The arguments passed to the init process, extracted from the kernel command line.
+   171	#[derive(PartialEq, Debug)]
+   172	pub struct InitprocArgs {
+   173	    argv: Vec<CString>,
+   174	    envp: Vec<CString>,
+   175	}
+   176	
+   177	impl InitprocArgs {
+   178	    /// Gets the argument vector (`argv`) of the init process.
+   179	    pub fn argv(&self) -> &Vec<CString> {
+   180	        &self.argv
+   181	    }
+   182	
+   183	    /// Gets the environment vector (`envp`) of the init process.
+   184	    pub fn envp(&self) -> &Vec<CString> {
+   185	        &self.envp
+   186	    }
+   187	}
+   188	
+   189	/// Trait for types that can store a parsed parameter value.
+   190	pub trait ParamStorage: Sync + 'static {
+   191	    type Value;
+   192	    fn store_param(&self, value: Self::Value);
+   193	}
+   194	
+   195	impl<T: Send + Sync + 'static> ParamStorage for Once<T> {
+   196	    type Value = T;
+   197	    fn store_param(&self, value: T) {
+   198	        self.call_once(|| value);
+   199	    }
+   200	}
+   201	
+   202	impl ParamStorage for AtomicU8 {
+   203	    type Value = u8;
+   204	    fn store_param(&self, value: u8) {
+   205	        self.store(value, Ordering::Relaxed);
+   206	    }
+   207	}
+   208	
+   209	impl ParamStorage for AtomicU32 {
+   210	    type Value = u32;
+   211	    fn store_param(&self, value: u32) {
+   212	        self.store(value, Ordering::Relaxed);
+   213	    }
+   214	}
+   215	
+   216	impl ParamStorage for AtomicBool {
+   217	    type Value = bool;
+   218	    fn store_param(&self, value: bool) {
+   219	        self.store(value, Ordering::Relaxed);
+   220	    }
+   221	}
+   222	
+   223	/// Errors while parsing kernel command line parameters.
+   224	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+   225	pub enum ParamError {
+   226	    InvalidValue,
+   227	}
+   228	
+   229	/// Parse a single-value key-value parameter (e.g., log_level=3).
+   230	///
+   231	/// If the parameter appears multiple times, the framework applies last-wins
+   232	/// semantics (matching Linux behavior) and passes only the final value.
+   233	pub trait ParseParamValue: Sized {
+   234	    fn parse_param(value: &str) -> Result<Self, ParamError>;
+   235	}
+   236	
+   237	/// Parse a repeatable key-value parameter (e.g., "console=ttyS0 console=ttyS1").
+   238	///
+   239	/// The framework collects all occurrences and passes the full slice.
+   240	pub trait ParseRepeatableParamValue: Sized {
+   241	    fn parse_all(values: &[&str]) -> Result<Self, ParamError>;
+   242	}
+   243	
+   244	/// Parse a flag parameter (e.g., "ro", "debug", "nokaslr").
+   245	///
+   246	/// Flags may optionally accept a value (e.g., "debug=1" in Linux).
+   247	pub trait ParseFlag: Sized {
+   248	    /// Called when the flag is present on the command line.
+   249	    /// `value` is `Some(v)` if written as "flag=v", `None` if bare.
+   250	    fn parse_flag(value: Option<&str>) -> Result<Self, ParamError>;
+   251	}
+   252	
+   253	/// Any `FromStr` type can be a single-value parameter.
+   254	impl<T: FromStr> ParseParamValue for T {
+   255	    fn parse_param(value: &str) -> Result<Self, ParamError> {
+   256	        value.parse().map_err(|_| ParamError::InvalidValue)
+   257	    }
+   258	}
+   259	
+   260	/// A `Vec<T>` where `T: FromStr` can be a repeatable parameter.
+   261	/// (No coherence conflict: `Vec<T>` does not implement `FromStr`.)
+   262	impl<T: FromStr> ParseRepeatableParamValue for Vec<T> {
+   263	    fn parse_all(values: &[&str]) -> Result<Self, ParamError> {
+   264	        values
+   265	            .iter()
+   266	            .map(|v| v.parse().map_err(|_| ParamError::InvalidValue))
+   267	            .collect()
+   268	    }
+   269	}
+   270	
+   271	/// `bool` as a flag: bare flag means `true`; "flag=1"/"flag=on" also accepted.
+   272	impl ParseFlag for bool {
+   273	    fn parse_flag(value: Option<&str>) -> Result<Self, ParamError> {
+   274	        match value {
+   275	            None | Some("1") | Some("on") | Some("yes") | Some("true") => Ok(true),
+   276	            Some("0") | Some("off") | Some("no") | Some("false") => Ok(false),
+   277	            _ => Err(ParamError::InvalidValue),
+   278	        }
+   279	    }
+   280	}
+   281	
+   282	#[derive(Debug)]
+   283	pub struct KernelParam {
+   284	    pub name: &'static str,
+   285	    pub setup: fn(occurrences: &[(&str, Option<&str>)]),
+   286	    pub early: bool,
+   287	}
+   288	
+   289	inventory::collect!(KernelParam);
+   290	
+   291	/// Helper for single-value key-value parameters (last-wins).
+   292	pub fn setup_kv_param<S: ParamStorage>(
+   293	    storage: &S,
+   294	    occurrences: &[(&str, Option<&str>)],
+   295	    name: &str,
+   296	) where
+   297	    S::Value: ParseParamValue,
+   298	{
+   299	    let last = match occurrences.last() {
+   300	        Some((_, val)) => *val, // Option<&str> is Copy
+   301	        None => return,
+   302	    };
+   303	    match last {
+   304	        Some(value) => match S::Value::parse_param(value) {
+   305	            Ok(v) => storage.store_param(v),
+   306	            Err(_) => log::warn!("invalid value for kernel parameter '{}'", name),
+   307	        },
+   308	        None => log::warn!("kernel parameter '{}' requires a value", name),
+   309	    }
+   310	}
+   311	
+   312	/// Helper for repeatable key-value parameters (all occurrences).
+   313	pub fn setup_repeatable_kv_param<S: ParamStorage>(
+   314	    storage: &S,
+   315	    occurrences: &[(&str, Option<&str>)],
+   316	    name: &str,
+   317	) where
+   318	    S::Value: ParseRepeatableParamValue,
+   319	{
+   320	    let values: Vec<&str> = occurrences.iter().filter_map(|(_, val)| *val).collect();
+   321	    if values.is_empty() {
+   322	        log::warn!("repeatable parameter '{}' requires values", name);
+   323	        return;
+   324	    }
+   325	    match S::Value::parse_all(&values) {
+   326	        Ok(v) => storage.store_param(v),
+   327	        Err(_) => log::warn!("invalid value for kernel parameter '{}'", name),
+   328	    }
+   329	}
+   330	
+   331	/// Helper for flag parameters (last-wins, optional value).
+   332	pub fn setup_flag_param<S: ParamStorage>(
+   333	    storage: &S,
+   334	    occurrences: &[(&str, Option<&str>)],
+   335	    name: &str,
+   336	) where
+   337	    S::Value: ParseFlag,
+   338	{
+   339	    let last = match occurrences.last() {
+   340	        Some((_, val)) => *val,
+   341	        None => return,
+   342	    };
+   343	    match S::Value::parse_flag(last) {
+   344	        Ok(v) => storage.store_param(v),
+   345	        Err(_) => log::warn!("invalid value for flag '{}'", name),
+   346	    }
+   347	}
+   348	
+   349	pub static INIT_PROC_ARGS: Once<InitprocArgs> = Once::new();
+   350	
+   351	#[init_component]
+   352	fn init() -> Result<(), ComponentInitError> {
+   353	    INIT_PROC_ARGS.call_once(|| dispatch_params(ostd::boot::boot_info().kernel_cmdline.as_str()));
+   354	
+   355	    Ok(())
+   356	}
+   357	
+   358	// Splits the command line string by spaces but preserve
+   359	// ones that are protected by double quotes(`"`).
+   360	fn split_arg(input: &str) -> impl Iterator<Item = &str> {
+   361	    let mut inside_quotes = false;
+   362	
+   363	    input.split(move |c: char| {
+   364	        if c == '"' {
+   365	            inside_quotes = !inside_quotes;
+   366	        }
+   367	
+   368	        !inside_quotes && c.is_whitespace()
+   369	    })
+   370	}
+   371	
+   372	fn dispatch_params(cmdline: &str) -> InitprocArgs {
+   373	    let mut result: InitprocArgs = InitprocArgs {
+   374	        argv: Vec::new(),
+   375	        envp: Vec::new(),
+   376	    };
+   377	
+   378	    let mut kcmdline_end = false;
+   379	
+   380	    // Step 1: Tokenize and group by normalized parameter name.
+   381	    let mut grouped: BTreeMap<String, Vec<(&str, Option<&str>)>> = BTreeMap::new();
+   382	
+   383	    for arg in split_arg(cmdline) {
+   384	        // Everything after "--" goes to init.
+   385	        if kcmdline_end {
+   386	            result.argv.push(CString::new(arg).unwrap());
+   387	            continue;
+   388	        }
+   389	        if arg == "--" {
+   390	            kcmdline_end = true;
+   391	            continue;
+   392	        }
+   393	
+   394	        let (key, value) = match arg.find('=') {
+   395	            Some(pos) => (&arg[..pos], Some(&arg[pos + 1..])),
+   396	            None => (arg, None),
+   397	        };
+   398	        // Normalize hyphens to underscores (Linux compatibility)
+   399	        let normalized = key.replace('-', "_");
+   400	        // Group by normalized name, but keep the original key and value for forwarding.
+   401	        grouped.entry(normalized).or_default().push((key, value));
+   402	    }
+   403	
+   404	    // Step 2: Build lookup from registered param name to handler.
+   405	    let registry: BTreeMap<&str, &KernelParam> = inventory::iter::<KernelParam>
+   406	        .into_iter()
+   407	        .map(|p| (p.name, p))
+   408	        .collect();
+   409	
+   410	    // Step 3: Dispatch each group to its handler.
+   411	    let mut recognized = Vec::new();
+   412	    for (name, occurrences) in &grouped {
+   413	        if let Some(param) = registry.get(name.as_str()) {
+   414	            recognized.push((*param, occurrences));
+   415	        } else {
+   416	            // Unknown parameter: forward to init
+   417	            if name.contains('.') {
+   418	                // The entry contains a dot, which is treated as a module argument.
+   419	                // Unrecognized module arguments are ignored.
+   420	                continue;
+   421	            } else if let Some((key, Some(value))) = occurrences.last().copied() {
+   422	                // If the entry is not recognized, it is passed to the init process.
+   423	                // Pattern 'entry=value' is treated as the init environment.
+   424	                let envp_entry = CString::new(key.to_string() + "=" + value).unwrap();
+   425	                result.envp.push(envp_entry);
+   426	            } else if let Some((key, None)) = occurrences.last().copied() {
+   427	                // If the entry is not recognized, it is passed to the init process.
+   428	                // Pattern 'entry' without value is treated as the init argument.
+   429	                let argv_entry = CString::new(key.to_string()).unwrap();
+   430	                result.argv.push(argv_entry);
+   431	            } else {
+   432	                // This case should not happen since `occurrences` should never be empty.
+   433	                debug_assert!(!occurrences.is_empty());
+   434	            }
+   435	        }
+   436	    }
+   437	
+   438	    // Step 4: Call the setup function for each recognized parameter.
+   439	    let (early_params, params): (Vec<_>, Vec<_>) =
+   440	        recognized.into_iter().partition(|(p, _)| p.early);
+   441	    early_params
+   442	        .into_iter()
+   443	        .chain(params)
+   444	        .for_each(|(param, occurrences)| (param.setup)(occurrences));
+   445	
+   446	    result
+   447	}
+   448	
+   449	macro_rules! define_unimplemented_param {
+   450	    ($($name:expr),+ $(,)?) => {
+   451	        $(
+   452	            const _: () = {
+   453	                fn __kparam_setup(occurrences: &[(&str, Option<&str>)]) {
+   454	                    $crate::setup_unimplemented(occurrences, $name);
+   455	                }
+   456	                $crate::submit! {
+   457	                    $crate::KernelParam { name: $name, setup: __kparam_setup, early: false }
+   458	                }
+   459	            };
+   460	        )+
+
+exec
+/bin/bash -lc "nl -ba kernel/comps/cmdline/src/lib.rs | sed -n '460,540p' && nl -ba kernel/comps/cmdline/src/types.rs | sed -n '1,470p' && nl -ba kernel/comps/cmdline/Cargo.toml | sed -n '1,80p' && nl -ba kernel/comps/i8042/src/controller.rs | sed -n '150,410p' && nl -ba kernel/src/device/tty/device.rs | sed -n '90,175p' && nl -ba kernel/src/init.rs | sed -n '135,190p'" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0100/scratch/work/wt1
+ succeeded in 0ms:
+   460	        )+
+   461	    };
+   462	}
+   463	
+   464	fn setup_unimplemented(occurrences: &[(&str, Option<&str>)], name: &str) {
+   465	    if !occurrences.is_empty() {
+   466	        log::warn!("kernel parameter '{}' is not yet implemented", name);
+   467	    }
+   468	}
+   469	
+   470	// Placeholders for recognized but unimplemented kernel command-line parameters; these
+   471	// consume matching parameters so they are not forwarded to init and avoid unexpected
+   472	// boot behavior. A warning is emitted when such parameters appear.
+   473	define_unimplemented_param!(
+   474	    "tsc",
+   475	    "no_timer_check",
+   476	    "reboot",
+   477	    "pci",
+   478	    "debug",
+   479	    "panic",
+   480	    "nr_cpus",
+   481	    "selinux",
+   482	    "initrd"
+   483	);
+     1	// SPDX-License-Identifier: MPL-2.0
+     2	
+     3	//! Common parameter value types for the cmdline framework.
+     4	//!
+     5	//! This module provides Linux-style parsers that are frequently used by kernel
+     6	//! command lines so users of this framework don't need to rewrite them.
+     7	
+     8	#![allow(dead_code)]
+     9	
+    10	extern crate alloc;
+    11	
+    12	use alloc::vec::Vec;
+    13	
+    14	use crate::{ParamError, ParseParamValue};
+    15	
+    16	/// Linux-style CPU list.
+    17	///
+    18	/// Examples:
+    19	/// - `"1"`
+    20	/// - `"1,2,10-20"`
+    21	/// - `"100-2000:2/25"` (range with stride and optional group size)
+    22	///
+    23	/// The stored representation is a list of segments; expansion is optional.
+    24	#[derive(Debug, Clone, PartialEq, Eq)]
+    25	pub struct CpuList {
+    26	    segments: Vec<CpuListSegment>,
+    27	}
+    28	
+    29	#[derive(Debug, Clone, PartialEq, Eq)]
+    30	pub struct CpuListSegment {
+    31	    pub start: u32,
+    32	    pub end: u32,
+    33	    /// Step within range, default 1.
+    34	    pub stride: u32,
+    35	    /// Optional group size (the `/N` part). When present, stride selection is
+    36	    /// applied within each group window.
+    37	    pub group: Option<u32>,
+    38	}
+    39	
+    40	/// Linux-style metric-suffixed u64 value.
+    41	///
+    42	/// Supports binary multiples (KiB-style):
+    43	/// - `K` = 1024
+    44	/// - `M` = 1024^2
+    45	/// - `G` = 1024^3
+    46	/// - `T` = 1024^4
+    47	/// - `P` = 1024^5
+    48	///
+    49	/// Case-insensitive.
+    50	#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    51	pub struct MetricU64(pub u64);
+    52	
+    53	impl CpuList {
+    54	    pub fn segments(&self) -> &[CpuListSegment] {
+    55	        &self.segments
+    56	    }
+    57	
+    58	    pub fn contains(&self, cpu: u32) -> bool {
+    59	        self.segments.iter().any(|s| segment_contains(s, cpu))
+    60	    }
+    61	
+    62	    /// Expand to concrete CPU IDs, returning at most `max_elems` elements.
+    63	    ///
+    64	    /// Note: if the CPU list expands to more than `max_elems`, the result is truncated.
+    65	    pub fn expand_bounded(&self, max_elems: usize) -> Result<Vec<u32>, ParamError> {
+    66	        if max_elems == 0 {
+    67	            return Ok(Vec::new());
+    68	        }
+    69	
+    70	        let mut out = Vec::new();
+    71	
+    72	        // Helper: push a cpu id; if we reached the bound, stop expansion.
+    73	        let push_or_done = |out: &mut Vec<u32>, cpu: u32| -> bool {
+    74	            if out.len() >= max_elems {
+    75	                return true;
+    76	            }
+    77	            out.push(cpu);
+    78	            out.len() >= max_elems
+    79	        };
+    80	
+    81	        for s in &self.segments {
+    82	            if s.stride == 0 {
+    83	                return Err(ParamError::InvalidValue);
+    84	            }
+    85	            if let Some(g) = s.group
+    86	                && g == 0
+    87	            {
+    88	                return Err(ParamError::InvalidValue);
+    89	            }
+    90	            if s.start > s.end {
+    91	                return Err(ParamError::InvalidValue);
+    92	            }
+    93	
+    94	            // Fast path: no group => arithmetic progression from start to end by stride.
+    95	            if s.group.is_none() {
+    96	                let mut cur = s.start;
+    97	                while cur <= s.end {
+    98	                    if push_or_done(&mut out, cur) {
+    99	                        return Ok(out);
+   100	                    }
+   101	
+   102	                    match cur.checked_add(s.stride) {
+   103	                        Some(n) => cur = n,
+   104	                        None => break,
+   105	                    }
+   106	                }
+   107	                continue;
+   108	            }
+   109	
+   110	            // Grouped selection:
+   111	            // for each group window [start+gb, start+gb+g), emit start+gb+within for within=0,stride,2*stride...
+   112	            let g = s.group.unwrap();
+   113	            let stride = s.stride;
+   114	
+   115	            let mut gb: u32 = 0;
+   116	            while let Some(v) = s.start.checked_add(gb) {
+   117	                let group_start = v;
+   118	                if group_start > s.end {
+   119	                    break;
+   120	                }
+   121	
+   122	                let mut within: u32 = 0;
+   123	                while within < g {
+   124	                    let cpu = match group_start.checked_add(within) {
+   125	                        Some(v) => v,
+   126	                        None => break,
+   127	                    };
+   128	                    if cpu > s.end {
+   129	                        break;
+   130	                    }
+   131	
+   132	                    if push_or_done(&mut out, cpu) {
+   133	                        return Ok(out);
+   134	                    }
+   135	
+   136	                    match within.checked_add(stride) {
+   137	                        Some(n) => within = n,
+   138	                        None => break,
+   139	                    }
+   140	                }
+   141	
+   142	                match gb.checked_add(g) {
+   143	                    Some(n) => gb = n,
+   144	                    None => break,
+   145	                }
+   146	            }
+   147	        }
+   148	
+   149	        Ok(out)
+   150	    }
+   151	}
+   152	
+   153	fn segment_contains(s: &CpuListSegment, cpu: u32) -> bool {
+   154	    if cpu < s.start || cpu > s.end {
+   155	        return false;
+   156	    }
+   157	    if s.stride == 0 {
+   158	        return false;
+   159	    }
+   160	
+   161	    let offset = cpu - s.start;
+   162	    if let Some(g) = s.group {
+   163	        if g == 0 {
+   164	            return false;
+   165	        }
+   166	        let in_group_offset = offset % g;
+   167	        in_group_offset.is_multiple_of(s.stride)
+   168	    } else {
+   169	        offset.is_multiple_of(s.stride)
+   170	    }
+   171	}
+   172	
+   173	impl ParseParamValue for CpuList {
+   174	    fn parse_param(value: &str) -> Result<Self, ParamError> {
+   175	        if value.is_empty() {
+   176	            return Err(ParamError::InvalidValue);
+   177	        }
+   178	
+   179	        let mut segments = Vec::new();
+   180	        for part in value.split(',') {
+   181	            if part.is_empty() {
+   182	                return Err(ParamError::InvalidValue);
+   183	            }
+   184	            segments.push(parse_cpu_segment(part)?);
+   185	        }
+   186	
+   187	        Ok(CpuList { segments })
+   188	    }
+   189	}
+   190	
+   191	fn parse_cpu_segment(s: &str) -> Result<CpuListSegment, ParamError> {
+   192	    // Grammar (pragmatic):
+   193	    //   <range> [":" <stride> ["/" <group>] ]
+   194	    // where <range> := <n> | <n> "-" <m>
+   195	    let (range_part, tail) = match s.split_once(':') {
+   196	        Some((a, b)) => (a, Some(b)),
+   197	        None => (s, None),
+   198	    };
+   199	
+   200	    let (start, end) = if let Some((a, b)) = range_part.split_once('-') {
+   201	        (parse_u32(a)?, parse_u32(b)?)
+   202	    } else {
+   203	        let n = parse_u32(range_part)?;
+   204	        (n, n)
+   205	    };
+   206	
+   207	    if start > end {
+   208	        return Err(ParamError::InvalidValue);
+   209	    }
+   210	
+   211	    let (stride, group) = match tail {
+   212	        None => (1u32, None),
+   213	        Some(t) => {
+   214	            if t.is_empty() {
+   215	                return Err(ParamError::InvalidValue);
+   216	            }
+   217	            if let Some((stride_s, group_s)) = t.split_once('/') {
+   218	                let stride = parse_u32(stride_s)?;
+   219	                let group = parse_u32(group_s)?;
+   220	                (stride, Some(group))
+   221	            } else {
+   222	                (parse_u32(t)?, None)
+   223	            }
+   224	        }
+   225	    };
+   226	
+   227	    if stride == 0 {
+   228	        return Err(ParamError::InvalidValue);
+   229	    }
+   230	
+   231	    if let Some(g) = group
+   232	        && g == 0
+   233	    {
+   234	        return Err(ParamError::InvalidValue);
+   235	    }
+   236	
+   237	    Ok(CpuListSegment {
+   238	        start,
+   239	        end,
+   240	        stride,
+   241	        group,
+   242	    })
+   243	}
+   244	
+   245	fn parse_u32(s: &str) -> Result<u32, ParamError> {
+   246	    if s.is_empty() {
+   247	        return Err(ParamError::InvalidValue);
+   248	    }
+   249	    s.parse::<u32>().map_err(|_| ParamError::InvalidValue)
+   250	}
+   251	
+   252	impl ParseParamValue for MetricU64 {
+   253	    fn parse_param(value: &str) -> Result<Self, ParamError> {
+   254	        if value.is_empty() {
+   255	            return Err(ParamError::InvalidValue);
+   256	        }
+   257	
+   258	        let (num_part, suf) = match value.chars().last() {
+   259	            Some(c) if c.is_ascii_alphabetic() => (&value[..value.len() - c.len_utf8()], Some(c)),
+   260	            _ => (value, None),
+   261	        };
+   262	
+   263	        if num_part.is_empty() {
+   264	            return Err(ParamError::InvalidValue);
+   265	        }
+   266	
+   267	        let base: u64 = num_part.parse().map_err(|_| ParamError::InvalidValue)?;
+   268	        let mul: u64 = match suf.map(|c| c.to_ascii_uppercase()) {
+   269	            None => 1,
+   270	            Some('K') => 1024u64,
+   271	            Some('M') => 1024u64.pow(2),
+   272	            Some('G') => 1024u64.pow(3),
+   273	            Some('T') => 1024u64.pow(4),
+   274	            Some('P') => 1024u64.pow(5),
+   275	            _ => return Err(ParamError::InvalidValue),
+   276	        };
+   277	
+   278	        base.checked_mul(mul)
+   279	            .map(MetricU64)
+   280	            .ok_or(ParamError::InvalidValue)
+   281	    }
+   282	}
+   283	
+   284	#[cfg(ktest)]
+   285	mod test {
+   286	    use ostd::prelude::*;
+   287	
+   288	    use super::*;
+   289	
+   290	    #[ktest]
+   291	    fn metric_u64_parse_ok() {
+   292	        assert_eq!(MetricU64::parse_param("0").unwrap(), MetricU64(0));
+   293	        assert_eq!(MetricU64::parse_param("1").unwrap(), MetricU64(1));
+   294	
+   295	        assert_eq!(MetricU64::parse_param("1K").unwrap(), MetricU64(1024));
+   296	        assert_eq!(MetricU64::parse_param("2k").unwrap(), MetricU64(2 * 1024));
+   297	
+   298	        assert_eq!(
+   299	            MetricU64::parse_param("3M").unwrap(),
+   300	            MetricU64(3 * 1024u64.pow(2))
+   301	        );
+   302	        assert_eq!(
+   303	            MetricU64::parse_param("4G").unwrap(),
+   304	            MetricU64(4 * 1024u64.pow(3))
+   305	        );
+   306	        assert_eq!(
+   307	            MetricU64::parse_param("5T").unwrap(),
+   308	            MetricU64(5 * 1024u64.pow(4))
+   309	        );
+   310	        assert_eq!(
+   311	            MetricU64::parse_param("6P").unwrap(),
+   312	            MetricU64(6 * 1024u64.pow(5))
+   313	        );
+   314	    }
+   315	
+   316	    #[ktest]
+   317	    fn metric_u64_parse_err() {
+   318	        assert!(MetricU64::parse_param("").is_err());
+   319	        assert!(MetricU64::parse_param("   ").is_err());
+   320	        assert!(MetricU64::parse_param("K").is_err());
+   321	        assert!(MetricU64::parse_param("1KB").is_err());
+   322	        assert!(MetricU64::parse_param("1E").is_err());
+   323	        assert!(MetricU64::parse_param("-1").is_err());
+   324	        assert!(MetricU64::parse_param("1.5G").is_err());
+   325	    }
+   326	
+   327	    #[ktest]
+   328	    fn cpu_list_parse_ok_and_contains() {
+   329	        let cl = CpuList::parse_param("1").unwrap();
+   330	        assert_eq!(cl.segments().len(), 1);
+   331	        assert!(cl.contains(1));
+   332	        assert!(!cl.contains(0));
+   333	        assert!(!cl.contains(2));
+   334	
+   335	        let cl = CpuList::parse_param("1,2,10-20").unwrap();
+   336	        assert_eq!(cl.segments().len(), 3);
+   337	        assert!(cl.contains(1));
+   338	        assert!(cl.contains(2));
+   339	        assert!(cl.contains(10));
+   340	        assert!(cl.contains(20));
+   341	        assert!(!cl.contains(21));
+   342	
+   343	        // range with stride: 100-110:2 => 100,102,104,106,108,110
+   344	        let cl = CpuList::parse_param("100-110:2").unwrap();
+   345	        assert!(cl.contains(100));
+   346	        assert!(!cl.contains(101));
+   347	        assert!(cl.contains(102));
+   348	        assert!(!cl.contains(103));
+   349	        assert!(cl.contains(110));
+   350	    }
+   351	
+   352	    #[ktest]
+   353	    fn cpu_list_parse_ok_group_stride() {
+   354	        // 0-9:2/4
+   355	        // windows of 4: [0..3] picks 0,2; [4..7] picks 4,6; [8..11] picks 8,10
+   356	        // intersect with 0..9 => 0,2,4,6,8
+   357	        let cl = CpuList::parse_param("0-9:2/4").unwrap();
+   358	        assert!(cl.contains(0));
+   359	        assert!(!cl.contains(1));
+   360	        assert!(cl.contains(2));
+   361	        assert!(!cl.contains(3));
+   362	        assert!(cl.contains(4));
+   363	        assert!(!cl.contains(5));
+   364	        assert!(cl.contains(6));
+   365	        assert!(!cl.contains(7));
+   366	        assert!(cl.contains(8));
+   367	        assert!(!cl.contains(9));
+   368	    }
+   369	
+   370	    #[ktest]
+   371	    fn cpu_list_parse_err() {
+   372	        assert!(CpuList::parse_param("").is_err());
+   373	        assert!(CpuList::parse_param("   ").is_err());
+   374	        assert!(CpuList::parse_param(",").is_err());
+   375	        assert!(CpuList::parse_param("1,").is_err());
+   376	        assert!(CpuList::parse_param("1,,2").is_err());
+   377	        assert!(CpuList::parse_param("a").is_err());
+   378	        assert!(CpuList::parse_param("1-a").is_err());
+   379	        assert!(CpuList::parse_param("2-1").is_err()); // start > end
+   380	        assert!(CpuList::parse_param("1:0").is_err()); // stride 0
+   381	        assert!(CpuList::parse_param("1:2/0").is_err()); // group 0
+   382	        assert!(CpuList::parse_param("1:").is_err());
+   383	        assert!(CpuList::parse_param("1-/2").is_err());
+   384	    }
+   385	
+   386	    #[ktest]
+   387	    fn cpu_list_expand_bounded() {
+   388	        let cl = CpuList::parse_param("10-20:2").unwrap(); // 10,12,14,16,18,20 => 6 elems
+   389	        let v = cl.expand_bounded(6).unwrap();
+   390	        assert_eq!(v.as_slice(), &[10u32, 12u32, 14u32, 16u32, 18u32, 20u32]);
+   391	
+   392	        let v = cl.expand_bounded(5).unwrap();
+   393	        assert_eq!(v.as_slice(), &[10u32, 12u32, 14u32, 16u32, 18u32]);
+   394	    }
+   395	
+   396	    #[ktest]
+   397	    fn cpu_list_expand_bounded_large_range_stride_fast() {
+   398	        // 0-4_000_000_000:1024 should not scan the whole range; it should just step by 1024.
+   399	        // We only ask for a few elements to ensure it returns quickly and correctly.
+   400	        let cl = CpuList::parse_param("0-4000000000:1024").unwrap();
+   401	        let v = cl.expand_bounded(4).unwrap();
+   402	        assert_eq!(v.as_slice(), &[0u32, 1024u32, 2048u32, 3072u32]);
+   403	    }
+   404	
+   405	    #[ktest]
+   406	    fn cpu_list_expand_bounded_group_large_range_fast() {
+   407	        // Grouped selection still shouldn't scan by +1.
+   408	        // 0-4_000_000_000:2/4 => in each group of 4 select offsets 0 and 2.
+   409	        // First few selected: 0,2,4,6,8,10,...
+   410	        let cl = CpuList::parse_param("0-4000000000:2/4").unwrap();
+   411	        let v = cl.expand_bounded(6).unwrap();
+   412	        assert_eq!(v.as_slice(), &[0u32, 2u32, 4u32, 6u32, 8u32, 10u32]);
+   413	    }
+   414	
+   415	    #[ktest]
+   416	    fn cpu_list_expand_bounded_group_respects_end_boundary() {
+   417	        // Ensure the last (partial) group is clipped by end.
+   418	        // 0-5:2/4 => groups [0..3] => 0,2; [4..7] => 4,6 but end=5 so only 4.
+   419	        let cl = CpuList::parse_param("0-5:2/4").unwrap();
+   420	        let v = cl.expand_bounded(8).unwrap();
+   421	        assert_eq!(v.as_slice(), &[0u32, 2u32, 4u32]);
+   422	    }
+   423	
+   424	    #[ktest]
+   425	    fn cpu_list_expand_bounded_group_stride_gt_group() {
+   426	        // stride > group: only within=0 is emitted per group.
+   427	        // 0-20:8/4 => groups start at 0,4,8,12,16,20 => emit 0,4,8,12,16,20
+   428	        let cl = CpuList::parse_param("0-20:8/4").unwrap();
+   429	        let v = cl.expand_bounded(16).unwrap();
+   430	        assert_eq!(v.as_slice(), &[0u32, 4u32, 8u32, 12u32, 16u32, 20u32]);
+   431	    }
+   432	}
+     1	[package]
+     2	name = "aster-cmdline"
+     3	version = "0.1.0"
+     4	edition.workspace = true
+     5	
+     6	# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+     7	
+     8	[dependencies]
+     9	component.workspace = true
+    10	log.workspace = true
+    11	ostd.workspace = true
+    12	spin.workspace = true
+    13	inventory = { git = "https://github.com/asterinas/inventory", rev = "9dce587" }
+    14	
+    15	[lints]
+    16	workspace = true
+   150	            } else {
+   151	                log::info!(
+   152	                    "ACPI says i8042 controller is absent; \
+   153	                    however, it is overridden by 'i8042.exist' in cmdline"
+   154	                );
+   155	            }
+   156	        } else {
+   157	            log::info!("ACPI says i8042 controller is present");
+   158	        }
+   159	
+   160	        let controller = Self {
+   161	            data_port: IoPort::acquire(DATA_PORT_ADDR).unwrap(),
+   162	            status_or_command_port: IoPort::acquire(STATUS_OR_COMMAND_PORT_ADDR).unwrap(),
+   163	        };
+   164	        Ok(controller)
+   165	    }
+   166	
+   167	    fn is_present_acpi() -> bool {
+   168	        ACPI_INFO
+   169	            .get()
+   170	            .unwrap()
+   171	            .boot_flags
+   172	            .is_some_and(|flags| flags.motherboard_implements_8042())
+   173	    }
+   174	
+   175	    /// Checks if the kernel command line contains the "i8042.exist" option.
+   176	    fn is_present_cmdline() -> bool {
+   177	        I8042_EXIST.get().copied().unwrap_or(false)
+   178	    }
+   179	
+   180	    fn read_configuration(&mut self) -> Result<Configuration, I8042ControllerError> {
+   181	        self.wait_and_send_command(Command::ReadConfiguration)?;
+   182	        self.wait_and_recv_data()
+   183	            .map(Configuration::from_bits_retain)
+   184	    }
+   185	
+   186	    fn write_configuration(&mut self, config: &Configuration) -> Result<(), I8042ControllerError> {
+   187	        self.wait_and_send_command(Command::WriteConfiguration)?;
+   188	        self.wait_and_send_data(config.bits())
+   189	    }
+   190	
+   191	    fn wait_and_send_command(&mut self, command: Command) -> Result<(), I8042ControllerError> {
+   192	        spin_wait_until(Timeout::Short, || self.send_command(command).ok())
+   193	            .ok_or(I8042ControllerError::OutputBusy)
+   194	    }
+   195	
+   196	    fn send_command(&mut self, command: Command) -> Result<(), I8042ControllerError> {
+   197	        if !self.read_status().contains(Status::INPUT_BUFFER_IS_FULL) {
+   198	            self.write_command(command as u8);
+   199	            Ok(())
+   200	        } else {
+   201	            Err(I8042ControllerError::OutputBusy)
+   202	        }
+   203	    }
+   204	
+   205	    fn read_status(&self) -> Status {
+   206	        Status::from_bits_retain(self.status_or_command_port.read())
+   207	    }
+   208	
+   209	    fn write_command(&mut self, command: u8) {
+   210	        self.status_or_command_port.write(command);
+   211	    }
+   212	
+   213	    pub(super) fn wait_and_send_data(&mut self, data: u8) -> Result<(), I8042ControllerError> {
+   214	        spin_wait_until(Timeout::Short, || self.send_data(data).ok())
+   215	            .ok_or(I8042ControllerError::OutputBusy)
+   216	    }
+   217	
+   218	    pub(super) fn write_to_second_port(&mut self, data: u8) -> Result<(), I8042ControllerError> {
+   219	        self.wait_and_send_command(Command::WriteToSecondPort)?;
+   220	        self.wait_and_send_data(data)
+   221	    }
+   222	
+   223	    pub(super) fn send_data(&mut self, data: u8) -> Result<(), I8042ControllerError> {
+   224	        if !self.read_status().contains(Status::INPUT_BUFFER_IS_FULL) {
+   225	            self.write_data(data);
+   226	            Ok(())
+   227	        } else {
+   228	            Err(I8042ControllerError::OutputBusy)
+   229	        }
+   230	    }
+   231	
+   232	    fn write_data(&mut self, data: u8) {
+   233	        self.data_port.write(data);
+   234	    }
+   235	
+   236	    pub(super) fn wait_and_recv_data(&mut self) -> Result<u8, I8042ControllerError> {
+   237	        spin_wait_until(Timeout::Short, || self.receive_data()).ok_or(I8042ControllerError::NoInput)
+   238	    }
+   239	
+   240	    /// Waits a long time for the data to be received.
+   241	    ///
+   242	    /// This is usually used when performing a reset that takes a long time to complete.
+   243	    pub(super) fn wait_long_and_recv_data(&mut self) -> Result<u8, I8042ControllerError> {
+   244	        spin_wait_until(Timeout::Long, || self.receive_data()).ok_or(I8042ControllerError::NoInput)
+   245	    }
+   246	
+   247	    /// Waits for the specified data to be received.
+   248	    ///
+   249	    /// This is typically used when waiting for an acknowledgment of a command. Any garbage data
+   250	    /// before the acknowledgment is ignored.
+   251	    pub(super) fn wait_for_specific_data(
+   252	        &mut self,
+   253	        data: &[u8],
+   254	    ) -> Result<u8, I8042ControllerError> {
+   255	        spin_wait_until(Timeout::Short, || {
+   256	            self.receive_data().filter(|val| data.contains(val))
+   257	        })
+   258	        .ok_or(I8042ControllerError::NoInput)
+   259	    }
+   260	
+   261	    pub(super) fn receive_data(&mut self) -> Option<u8> {
+   262	        if self.read_status().contains(Status::OUTPUT_BUFFER_IS_FULL) {
+   263	            Some(self.read_data())
+   264	        } else {
+   265	            None
+   266	        }
+   267	    }
+   268	
+   269	    fn read_data(&self) -> u8 {
+   270	        self.data_port.read()
+   271	    }
+   272	
+   273	    fn flush_output_buffer(&mut self) {
+   274	        while self.receive_data().is_some() {}
+   275	    }
+   276	}
+   277	
+   278	/// Timeout in milliseconds for sending commands or receiving data.
+   279	///
+   280	/// Reference: <https://elixir.bootlin.com/linux/v6.17.9/source/drivers/input/serio/libps2.c#L344>
+   281	#[repr(u16)]
+   282	#[derive(Debug, Clone, Copy)]
+   283	enum Timeout {
+   284	    /// Short timeout for normal commands (500 ms).
+   285	    Short = 500,
+   286	    /// Long timeout for the reset command (4000 ms).
+   287	    Long = 4000,
+   288	}
+   289	
+   290	/// Spins and waits until the timeout occurs or `f` returns `Some(_)`.
+   291	//
+   292	// TODO: The timeout is relatively large, up to several seconds. Therefore, spinning here is not
+   293	// appropriate. The code needs to be refactored to use asynchronous interrupts.
+   294	fn spin_wait_until<F, R>(timeout: Timeout, mut f: F) -> Option<R>
+   295	where
+   296	    F: FnMut() -> Option<R>,
+   297	{
+   298	    use ostd::arch::{read_tsc, tsc_freq};
+   299	
+   300	    const MSEC_PER_SEC: u64 = 1000;
+   301	
+   302	    if let Some(res) = f() {
+   303	        return Some(res);
+   304	    }
+   305	
+   306	    let current = read_tsc();
+   307	    let distance = tsc_freq() / MSEC_PER_SEC * (timeout as u16 as u64);
+   308	    loop {
+   309	        if let Some(res) = f() {
+   310	            return Some(res);
+   311	        }
+   312	        if read_tsc().wrapping_sub(current) >= distance {
+   313	            return None;
+   314	        }
+   315	        core::hint::spin_loop();
+   316	    }
+   317	}
+   318	
+   319	/// Errors that can occur when initializing the i8042 controller.
+   320	#[derive(Debug, Clone, Copy)]
+   321	pub(super) enum I8042ControllerError {
+   322	    NotPresent,
+   323	    ControllerTestFailed,
+   324	    FirstPortTestFailed,
+   325	    SecondPortTestFailed,
+   326	    OutputBusy,
+   327	    NoInput,
+   328	    DeviceResetFailed,
+   329	    DeviceUnknown,
+   330	    DeviceAllocIrqFailed,
+   331	}
+   332	
+   333	/// The commands that can be sent to the PS/2 controller.
+   334	///
+   335	/// Reference: <https://wiki.osdev.org/I8042_PS/2_Controller#PS/2_Controller_Commands>.
+   336	#[derive(Debug, Clone, Copy)]
+   337	#[repr(u8)]
+   338	enum Command {
+   339	    ReadConfiguration = 0x20,
+   340	    WriteConfiguration = 0x60,
+   341	    DisableSecondPort = 0xA7,
+   342	    EnableSecondPort = 0xA8,
+   343	    TestSecondPort = 0xA9,
+   344	    TestController = 0xAA,
+   345	    TestFirstPort = 0xAB,
+   346	    DisableFirstPort = 0xAD,
+   347	    EnableFirstPort = 0xAE,
+   348	    WriteToSecondPort = 0xD4,
+   349	}
+   350	
+   351	bitflags! {
+   352	    /// The configuration of the PS/2 controller.
+   353	    ///
+   354	    /// Reference: <https://wiki.osdev.org/I8042_PS/2_Controller#PS/2_Controller_Configuration_Byte>.
+   355	    struct Configuration: u8 {
+   356	        /// First PS/2 port interrupt (1 = enabled, 0 = disabled)
+   357	        const FIRST_PORT_INTERRUPT_ENABLED = 1 << 0;
+   358	        /// Second PS/2 port interrupt (1 = enabled, 0 = disabled, only if 2 PS/2 ports supported)
+   359	        const SECOND_PORT_INTERRUPT_ENABLED = 1 << 1;
+   360	        /// System Flag (1 = system passed POST, 0 = your OS shouldn't be running)
+   361	        const SYSTEM_POST_PASSED = 1 << 2;
+   362	        /// First PS/2 port clock (1 = disabled, 0 = enabled)
+   363	        const FIRST_PORT_CLOCK_DISABLED = 1 << 4;
+   364	        /// Second PS/2 port clock (1 = disabled, 0 = enabled, only if 2 PS/2 ports supported)
+   365	        const SECOND_PORT_CLOCK_DISABLED = 1 << 5;
+   366	        /// First PS/2 port translation (1 = enabled, 0 = disabled)
+   367	        const FIRST_PORT_TRANSLATION_ENABLED = 1 << 6;
+   368	    }
+   369	}
+   370	
+   371	bitflags! {
+   372	    /// The status of the i8042 PS/2 controller.
+   373	    ///
+   374	    /// Reference: <https://wiki.osdev.org/I8042_PS/2_Controller#Status_Register>.
+   375	    struct Status: u8 {
+   376	        /// Output buffer status (0 = empty, 1 = full)
+   377	        /// Must be set before attempting to read data from port 0x60.
+   378	        const OUTPUT_BUFFER_IS_FULL = 1 << 0;
+   379	        /// Input buffer status (0 = empty, 1 = full)
+   380	        /// Must be clear before attempting to write data to IO port 0x60 or IO port 0x64.
+   381	        const INPUT_BUFFER_IS_FULL = 1 << 1;
+   382	        /// System Flag
+   383	        /// Meant to be cleared on reset and set by firmware (via. PS/2 Controller Configuration Byte)
+   384	        /// if the system passes self tests (POST).
+   385	        const SYSTEM_FLAG = 1 << 2;
+   386	        /// Command or data (0 = data, 1 = command)
+   387	        /// Data written to input buffer is data for PS/2 device or command for controller.
+   388	        const IS_COMMAND = 1 << 3;
+   389	        /// Time-out error (0 = no error, 1 = time-out error)
+   390	        const TIME_OUT_ERROR = 1 << 6;
+   391	        /// Parity error (0 = no error, 1 = parity error)
+   392	        const PARITY_ERROR = 1 << 7;
+   393	    }
+   394	}
+   395	
+   396	static I8042_EXIST: Once<bool> = Once::new();
+   397	aster_cmdline::define_flag_param!("i8042.exist", I8042_EXIST);
+    90	    }
+    91	}
+    92	
+    93	/// Corresponds to `/dev/console` in the file system. This device represents a console to which
+    94	/// system messages will be sent.
+    95	pub struct SystemConsole {
+    96	    inner: Arc<dyn Terminal>,
+    97	}
+    98	
+    99	impl SystemConsole {
+   100	    /// Returns the singleton instance of the console device.
+   101	    pub fn singleton() -> &'static Arc<SystemConsole> {
+   102	        static INSTANCE: Once<Arc<SystemConsole>> = Once::new();
+   103	
+   104	        INSTANCE.call_once(|| {
+   105	            // TODO: Support specifying multiple TTY devices, e.g., "console=hvc0 console=tty0".
+   106	            let console_name = CONSOLES
+   107	                .get()
+   108	                .and_then(|consoles| consoles.first().map(|s| s.as_str()))
+   109	                .unwrap_or("tty0");
+   110	
+   111	            let device = match console_name {
+   112	                "tty0" => Some(Arc::new(Tty0Device) as _),
+   113	                "ttyS0" => serial0_device().cloned().map(|device| device as _),
+   114	                "hvc0" => hvc0_device().cloned().map(|device| device as _),
+   115	                _ => None,
+   116	            };
+   117	            let inner = device.unwrap_or_else(|| {
+   118	                warn!(
+   119	                    "'{}' console not found, falling back to 'tty0'",
+   120	                    console_name
+   121	                );
+   122	                Arc::new(Tty0Device) as _
+   123	            });
+   124	
+   125	            Arc::new(Self { inner })
+   126	        })
+   127	    }
+   128	
+   129	    /// Returns the terminal associated with the console device.
+   130	    pub fn terminal(&self) -> &Arc<dyn Terminal> {
+   131	        &self.inner
+   132	    }
+   133	}
+   134	
+   135	impl Device for SystemConsole {
+   136	    fn type_(&self) -> DeviceType {
+   137	        DeviceType::Char
+   138	    }
+   139	
+   140	    fn id(&self) -> DeviceId {
+   141	        DeviceId::new(MajorId::new(5), MinorId::new(1))
+   142	    }
+   143	
+   144	    fn devtmpfs_path(&self) -> Option<String> {
+   145	        Some("console".into())
+   146	    }
+   147	
+   148	    fn open(&self) -> Result<Box<dyn FileIo>> {
+   149	        self.inner.open()
+   150	    }
+   151	}
+   152	
+   153	pub(super) fn init_in_first_process() -> Result<()> {
+   154	    char::register(Arc::new(Tty0Device))?;
+   155	    char::register(Arc::new(TtyDevice))?;
+   156	    char::register(SystemConsole::singleton().clone())?;
+   157	
+   158	    Ok(())
+   159	}
+   160	
+   161	static CONSOLES: Once<Vec<String>> = Once::new();
+   162	aster_cmdline::define_repeatable_kv_param!("console", CONSOLES);
+   135	// The main function of the first (non-idle) kernel thread
+   136	fn first_kthread() {
+   137	    println!("[kernel] Spawn the first kernel thread");
+   138	
+   139	    let init_mnt_ns = MountNamespace::get_init_singleton();
+   140	    let fs_resolver = init_mnt_ns.new_path_resolver();
+   141	    init_in_first_kthread(&fs_resolver);
+   142	
+   143	    print_banner();
+   144	
+   145	    INIT_PROCESS.call_once(|| {
+   146	        let karg = INIT_PROC_ARGS.get().unwrap();
+   147	        let init_path = INIT_PATH.get().expect("Init process path not specified.");
+   148	        spawn_init_process(init_path, karg.argv().to_vec(), karg.envp().to_vec())
+   149	            .expect("Run init process failed.")
+   150	    });
+   151	}
+   152	
+   153	static INIT_PROCESS: Once<Arc<Process>> = Once::new();
+   154	
+   155	fn init_in_first_kthread(path_resolver: &PathResolver) {
+   156	    component::init_all(InitStage::Kthread, component::parse_metadata!()).unwrap();
+   157	    // Work queue should be initialized before interrupt is enabled,
+   158	    // in case any irq handler uses work queue as bottom half
+   159	    crate::thread::work_queue::init_in_first_kthread();
+   160	    crate::device::init_in_first_kthread();
+   161	    crate::net::init_in_first_kthread();
+   162	    crate::fs::init_in_first_kthread(path_resolver);
+   163	    crate::ipc::init_in_first_kthread();
+   164	    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+   165	    crate::vdso::init_in_first_kthread();
+   166	}
+   167	
+   168	fn print_banner() {
+   169	    println!("");
+   170	    println!("{}", logo_ascii_art::get_gradient_color_version());
+   171	}
+   172	
+   173	pub(crate) fn on_first_process_startup(ctx: &Context) {
+   174	    component::init_all(InitStage::Process, component::parse_metadata!()).unwrap();
+   175	    crate::device::init_in_first_process(ctx).unwrap();
+   176	    crate::fs::init_in_first_process(ctx);
+   177	    crate::process::init_in_first_process(ctx);
+   178	}
+   179	
+   180	static INIT_PATH: Once<String> = Once::new();
+   181	aster_cmdline::define_kv_param!("init", INIT_PATH);
+
+codex
+The main maintainability pressure points are in the new command-line framework surface: dependency declaration, broad lint suppression, and exposed representation. I’m narrowing that to issues that are concrete enough to report without drifting into runtime-correctness review.
+exec
+/bin/bash -lc "rg -n \"\\[workspace\\.dependencies\\]|inventory\" Cargo.toml kernel/comps/cmdline/Cargo.toml Cargo.lock" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0100/scratch/work/wt1
+ succeeded in 0ms:
+Cargo.lock:116: "inventory",
+Cargo.lock:518: "inventory",
+Cargo.lock:1005:name = "inventory"
+Cargo.lock:1007:source = "git+https://github.com/asterinas/inventory?rev=9dce587#9dce58712d1cd1e51ff067634d42b5c5fea29f48"
+Cargo.toml:86:[workspace.dependencies]
+kernel/comps/cmdline/Cargo.toml:13:inventory = { git = "https://github.com/asterinas/inventory", rev = "9dce587" }
+
+exec
+/bin/bash -lc "sed -n '86,180p' Cargo.toml" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0100/scratch/work/wt1
+ succeeded in 0ms:
+[workspace.dependencies]
+ostd = { version = "0.17.0", path = "ostd" }
+
+# Crates under ostd/libs
+align_ext = { path = "ostd/libs/align_ext", version = "0.1.0" }
+id-alloc = { path = "ostd/libs/id-alloc", version = "0.1.0" }
+int-to-c-enum = { path = "ostd/libs/int-to-c-enum", version = "0.1.0" }
+linux-boot-params = { version = "0.17.0", path = "ostd/libs/linux-bzimage/boot-params" }
+ostd-macros = { version = "0.17.0", path = "ostd/libs/ostd-macros" }
+ostd-pod = { path = "ostd/libs/ostd-pod", version = "0.4.0" }
+ostd-test = { version = "0.17.0", path = "ostd/libs/ostd-test" }
+
+# Crates under kernel/comps
+aster-block = { path = "kernel/comps/block" }
+aster-cmdline = { path = "kernel/comps/cmdline" }
+aster-console = { path = "kernel/comps/console" }
+aster-framebuffer = { path = "kernel/comps/framebuffer" }
+aster-i8042 = { path = "kernel/comps/i8042" }
+aster-input = { path = "kernel/comps/input" }
+aster-logger = { path = "kernel/comps/logger" }
+aster-mlsdisk = { path = "kernel/comps/mlsdisk" }
+aster-network = { path = "kernel/comps/network" }
+aster-pci = { path = "kernel/comps/pci" }
+aster-softirq = { path = "kernel/comps/softirq" }
+aster-systree = { path = "kernel/comps/systree" }
+aster-time = { path = "kernel/comps/time" }
+aster-uart = { path = "kernel/comps/uart" }
+aster-virtio = { path = "kernel/comps/virtio" }
+
+# Crates under kernel/libs
+aster-bigtcp = { path = "kernel/libs/aster-bigtcp" }
+aster-rights = { path = "kernel/libs/aster-rights" }
+aster-rights-proc = { path = "kernel/libs/aster-rights-proc" }
+aster-util = { path = "kernel/libs/aster-util" }
+atomic-integer-wrapper = { path = "kernel/libs/atomic-integer-wrapper" }
+cpio-decoder = { path = "kernel/libs/cpio-decoder" }
+device-id = { path = "kernel/libs/device-id" }
+jhash = { path = "kernel/libs/jhash" }
+keyable-arc = { path = "kernel/libs/keyable-arc" }
+logo-ascii-art = { path = "kernel/libs/logo-ascii-art" }
+typeflags = { path = "kernel/libs/typeflags" }
+typeflags-util = { path = "kernel/libs/typeflags-util" }
+xarray = { path = "kernel/libs/xarray" }
+
+# Crates under kernel/libs/comp-sys
+component = { path = "kernel/libs/comp-sys/component" }
+controlled = { path = "kernel/libs/comp-sys/controlled" }
+
+# Crates under osdk/deps
+osdk-frame-allocator = { path = "osdk/deps/frame-allocator" }
+osdk-heap-allocator = { path = "osdk/deps/heap-allocator" }
+
+# External dependencies only for unsafe crates (i.e., crates under ostd directory)
+bit_field = "0.10.1"
+gimli = { version = "0.28", default-features = false, features = ["read-core"] }
+minicov = "0.3"
+num-traits = { version = "0.2", default-features = false }
+serde = { version = "1.0.192", default-features = false, features = ["alloc", "derive"] }
+smallvec = "1.13.2"
+uart_16550 = "0.3.0"
+volatile = "0.6.1"
+
+# External dependencies only for safe crates (i.e., crates under kernel or osdk/deps directories)
+#
+# Enable `force-soft` feature to disable `AES-NI` and `CLMUL` intrinsics, ensuring that the implementation
+# relies solely on software, and in the software implementation, unsafe code is rarely used.
+# FIXME: to utilize `AES-NI` and `CLMUL` intrinsics, some specific flags must be added to `RUSTFLAGS`,
+# i.e. `-Ctarget-cpu=sandybridge -Ctarget-feature=+aes,+sse2,+sse4.1,+ssse3`.
+# This suggests that `Asterinas` should support saving and restoring the `FPU` state within the kernel context,
+# a capability it currently lacks.
+aes-gcm = { version = "0.9.4", features = ["force-soft"] }
+bittle = "0.5.6"
+const_format = "0.2.35"
+ctr = "0.8.0"
+font8x8 = { version = "0.2.5", default-features = false, features = [ "unicode" ] }
+getset = "0.1.2"
+hashbrown = { version = "0.14.3", features = ["serde"]  }
+itertools = "0.10.5"
+lending-iterator = "0.1.7"
+lru = "0.16.3"
+owo-colors = "4.2.2"
+paste = "1.0.15"
+postcard = "1.0.6"
+smoltcp = { git = "https://github.com/asterinas/smoltcp", tag = "r_2024-11-08_f07e5b5", default-features = false, features = [
+    "alloc",
+    "log",
+    "medium-ethernet",
+    "medium-ip",
+    "proto-ipv4",
+    "socket-udp",
+    "socket-tcp",
+] }
+takeable = "0.2.2"
+time = { version = "0.3", default-features = false, features = ["alloc"] }
+
+
+codex
+[
+  {
+    "file": "kernel/comps/cmdline/Cargo.toml",
+    "line": 13,
+    "persona": "maintainability",
+    "grounding": "workspace-deps",
+    "severity": "major",
+    "problem": "`inventory` is declared directly in `kernel/comps/cmdline/Cargo.toml`, bypassing the workspace dependency table. That gives this crate its own dependency spelling/version source instead of the single workspace representation used for shared dependencies.",
+    "fix": "Move `inventory` to the root `[workspace.dependencies]` table, then reference it here as `inventory.workspace = true`.",
+    "diff": "[dependencies]\n component.workspace = true\n log.workspace = true\n ostd.workspace = true\n spin.workspace = true\n+inventory = { git = \"https://github.com/asterinas/inventory\", rev = \"9dce587\" }"
+  },
+  {
+    "file": "kernel/comps/cmdline/src/lib.rs",
+    "line": 179,
+    "persona": "maintainability",
+    "grounding": "information-hiding",
+    "severity": "minor",
+    "problem": "`InitprocArgs::argv` and `InitprocArgs::envp` expose `Vec` in their return types even though callers only need to inspect/copy the entries. This leaks the storage choice into the public API and makes a future representation change noisier.",
+    "fix": "Return slices from these getters, e.g. `pub fn argv(&self) -> &[CString]` and `pub fn envp(&self) -> &[CString]`; existing callers can still use `.to_vec()` on the slice.",
+    "diff": "impl InitprocArgs {\n    /// Gets the argument vector (`argv`) of the init process.\n    pub fn argv(&self) -> &Vec<CString> {\n        &self.argv\n    }\n\n    /// Gets the environment vector (`envp`) of the init process.\n    pub fn envp(&self) -> &Vec<CString> {\n        &self.envp\n    }\n}"
+  },
+  {
+    "file": "kernel/comps/cmdline/src/types.rs",
+    "line": 8,
+    "persona": "maintainability",
+    "grounding": "narrow-lint-suppression",
+    "severity": "minor",
+    "problem": "The module-level `#![allow(dead_code)]` suppresses `dead_code` for the entire `types` module, including any future private helpers added here. That makes unused code harder to notice and is broader than the actual planned-unused items.",
+    "fix": "Remove the module-level suppression. If a specific item is intentionally unused for a concrete future parameter, put `#[expect(dead_code)]` on that item with a short reason.",
+    "diff": "//! command lines so users of this framework don't need to rewrite them.\n\n#![allow(dead_code)]\n\nextern crate alloc;"
+  },
+  {
+    "file": "kernel/comps/cmdline/src/types.rs",
+    "line": 30,
+    "persona": "maintainability",
+    "grounding": "getter-encapsulation",
+    "severity": "minor",
+    "problem": "`CpuListSegment` exposes all representation fields as `pub`, including invariant-bearing fields such as `stride` and `group`. Once consumers rely on these fields directly, it becomes harder to rename them or tighten invariants like non-zero stride/group values.",
+    "fix": "Keep the fields private and expose simple getters such as `start()`, `end()`, `stride()`, and `group()`. If external construction is needed, add a checked constructor instead of exposing the raw fields.",
+    "diff": "pub struct CpuListSegment {\n    pub start: u32,\n    pub end: u32,\n    /// Step within range, default 1.\n    pub stride: u32,\n    /// Optional group size (the `/N` part). When present, stride selection is\n    /// applied within each group window.\n    pub group: Option<u32>,\n}"
+  }
+]
+tokens used
+34,849
+
+
+
+
+分析log过程：
+
+• 我先给结论：从 benchmark_runs/codex_all_20260727T115738Z/0100/
+  extract_log.txt:1652 和最终 benchmark_runs/codex_all_20260727T115738Z/0100/
+  keep/0100-cmdline-maintainability-issues/review-fanout.md:1 看，Codex 实际上写出
+  了 0100 的三个 expected defects。如果你的统计显示“只能找到一个”，那大概率是匹配
+  器只计入了字段完全对齐的一条，而不是 agent 真没发现另外两条。
+
+  哪个最可能被计入
+
+  最可能被计入的是 defect #2：types.rs 的模块级 #![allow(dead_code)]。
+
+  Expected 在 benchmark_runs/codex_all_20260727T115738Z/0100/keep/0100-cmdline-
+  maintainability-issues/expected-defects.txt:7：narrow-lint-suppression、severity
+  minor、line 8。
+
+  Codex 输出在 benchmark_runs/codex_all_20260727T115738Z/0100/
+  extract_log.txt:1672：同文件、line 8、grounding narrow-lint-suppression、
+  severity minor，问题描述也完全一致。所以这条最稳。
+
+  另外两条其实也写了，但可能没被计入
+
+  Defect #1：inventory 直接声明在 member crate。
+  Expected 是 benchmark_runs/codex_all_20260727T115738Z/0100/keep/0100-cmdline-
+  maintainability-issues/expected-defects.txt:3，severity 是 minor。Codex 在
+  benchmark_runs/codex_all_20260727T115738Z/0100/extract_log.txt:1652 报了同一个问
+  题，grounding 也是 workspace-deps，fix 也是移到 workspace 后用
+  inventory.workspace = true。但它把 severity 写成了 major。如果评测器严格匹配
+  severity，这条会被判 miss。
+
+  Defect #3：CpuListSegment public fields 破坏封装。
+  Expected 是 benchmark_runs/codex_all_20260727T115738Z/0100/keep/0100-cmdline-
+  maintainability-issues/expected-defects.txt:11，line 31。Codex 在
+  benchmark_runs/codex_all_20260727T115738Z/0100/extract_log.txt:1682 报了 getter-
+  encapsulation，内容也说 CpuListSegment exposes all representation fields as
+  pub，并建议 private fields + getters / checked constructor。问题是它锚在 line
+  30，也就是 pub struct CpuListSegment {，而 expected 写的是 line 31，也就是第一个
+  public field pub start: u32。如果评测器对 line 很严格，这条也可能不计入。
+
+  Agent 的思维过程
+
+  它一开始就是 maintainability-only pass，没有跑 correctness/security。它先读
+  skill，然后直接读了 kernel/comps/cmdline/src/lib.rs，再读 types.rs、Cargo.toml
+  和若干使用方。日志里它明确总结了自己的关注点：benchmark_runs/
+  codex_all_20260727T115738Z/0100/extract_log.txt:1527 说“main maintainability
+  pressure points are dependency declaration, broad lint suppression, and exposed
+  representation”。这三个正好对应 expected defects。
+
+  然后它验证 workspace 依赖：在 benchmark_runs/codex_all_20260727T115738Z/0100/
+  extract_log.txt:1548 搜到 kernel/comps/cmdline/Cargo.toml:13 直接声明
+  inventory，并查看根 Cargo.toml 的 [workspace.dependencies]。最后输出了
+  workspace-deps finding。
+
+  它也看到了 types.rs line 8 的 #![allow(dead_code)]，见 benchmark_runs/
+  codex_all_20260727T115738Z/0100/extract_log.txt:728，最终输出 narrow-lint-
+  suppression。
+
+  它还看到了 CpuListSegment public fields，见 benchmark_runs/
+  codex_all_20260727T115738Z/0100/extract_log.txt:750，最终输出 getter-
+  encapsulation。
+
+  所以这次不是“agent 只找到一个”。更准确地说：agent 语义上找到了三个，但可能只有
+  narrow-lint-suppression 这一条在字段级别完全匹配 expected；另外两条因为 severity
+  或 line anchor 偏差，被自动评分漏计。

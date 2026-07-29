@@ -1,0 +1,5 @@
+# Expected defects
+
+1. location: kernel/src/syscall/getcwd.rs (persona: security, grounding: validate-at-boundaries, severity: major)
+   defect: The code clamps the user buffer with `let write_len = len.min(bytes.len())` and writes a truncated path, returning the truncated length, instead of returning `ERANGE` when the user buffer is too small (the Linux `getcwd` contract).
+   MATCH IF: A reviewer should flag that silently clamping a user-supplied length hides the "buffer too small" error the syscall must report. A matching comment may come from the Security persona or the Development persona (incorrect error semantics).

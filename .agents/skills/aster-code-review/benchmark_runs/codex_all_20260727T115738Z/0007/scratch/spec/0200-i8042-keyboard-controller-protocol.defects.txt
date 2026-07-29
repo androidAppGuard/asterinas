@@ -1,0 +1,13 @@
+# Expected defects
+
+1. location: kernel/comps/keyboard/src/i8042_chip/controller.rs (persona: development, grounding: Wrong predicate, severity: major)
+   defect: `Status::has_error` uses `contains(Self::SYSTEM_FLAG | Self::TIME_OUT_ERROR | Self::PARITY_ERROR)`. In `bitflags`, `contains` only returns true when all requested bits are set, so a status with only `TIME_OUT_ERROR` or only `PARITY_ERROR` is treated as clean. The expression also includes `SYSTEM_FLAG`, which is a normal POST/status bit rather than an I/O error bit.
+   MATCH IF: A reviewer should flag that `Status::has_error` uses `contains` over `SYSTEM_FLAG | TIME_OUT_ERROR | PARITY_ERROR`, thereby missing isolated timeout or parity errors and mixing a normal status bit into error detection.
+
+2. location: kernel/comps/keyboard/src/i8042_chip/keyboard.rs (persona: development, grounding: Invalid read, severity: major)
+   defect: `parse_inputkey` reads `DATA_PORT` before checking `status.has_data_to_read()`. On a spurious IRQ1 or any interrupt where the i8042 output buffer is empty, the code reads port `0x60` first and only then notices that no data was available, consuming an undefined or stale byte before returning `InputKey::Ign`.
+   MATCH IF: A reviewer should flag that the IRQ parser reads from port `0x60` before checking `OUTPUT_BUFFER_IS_FULL` and should require the output-buffer status check to happen before `ScanCode::read`.
+
+3. location: kernel/comps/keyboard/src/i8042_chip/keyboard.rs (persona: development, grounding: no-io-under-spinlock, severity: major)
+   defect: `handle_keyboard_input` iterates `KEYBOARD_CALLBACKS.lock().iter()` and invokes arbitrary callbacks while holding the callback-list spinlock with local IRQs disabled. The registered framebuffer callback can enter the TTY path and echo input back through `FramebufferConsole::send`, so framebuffer/console work can run while the keyboard callback spinlock is held in interrupt context.
+   MATCH IF: A reviewer should flag that the keyboard IRQ handler invokes callbacks under `KEYBOARD_CALLBACKS`'s IRQ-disabling spinlock and require callback dispatch to happen after releasing that lock.

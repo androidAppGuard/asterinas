@@ -1,0 +1,2026 @@
+OK: 8 problems (6 diff, 2 files), 18 defects (0 negative), problem_ids unique (numeric ids too)
+WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/tmp" (codex_home: AbsolutePathBuf("/root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/tmp/tmp.UDgNLbmHj4"))
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1
+model: gpt-5.5
+provider: OpenAI
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR] (network access enabled)
+reasoning effort: high
+reasoning summaries: none
+session id: 019fa38f-3f12-7382-a38d-685513100365
+--------
+user
+Use the aster-code-review skill with these arguments: diff 546e32e231429bbb0b5b40ba0fe9e75f38387c9f --per-persona-context=yes /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1/on.md --overwrite. Review this working tree.
+warning: Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.
+codex
+I’ll use the `aster-code-review` skill for this review and write the requested Markdown output to `on.md`. First I’m loading the skill instructions so the review follows the repository’s expected format.
+exec
+/bin/bash -lc "sed -n '1,240p' .agents/skills/aster-code-review/SKILL.md" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1
+ succeeded in 0ms:
+---
+name: aster-code-review
+description: Review code against Asterinas's persona-keyed coding guidelines and write a Markdown review file. Use when asked to review a Git change (diff mode) or a set of target files (files mode) for defects, or inside a write-test-review loop.
+---
+
+# aster-code-review
+
+Review code against Asterinas's coding guidelines
+— the persona-keyed pages under `book/src/to-contribute/coding-guidelines/`
+— and write one Markdown review file.
+The review is **recall-first**: miss as few real defects as possible.
+It makes both objective calls (undeniable bugs) and subjective calls (guideline violations, each grounded in a cited rule).
+
+There are two review modes, both **anchored at the current checkout (HEAD)**:
+
+- **`diff <base>`** — a Git change:
+  the **commit series** the branch adds over its merge-base with `<base>`
+  — each commit's message *and* its diff,
+  so the review covers per-commit intent and commit hygiene, not just the net change.
+  (Commit first; uncommitted edits are not reviewed in diff mode.)
+- **`files <path[:lines] ...>`**
+  — target code: the working-tree contents of the named files,
+  optionally narrowed to line ranges.
+
+To review at a specific commit, check it out first (it becomes HEAD).
+
+This skill is agent-agnostic (Claude Code and Codex).
+Only step 3's spawn primitive differs between agents;
+everything else is identical.
+
+## Interface
+
+However the skill is triggered,
+it receives ONE raw argument string that begins with a mode word:
+
+```
+diff   <base>              <output> [--overwrite] [--per-persona-context=auto|yes|no]
+files  <path[:lines] ...>  <output> [--overwrite] [--per-persona-context=auto|yes|no]
+```
+
+- `<base>` (diff) — **required**,
+  any ref or SHA;
+  reviews the commit series `merge-base(<base>, HEAD)..HEAD` (each commit's message + diff).
+- `<path[:lines] ...>` (files) — **required**, one or more targets in the working tree.
+  A target is a path, optionally `path:N-M` or `path:N-M,K-L` (1-based, inclusive);
+  repeat a path to add ranges.
+  Wrap a path in double quotes to allow spaces or colons (`"a: b.rs":10-20`).
+- `<output>` — **required, last positional** (`cp src... dest` style);
+  refuse to overwrite unless `--overwrite`.
+- `--overwrite` — replace the output file if it already exists.
+- `--per-persona-context` — `yes`: fan out one isolated agent per persona (best recall).
+  `no`: one combined agent reviews all personas (cheaper, lower recall).
+  `auto` (default) currently resolves to `yes`;
+  it will become a benchmark-driven heuristic.
+  Controls step 3 only.
+
+**Do not pre-split the argument string yourself.**
+Pass it verbatim, as a single quoted argument,
+to `resolve_target.sh` (step 1)
+— the script self-tokenizes (whitespace-split except inside double quotes),
+which keeps the parse deterministic and identical across agents.
+
+## Pipeline
+
+Run these steps in order.
+Steps 1 and 5 are deterministic scripts;
+steps 6–8 use the model.
+
+The helper scripts live in the skill's own `scripts/` directory,
+at `.agents/skills/aster-code-review/scripts/` inside the repository under review.
+**Invoke every script by its absolute path**
+— the working directory is the code under review (the repo root), *not* the skill directory,
+so a bare `scripts/…` is not found (notably on Codex, which runs commands from the repo root; do not `cd` into the skill dir either — `resolve_target.sh` needs the repo as its cwd).
+Shells do not persist between commands,
+so **set `SKILL` at the start of each command that uses it** (or inline the `$(git rev-parse …)`):
+
+```sh
+SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/resolve_target.sh" '<raw args>'
+```
+
+The steps below write `$SKILL/scripts/…` as shorthand for that absolute path.
+
+1. **Resolve the target.**
+   `"$SKILL/scripts/resolve_target.sh" '<raw args>'` prints the canonical review input
+   — the commit series (each commit's message + diff) in `diff` mode,
+   annotated file excerpts in `files` mode;
+   save it to a temp file.
+   Run it again with `--meta` first (`"$SKILL/scripts/resolve_target.sh" --meta '<raw args>'`) to get
+   `mode=`, `base=`/`files=`, `head=`, `branch=`, `output=`, `overwrite=`, `per_persona_context=`;
+   add `date=` (today) and an optional `title=` to make the meta file.
+   Pass the raw argument string as a single quoted argument
+   so the script's tokenizer sees it intact.
+2. **Activate personas.**
+   Pick which of the five personas run,
+   from the reviewed paths — changed paths in `diff` mode,
+   named paths in `files` mode (see *Activation*).
+3. **Fan out.**
+   Spawn the persona passes (see *Spawning*).
+   With `per_persona_context` = `yes` or `auto` (the default),
+   run **one isolated PASS per activated persona** — best recall.
+   With `no`, run **one combined PASS** over all activated personas in a single context
+   — cheaper, lower recall.
+   Build each pass's prompt deterministically with `"$SKILL/scripts/build_pass_prompt.sh" <input-file> <persona>...`
+   — one persona for fan-out, all activated personas for combined
+   — and spawn the sub-agent with **that exact text**.
+   Each pass returns a JSON array of comments;
+   file each under its persona's `<fragdir>/<persona>.json` (the comment's `persona` field says which),
+   so step 5 is unchanged.
+4. **Collect** the per-persona JSON fragments.
+5. **Assemble.**
+   `"$SKILL/scripts/assemble_review.sh" [--overwrite] <meta> <fragdir> <output>` performs the deterministic merge (group by persona in fixed order, sort by file→line, drop exact duplicates *within a persona*, write frontmatter, leave a `<!-- SUMMARY -->` placeholder).
+   Pass `--overwrite` only if the user gave it;
+   otherwise the script refuses to clobber an existing `<output>`.
+6. **Verify** (see *Verification*).
+7. **Consolidate** (see *Consolidation*).
+8. **Summary.**
+   Replace `<!-- SUMMARY -->` with a constructive summary over the final comments:
+   what the code does well, the top issues ranked by severity,
+   any structural recommendations.
+
+## Activation
+
+A persona runs unless the reviewed paths *provably* contain nothing in its remit (reviewed paths = changed paths in `diff` mode, named paths in `files` mode):
+
+- **maintainability, development, security** — any reviewed code.
+- **hardware** — a reviewed path is assembly (`*.S`, `*.asm`),
+  an architecture directory (`.../arch/...`), or contains `asm!` / `global_asm!`.
+- **documentation** — a reviewed path is `book/`, any `*.md`,
+  syscall-coverage files (`*.scml`), or a user-facing API surface (a syscall or kernel parameter).
+
+Activation is path-based and deterministic;
+do not use a model to triage (a wrongly-skipped persona is a silent recall hole).
+
+## Pass contract
+
+The shared reviewer contract
+— the review methodology and the JSON comment schema every pass must follow
+— lives in [`scripts/pass_contract.md`](scripts/pass_contract.md),
+inlined as the **stable head** of every pass prompt by `build_pass_prompt.sh` (step 3).
+Do not paraphrase it into the prompt yourself:
+retyping it breaks the byte-identical prefix the prompt cache relies on (see [`execution_model.md`](spec/execution_model.md)).
+A pass reads only the persona block(s) it is given (selective exposure),
+reviews the **REVIEW INPUT** at the foot of the prompt,
+and returns a JSON array of comments per that schema.
+
+## Spawning a pass
+
+Build every pass prompt with `"$SKILL/scripts/build_pass_prompt.sh" <input-file> <persona>...`
+and spawn the sub-agent with its **exact** output
+— only a script keeps the prompt's stable head (contract + guideline) byte-identical across passes and reviews,
+which is what lets the prompt cache reuse it (see [`execution_model.md`](spec/execution_model.md)).
+
+**Default (`per_persona_context` = `yes`/`auto`)**
+— one pass per activated persona,
+each in a CLEAN context with only its own persona block (selective exposure):
+
+- **Claude Code** — spawn a Task sub-agent per persona.
+- **Codex** — run `codex exec "<build_pass_prompt.sh output>"` per persona
+  (pass the built PROMPT TEXT as the argument).
+
+**Never spawn a pass by re-running `aster_code_review.sh` / `run_agent.sh`,
+nor by re-issuing the skill's own arguments** (e.g. `codex exec … diff <base> <out>`).
+A pass is a *reviewer* invocation whose input is the `build_pass_prompt.sh` text
+— not another run of this skill.
+Re-entering the launcher spawns another orchestrator that spawns another … , an infinite fork bomb;
+the launcher now refuses it (`ACR_AGENT_RUNNING`).
+
+Passes are independent;
+order does not matter.
+Collect each pass's JSON.
+
+**Combined (`per_persona_context` = `no`)**
+— build ONE prompt with all activated personas (`"$SKILL/scripts/build_pass_prompt.sh" <input> <p1> <p2> ...`)
+and run a single pass;
+it reviews through every lens at once and tags each comment with its `persona`.
+The input and spawn overhead are paid once,
+so it is cheaper
+— but a larger shared context dilutes focus,
+so it finds fewer defects.
+The default stays fan-out:
+recall comes first,
+and `no` is an explicit, opt-in concession.
+
+## Verification (step 6)
+
+For each comment, isolate the key premise it rests on
+— especially an external-system fact (Linux/POSIX behaviour, the System V ABI, Rust semantics).
+Try to **refute** it:
+re-read the cited code and consult an authoritative source.
+Assign a verdict:
+
+- **confirmed** — keep the comment unchanged.
+- **uncertain** — keep it, but prefix `problem` with `(unverified) `.
+- **refuted** — remove the comment,
+  and append it to a `## Retracted by verification` list at the foot of the file with a one-line reason.
+
+Remove **only** on confident refutation;
+an unsure check is `uncertain`, not `refuted`.
+This is the only step that may remove a comment, and only false positives.
+
+## Consolidation (step 7)
+
+Find clusters of comments that share one root cause or one fix
+(e.g. several manual lock/unlock pairs that all want RAII).
+For each cluster, write a single unified fix
+and repoint each member's `**Fix.**` at it ("Shared with the other `raii` comments: …").
+**Never remove a comment**
+— every symptom stays at its own location.
+
+## Output format
+
+The assembled file is:
+frontmatter (`date`, `mode`, `base` or `files`, `head`, `branch`, optional `title`),
+a `# Summary`,
+then a `## <section>` per persona in the order **Maintainability, Correctness, Security, Hardware, Documentation** (Correctness is the Development persona's section).
+Each comment is a `### \`file\` line N` subsection:
+a quoted ` ```diff ` snippet,
+then a prose line `` `<grounding>` (<severity>): <problem> ``,
+then a `**Fix.**` paragraph.
+Do not restructure what the script emits;
+only fill the summary and apply the verify/consolidate edits.
+
+codex
+I’ve got the review pipeline. I’m resolving the diff target now, then I’ll activate the relevant persona passes from the changed paths and collect their JSON findings before assembling the final report.
+exec
+/bin/bash -lc 'SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/resolve_target.sh" --meta '"'diff 546e32e231429bbb0b5b40ba0fe9e75f38387c9f --per-persona-context=yes /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1/on.md --overwrite'" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1
+ succeeded in 0ms:
+mode=diff
+base=546e32e23
+head=d4508b8f5
+branch=HEAD
+output=/root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1/on.md
+overwrite=1
+per_persona_context=yes
+
+exec
+/bin/bash -lc 'SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/resolve_target.sh" '"'diff 546e32e231429bbb0b5b40ba0fe9e75f38387c9f --per-persona-context=yes /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1/on.md --overwrite' > /tmp/acr_input_0008.txt
+wc -l /tmp/acr_input_0008.txt" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1
+ succeeded in 0ms:
+23 /tmp/acr_input_0008.txt
+
+codex
+The resolved review input is small, so I’m reading it directly to determine persona activation and to understand the commit intent before running the passes.
+exec
+/bin/bash -lc "sed -n '1,220p' /tmp/acr_input_0008.txt" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1
+ succeeded in 0ms:
+
+===== commit d4508b8f5 =====
+
+[commit message]
+made some changes to getcwd
+
+tweaked the getcwd syscall.
+
+[changes]
+
+
+diff --git a/kernel/src/syscall/getcwd.rs b/kernel/src/syscall/getcwd.rs
+index c2ba62e37..9df0b9300 100644
+--- a/kernel/src/syscall/getcwd.rs
++++ b/kernel/src/syscall/getcwd.rs
+@@ -5,6 +5,7 @@ use ostd::mm::VmIo;
+ use super::SyscallReturn;
+ use crate::{fs::vfs::path::AbsPathResult, prelude::*};
+ 
++// Writes the current working directory path to the user buffer.
+ pub fn sys_getcwd(buf: Vaddr, len: usize, ctx: &Context) -> Result<SyscallReturn> {
+     let abs_path = {
+         let fs_ref = ctx.thread_local.borrow_fs();
+
+exec
+/bin/bash -lc "sed -n '220,440p' /tmp/acr_input_0008.txt" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1
+ succeeded in 0ms:
+codex
+The diff contains one committed change in `kernel/src/syscall/getcwd.rs`: a comment added to a syscall entry point. That activates maintainability, correctness, security, and documentation; hardware is not in scope because there is no arch or assembly change.
+codex
+I’m going to run the persona prompts as isolated reviewer passes and store their JSON fragments under `/tmp`. Since this target is a syscall API surface, documentation review is included even though the code change itself is only a Rust comment.
+exec
+/bin/bash -lc 'command -v codex' in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1
+ succeeded in 0ms:
+/root/.local/bin/codex
+
+exec
+/bin/bash -lc 'mkdir -p /tmp/acr_frag_0008 /tmp/acr_prompts_0008
+SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"
+"$SKILL/scripts/build_pass_prompt.sh" /tmp/acr_input_0008.txt maintainability > /tmp/acr_prompts_0008/maintainability.txt
+"$SKILL/scripts/build_pass_prompt.sh" /tmp/acr_input_0008.txt development > /tmp/acr_prompts_0008/development.txt
+"$SKILL/scripts/build_pass_prompt.sh" /tmp/acr_input_0008.txt security > /tmp/acr_prompts_0008/security.txt
+"$SKILL/scripts/build_pass_prompt.sh" /tmp/acr_input_0008.txt documentation > /tmp/acr_prompts_0008/documentation.txt
+wc -c /tmp/acr_prompts_0008/*.txt' in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1
+ succeeded in 113ms:
+24938 /tmp/acr_prompts_0008/development.txt
+10840 /tmp/acr_prompts_0008/documentation.txt
+47437 /tmp/acr_prompts_0008/maintainability.txt
+11907 /tmp/acr_prompts_0008/security.txt
+95122 total
+
+codex
+The four pass prompts are built. I’m starting them in parallel now; while they run, I’ll prepare the review metadata needed by the assembler.
+exec
+/bin/bash -lc 'codex exec "$(cat /tmp/acr_prompts_0008/maintainability.txt)" > /tmp/acr_frag_0008/maintainability.json' in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1
+ succeeded in 41030ms:
+codex
+I’m using the `aster-code-review` skill for this maintainability-only review and will keep the output to the requested JSON array.
+exec
+/bin/bash -lc "sed -n '1,240p' .agents/skills/aster-code-review/SKILL.md" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1
+ succeeded in 0ms:
+---
+name: aster-code-review
+description: Review code against Asterinas's persona-keyed coding guidelines and write a Markdown review file. Use when asked to review a Git change (diff mode) or a set of target files (files mode) for defects, or inside a write-test-review loop.
+---
+
+# aster-code-review
+
+Review code against Asterinas's coding guidelines
+— the persona-keyed pages under `book/src/to-contribute/coding-guidelines/`
+— and write one Markdown review file.
+The review is **recall-first**: miss as few real defects as possible.
+It makes both objective calls (undeniable bugs) and subjective calls (guideline violations, each grounded in a cited rule).
+
+There are two review modes, both **anchored at the current checkout (HEAD)**:
+
+- **`diff <base>`** — a Git change:
+  the **commit series** the branch adds over its merge-base with `<base>`
+  — each commit's message *and* its diff,
+  so the review covers per-commit intent and commit hygiene, not just the net change.
+  (Commit first; uncommitted edits are not reviewed in diff mode.)
+- **`files <path[:lines] ...>`**
+  — target code: the working-tree contents of the named files,
+  optionally narrowed to line ranges.
+
+To review at a specific commit, check it out first (it becomes HEAD).
+
+This skill is agent-agnostic (Claude Code and Codex).
+Only step 3's spawn primitive differs between agents;
+everything else is identical.
+
+## Interface
+
+However the skill is triggered,
+it receives ONE raw argument string that begins with a mode word:
+
+```
+diff   <base>              <output> [--overwrite] [--per-persona-context=auto|yes|no]
+files  <path[:lines] ...>  <output> [--overwrite] [--per-persona-context=auto|yes|no]
+```
+
+- `<base>` (diff) — **required**,
+  any ref or SHA;
+  reviews the commit series `merge-base(<base>, HEAD)..HEAD` (each commit's message + diff).
+- `<path[:lines] ...>` (files) — **required**, one or more targets in the working tree.
+  A target is a path, optionally `path:N-M` or `path:N-M,K-L` (1-based, inclusive);
+  repeat a path to add ranges.
+  Wrap a path in double quotes to allow spaces or colons (`"a: b.rs":10-20`).
+- `<output>` — **required, last positional** (`cp src... dest` style);
+  refuse to overwrite unless `--overwrite`.
+- `--overwrite` — replace the output file if it already exists.
+- `--per-persona-context` — `yes`: fan out one isolated agent per persona (best recall).
+  `no`: one combined agent reviews all personas (cheaper, lower recall).
+  `auto` (default) currently resolves to `yes`;
+  it will become a benchmark-driven heuristic.
+  Controls step 3 only.
+
+**Do not pre-split the argument string yourself.**
+Pass it verbatim, as a single quoted argument,
+to `resolve_target.sh` (step 1)
+— the script self-tokenizes (whitespace-split except inside double quotes),
+which keeps the parse deterministic and identical across agents.
+
+## Pipeline
+
+Run these steps in order.
+Steps 1 and 5 are deterministic scripts;
+steps 6–8 use the model.
+
+The helper scripts live in the skill's own `scripts/` directory,
+at `.agents/skills/aster-code-review/scripts/` inside the repository under review.
+**Invoke every script by its absolute path**
+— the working directory is the code under review (the repo root), *not* the skill directory,
+so a bare `scripts/…` is not found (notably on Codex, which runs commands from the repo root; do not `cd` into the skill dir either — `resolve_target.sh` needs the repo as its cwd).
+Shells do not persist between commands,
+so **set `SKILL` at the start of each command that uses it** (or inline the `$(git rev-parse …)`):
+
+```sh
+SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/resolve_target.sh" '<raw args>'
+```
+
+The steps below write `$SKILL/scripts/…` as shorthand for that absolute path.
+
+1. **Resolve the target.**
+   `"$SKILL/scripts/resolve_target.sh" '<raw args>'` prints the canonical review input
+   — the commit series (each commit's message + diff) in `diff` mode,
+   annotated file excerpts in `files` mode;
+   save it to a temp file.
+   Run it again with `--meta` first (`"$SKILL/scripts/resolve_target.sh" --meta '<raw args>'`) to get
+   `mode=`, `base=`/`files=`, `head=`, `branch=`, `output=`, `overwrite=`, `per_persona_context=`;
+   add `date=` (today) and an optional `title=` to make the meta file.
+   Pass the raw argument string as a single quoted argument
+   so the script's tokenizer sees it intact.
+2. **Activate personas.**
+   Pick which of the five personas run,
+   from the reviewed paths — changed paths in `diff` mode,
+   named paths in `files` mode (see *Activation*).
+3. **Fan out.**
+   Spawn the persona passes (see *Spawning*).
+   With `per_persona_context` = `yes` or `auto` (the default),
+   run **one isolated PASS per activated persona** — best recall.
+   With `no`, run **one combined PASS** over all activated personas in a single context
+   — cheaper, lower recall.
+   Build each pass's prompt deterministically with `"$SKILL/scripts/build_pass_prompt.sh" <input-file> <persona>...`
+   — one persona for fan-out, all activated personas for combined
+   — and spawn the sub-agent with **that exact text**.
+   Each pass returns a JSON array of comments;
+   file each under its persona's `<fragdir>/<persona>.json` (the comment's `persona` field says which),
+   so step 5 is unchanged.
+4. **Collect** the per-persona JSON fragments.
+5. **Assemble.**
+   `"$SKILL/scripts/assemble_review.sh" [--overwrite] <meta> <fragdir> <output>` performs the deterministic merge (group by persona in fixed order, sort by file→line, drop exact duplicates *within a persona*, write frontmatter, leave a `<!-- SUMMARY -->` placeholder).
+   Pass `--overwrite` only if the user gave it;
+   otherwise the script refuses to clobber an existing `<output>`.
+6. **Verify** (see *Verification*).
+7. **Consolidate** (see *Consolidation*).
+8. **Summary.**
+   Replace `<!-- SUMMARY -->` with a constructive summary over the final comments:
+   what the code does well, the top issues ranked by severity,
+   any structural recommendations.
+
+## Activation
+
+A persona runs unless the reviewed paths *provably* contain nothing in its remit (reviewed paths = changed paths in `diff` mode, named paths in `files` mode):
+
+- **maintainability, development, security** — any reviewed code.
+- **hardware** — a reviewed path is assembly (`*.S`, `*.asm`),
+  an architecture directory (`.../arch/...`), or contains `asm!` / `global_asm!`.
+- **documentation** — a reviewed path is `book/`, any `*.md`,
+  syscall-coverage files (`*.scml`), or a user-facing API surface (a syscall or kernel parameter).
+
+Activation is path-based and deterministic;
+do not use a model to triage (a wrongly-skipped persona is a silent recall hole).
+
+## Pass contract
+
+The shared reviewer contract
+— the review methodology and the JSON comment schema every pass must follow
+— lives in [`scripts/pass_contract.md`](scripts/pass_contract.md),
+inlined as the **stable head** of every pass prompt by `build_pass_prompt.sh` (step 3).
+Do not paraphrase it into the prompt yourself:
+retyping it breaks the byte-identical prefix the prompt cache relies on (see [`execution_model.md`](spec/execution_model.md)).
+A pass reads only the persona block(s) it is given (selective exposure),
+reviews the **REVIEW INPUT** at the foot of the prompt,
+and returns a JSON array of comments per that schema.
+
+## Spawning a pass
+
+Build every pass prompt with `"$SKILL/scripts/build_pass_prompt.sh" <input-file> <persona>...`
+and spawn the sub-agent with its **exact** output
+— only a script keeps the prompt's stable head (contract + guideline) byte-identical across passes and reviews,
+which is what lets the prompt cache reuse it (see [`execution_model.md`](spec/execution_model.md)).
+
+**Default (`per_persona_context` = `yes`/`auto`)**
+— one pass per activated persona,
+each in a CLEAN context with only its own persona block (selective exposure):
+
+- **Claude Code** — spawn a Task sub-agent per persona.
+- **Codex** — run `codex exec "<build_pass_prompt.sh output>"` per persona
+  (pass the built PROMPT TEXT as the argument).
+
+**Never spawn a pass by re-running `aster_code_review.sh` / `run_agent.sh`,
+nor by re-issuing the skill's own arguments** (e.g. `codex exec … diff <base> <out>`).
+A pass is a *reviewer* invocation whose input is the `build_pass_prompt.sh` text
+— not another run of this skill.
+Re-entering the launcher spawns another orchestrator that spawns another … , an infinite fork bomb;
+the launcher now refuses it (`ACR_AGENT_RUNNING`).
+
+Passes are independent;
+order does not matter.
+Collect each pass's JSON.
+
+**Combined (`per_persona_context` = `no`)**
+— build ONE prompt with all activated personas (`"$SKILL/scripts/build_pass_prompt.sh" <input> <p1> <p2> ...`)
+and run a single pass;
+it reviews through every lens at once and tags each comment with its `persona`.
+The input and spawn overhead are paid once,
+so it is cheaper
+— but a larger shared context dilutes focus,
+so it finds fewer defects.
+The default stays fan-out:
+recall comes first,
+and `no` is an explicit, opt-in concession.
+
+## Verification (step 6)
+
+For each comment, isolate the key premise it rests on
+— especially an external-system fact (Linux/POSIX behaviour, the System V ABI, Rust semantics).
+Try to **refute** it:
+re-read the cited code and consult an authoritative source.
+Assign a verdict:
+
+- **confirmed** — keep the comment unchanged.
+- **uncertain** — keep it, but prefix `problem` with `(unverified) `.
+- **refuted** — remove the comment,
+  and append it to a `## Retracted by verification` list at the foot of the file with a one-line reason.
+
+Remove **only** on confident refutation;
+an unsure check is `uncertain`, not `refuted`.
+This is the only step that may remove a comment, and only false positives.
+
+## Consolidation (step 7)
+
+Find clusters of comments that share one root cause or one fix
+(e.g. several manual lock/unlock pairs that all want RAII).
+For each cluster, write a single unified fix
+and repoint each member's `**Fix.**` at it ("Shared with the other `raii` comments: …").
+**Never remove a comment**
+— every symptom stays at its own location.
+
+## Output format
+
+The assembled file is:
+frontmatter (`date`, `mode`, `base` or `files`, `head`, `branch`, optional `title`),
+a `# Summary`,
+then a `## <section>` per persona in the order **Maintainability, Correctness, Security, Hardware, Documentation** (Correctness is the Development persona's section).
+Each comment is a `### \`file\` line N` subsection:
+a quoted ` ```diff ` snippet,
+then a prose line `` `<grounding>` (<severity>): <problem> ``,
+then a `**Fix.**` paragraph.
+Do not restructure what the script emits;
+only fill the summary and apply the verify/consolidate edits.
+
+exec
+/bin/bash -lc "nl -ba kernel/src/syscall/getcwd.rs | sed -n '1,40p'; git show --stat --oneline --decorate --no-renames HEAD" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1
+ succeeded in 0ms:
+     1	// SPDX-License-Identifier: MPL-2.0
+     2	
+     3	use ostd::mm::VmIo;
+     4	
+     5	use super::SyscallReturn;
+     6	use crate::{fs::vfs::path::AbsPathResult, prelude::*};
+     7	
+     8	// Writes the current working directory path to the user buffer.
+     9	pub fn sys_getcwd(buf: Vaddr, len: usize, ctx: &Context) -> Result<SyscallReturn> {
+    10	    let abs_path = {
+    11	        let fs_ref = ctx.thread_local.borrow_fs();
+    12	        let path_resolver = fs_ref.resolver().read();
+    13	        path_resolver.make_abs_path(path_resolver.cwd())
+    14	    };
+    15	
+    16	    debug!("getcwd: {:?}", abs_path);
+    17	
+    18	    // Linux will add a "(unreachable)" prefix to the path if the CWD is not reachable.
+    19	    // However, according to POSIX, `getcwd()` should fail with ENOENT in this case.
+    20	    // `glibc` treats the Linux's behavior as a bug and handles the Linux-specific prefix
+    21	    // to conform to POSIX. Here follows Linux's behavior to keep compatibility.
+    22	    //
+    23	    // Reference: <https://man7.org/linux/man-pages/man3/getcwd.3.html>
+    24	    let abs_path = match abs_path {
+    25	        AbsPathResult::Reachable(s) => s,
+    26	        AbsPathResult::Unreachable(s) => alloc::format!("(unreachable){}", s),
+    27	    };
+    28	
+    29	    let cwd = CString::new(abs_path)?;
+    30	    let bytes = cwd.as_bytes_with_nul();
+    31	    if bytes.len() > len {
+    32	        return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+    33	    }
+    34	    ctx.user_space().write_bytes(buf, bytes)?;
+    35	
+    36	    Ok(SyscallReturn::Return(bytes.len() as _))
+    37	}
+d4508b8f5 (HEAD) made some changes to getcwd
+ kernel/src/syscall/getcwd.rs | 1 +
+ 1 file changed, 1 insertion(+)
+
+codex
+[
+  {
+    "file": "commit d4508b8f5 message",
+    "persona": "maintainability",
+    "grounding": "imperative-subject",
+    "severity": "minor",
+    "problem": "The subject `made some changes to getcwd` is past-tense and vague, and it leaves `getcwd` unformatted instead of using backticks.",
+    "fix": "Use an imperative, verb-first subject that names the actual change, for example `Document `sys_getcwd`` if the comment stays.",
+    "diff": "[commit message]\nmade some changes to getcwd\n\ntweaked the getcwd syscall."
+  },
+  {
+    "file": "kernel/src/syscall/getcwd.rs",
+    "line": 8,
+    "persona": "maintainability",
+    "grounding": "explain-why",
+    "severity": "nit",
+    "problem": "The new comment only restates what `sys_getcwd` already conveys from the syscall name and `buf` parameter, so it adds noise without explaining a non-obvious decision.",
+    "fix": "Remove the comment, or replace it with rationale only if there is a non-obvious behavior to document.",
+    "diff": "+// Writes the current working directory path to the user buffer.\n pub fn sys_getcwd(buf: Vaddr, len: usize, ctx: &Context) -> Result<SyscallReturn> {"
+  }
+]
+tokens used
+9,425
+
+codex
+The first pass is still running; its diagnostic stream is verbose, but the JSON result is being redirected into the fragment file. I’m starting the remaining persona passes separately so they can complete in parallel.
+exec
+/bin/bash -lc 'codex exec "$(cat /tmp/acr_prompts_0008/development.txt)" > /tmp/acr_frag_0008/development.json' in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1
+ succeeded in 33594ms:
+codex
+I’ll use the `aster-code-review` skill for this review pass, then inspect the changed syscall code and nearby behavior before returning the JSON findings.
+exec
+/bin/bash -lc "sed -n '1,220p' .agents/skills/aster-code-review/SKILL.md" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1
+ succeeded in 0ms:
+---
+name: aster-code-review
+description: Review code against Asterinas's persona-keyed coding guidelines and write a Markdown review file. Use when asked to review a Git change (diff mode) or a set of target files (files mode) for defects, or inside a write-test-review loop.
+---
+
+# aster-code-review
+
+Review code against Asterinas's coding guidelines
+— the persona-keyed pages under `book/src/to-contribute/coding-guidelines/`
+— and write one Markdown review file.
+The review is **recall-first**: miss as few real defects as possible.
+It makes both objective calls (undeniable bugs) and subjective calls (guideline violations, each grounded in a cited rule).
+
+There are two review modes, both **anchored at the current checkout (HEAD)**:
+
+- **`diff <base>`** — a Git change:
+  the **commit series** the branch adds over its merge-base with `<base>`
+  — each commit's message *and* its diff,
+  so the review covers per-commit intent and commit hygiene, not just the net change.
+  (Commit first; uncommitted edits are not reviewed in diff mode.)
+- **`files <path[:lines] ...>`**
+  — target code: the working-tree contents of the named files,
+  optionally narrowed to line ranges.
+
+To review at a specific commit, check it out first (it becomes HEAD).
+
+This skill is agent-agnostic (Claude Code and Codex).
+Only step 3's spawn primitive differs between agents;
+everything else is identical.
+
+## Interface
+
+However the skill is triggered,
+it receives ONE raw argument string that begins with a mode word:
+
+```
+diff   <base>              <output> [--overwrite] [--per-persona-context=auto|yes|no]
+files  <path[:lines] ...>  <output> [--overwrite] [--per-persona-context=auto|yes|no]
+```
+
+- `<base>` (diff) — **required**,
+  any ref or SHA;
+  reviews the commit series `merge-base(<base>, HEAD)..HEAD` (each commit's message + diff).
+- `<path[:lines] ...>` (files) — **required**, one or more targets in the working tree.
+  A target is a path, optionally `path:N-M` or `path:N-M,K-L` (1-based, inclusive);
+  repeat a path to add ranges.
+  Wrap a path in double quotes to allow spaces or colons (`"a: b.rs":10-20`).
+- `<output>` — **required, last positional** (`cp src... dest` style);
+  refuse to overwrite unless `--overwrite`.
+- `--overwrite` — replace the output file if it already exists.
+- `--per-persona-context` — `yes`: fan out one isolated agent per persona (best recall).
+  `no`: one combined agent reviews all personas (cheaper, lower recall).
+  `auto` (default) currently resolves to `yes`;
+  it will become a benchmark-driven heuristic.
+  Controls step 3 only.
+
+**Do not pre-split the argument string yourself.**
+Pass it verbatim, as a single quoted argument,
+to `resolve_target.sh` (step 1)
+— the script self-tokenizes (whitespace-split except inside double quotes),
+which keeps the parse deterministic and identical across agents.
+
+## Pipeline
+
+Run these steps in order.
+Steps 1 and 5 are deterministic scripts;
+steps 6–8 use the model.
+
+The helper scripts live in the skill's own `scripts/` directory,
+at `.agents/skills/aster-code-review/scripts/` inside the repository under review.
+**Invoke every script by its absolute path**
+— the working directory is the code under review (the repo root), *not* the skill directory,
+so a bare `scripts/…` is not found (notably on Codex, which runs commands from the repo root; do not `cd` into the skill dir either — `resolve_target.sh` needs the repo as its cwd).
+Shells do not persist between commands,
+so **set `SKILL` at the start of each command that uses it** (or inline the `$(git rev-parse …)`):
+
+```sh
+SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/resolve_target.sh" '<raw args>'
+```
+
+The steps below write `$SKILL/scripts/…` as shorthand for that absolute path.
+
+1. **Resolve the target.**
+   `"$SKILL/scripts/resolve_target.sh" '<raw args>'` prints the canonical review input
+   — the commit series (each commit's message + diff) in `diff` mode,
+   annotated file excerpts in `files` mode;
+   save it to a temp file.
+   Run it again with `--meta` first (`"$SKILL/scripts/resolve_target.sh" --meta '<raw args>'`) to get
+   `mode=`, `base=`/`files=`, `head=`, `branch=`, `output=`, `overwrite=`, `per_persona_context=`;
+   add `date=` (today) and an optional `title=` to make the meta file.
+   Pass the raw argument string as a single quoted argument
+   so the script's tokenizer sees it intact.
+2. **Activate personas.**
+   Pick which of the five personas run,
+   from the reviewed paths — changed paths in `diff` mode,
+   named paths in `files` mode (see *Activation*).
+3. **Fan out.**
+   Spawn the persona passes (see *Spawning*).
+   With `per_persona_context` = `yes` or `auto` (the default),
+   run **one isolated PASS per activated persona** — best recall.
+   With `no`, run **one combined PASS** over all activated personas in a single context
+   — cheaper, lower recall.
+   Build each pass's prompt deterministically with `"$SKILL/scripts/build_pass_prompt.sh" <input-file> <persona>...`
+   — one persona for fan-out, all activated personas for combined
+   — and spawn the sub-agent with **that exact text**.
+   Each pass returns a JSON array of comments;
+   file each under its persona's `<fragdir>/<persona>.json` (the comment's `persona` field says which),
+   so step 5 is unchanged.
+4. **Collect** the per-persona JSON fragments.
+5. **Assemble.**
+   `"$SKILL/scripts/assemble_review.sh" [--overwrite] <meta> <fragdir> <output>` performs the deterministic merge (group by persona in fixed order, sort by file→line, drop exact duplicates *within a persona*, write frontmatter, leave a `<!-- SUMMARY -->` placeholder).
+   Pass `--overwrite` only if the user gave it;
+   otherwise the script refuses to clobber an existing `<output>`.
+6. **Verify** (see *Verification*).
+7. **Consolidate** (see *Consolidation*).
+8. **Summary.**
+   Replace `<!-- SUMMARY -->` with a constructive summary over the final comments:
+   what the code does well, the top issues ranked by severity,
+   any structural recommendations.
+
+## Activation
+
+A persona runs unless the reviewed paths *provably* contain nothing in its remit (reviewed paths = changed paths in `diff` mode, named paths in `files` mode):
+
+- **maintainability, development, security** — any reviewed code.
+- **hardware** — a reviewed path is assembly (`*.S`, `*.asm`),
+  an architecture directory (`.../arch/...`), or contains `asm!` / `global_asm!`.
+- **documentation** — a reviewed path is `book/`, any `*.md`,
+  syscall-coverage files (`*.scml`), or a user-facing API surface (a syscall or kernel parameter).
+
+Activation is path-based and deterministic;
+do not use a model to triage (a wrongly-skipped persona is a silent recall hole).
+
+## Pass contract
+
+The shared reviewer contract
+— the review methodology and the JSON comment schema every pass must follow
+— lives in [`scripts/pass_contract.md`](scripts/pass_contract.md),
+inlined as the **stable head** of every pass prompt by `build_pass_prompt.sh` (step 3).
+Do not paraphrase it into the prompt yourself:
+retyping it breaks the byte-identical prefix the prompt cache relies on (see [`execution_model.md`](spec/execution_model.md)).
+A pass reads only the persona block(s) it is given (selective exposure),
+reviews the **REVIEW INPUT** at the foot of the prompt,
+and returns a JSON array of comments per that schema.
+
+## Spawning a pass
+
+Build every pass prompt with `"$SKILL/scripts/build_pass_prompt.sh" <input-file> <persona>...`
+and spawn the sub-agent with its **exact** output
+— only a script keeps the prompt's stable head (contract + guideline) byte-identical across passes and reviews,
+which is what lets the prompt cache reuse it (see [`execution_model.md`](spec/execution_model.md)).
+
+**Default (`per_persona_context` = `yes`/`auto`)**
+— one pass per activated persona,
+each in a CLEAN context with only its own persona block (selective exposure):
+
+- **Claude Code** — spawn a Task sub-agent per persona.
+- **Codex** — run `codex exec "<build_pass_prompt.sh output>"` per persona
+  (pass the built PROMPT TEXT as the argument).
+
+**Never spawn a pass by re-running `aster_code_review.sh` / `run_agent.sh`,
+nor by re-issuing the skill's own arguments** (e.g. `codex exec … diff <base> <out>`).
+A pass is a *reviewer* invocation whose input is the `build_pass_prompt.sh` text
+— not another run of this skill.
+Re-entering the launcher spawns another orchestrator that spawns another … , an infinite fork bomb;
+the launcher now refuses it (`ACR_AGENT_RUNNING`).
+
+Passes are independent;
+order does not matter.
+Collect each pass's JSON.
+
+**Combined (`per_persona_context` = `no`)**
+— build ONE prompt with all activated personas (`"$SKILL/scripts/build_pass_prompt.sh" <input> <p1> <p2> ...`)
+and run a single pass;
+it reviews through every lens at once and tags each comment with its `persona`.
+The input and spawn overhead are paid once,
+so it is cheaper
+— but a larger shared context dilutes focus,
+so it finds fewer defects.
+The default stays fan-out:
+recall comes first,
+and `no` is an explicit, opt-in concession.
+
+## Verification (step 6)
+
+For each comment, isolate the key premise it rests on
+— especially an external-system fact (Linux/POSIX behaviour, the System V ABI, Rust semantics).
+Try to **refute** it:
+re-read the cited code and consult an authoritative source.
+Assign a verdict:
+
+- **confirmed** — keep the comment unchanged.
+- **uncertain** — keep it, but prefix `problem` with `(unverified) `.
+- **refuted** — remove the comment,
+  and append it to a `## Retracted by verification` list at the foot of the file with a one-line reason.
+
+Remove **only** on confident refutation;
+an unsure check is `uncertain`, not `refuted`.
+This is the only step that may remove a comment, and only false positives.
+
+## Consolidation (step 7)
+
+Find clusters of comments that share one root cause or one fix
+(e.g. several manual lock/unlock pairs that all want RAII).
+For each cluster, write a single unified fix
+and repoint each member's `**Fix.**` at it ("Shared with the other `raii` comments: …").
+**Never remove a comment**
+— every symptom stays at its own location.
+
+## Output format
+
+The assembled file is:
+frontmatter (`date`, `mode`, `base` or `files`, `head`, `branch`, optional `title`),
+a `# Summary`,
+then a `## <section>` per persona in the order **Maintainability, Correctness, Security, Hardware, Documentation** (Correctness is the Development persona's section).
+Each comment is a `### \`file\` line N` subsection:
+a quoted ` ```diff ` snippet,
+then a prose line `` `<grounding>` (<severity>): <problem> ``,
+then a `**Fix.**` paragraph.
+Do not restructure what the script emits;
+
+codex
+The reviewed diff only adds a comment above `sys_getcwd`, so I’m checking the surrounding implementation to make sure there is no changed runtime behavior hidden by context.
+exec
+/bin/bash -lc "sed -n '1,220p' kernel/src/syscall/getcwd.rs" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1
+ succeeded in 0ms:
+// SPDX-License-Identifier: MPL-2.0
+
+use ostd::mm::VmIo;
+
+use super::SyscallReturn;
+use crate::{fs::vfs::path::AbsPathResult, prelude::*};
+
+// Writes the current working directory path to the user buffer.
+pub fn sys_getcwd(buf: Vaddr, len: usize, ctx: &Context) -> Result<SyscallReturn> {
+    let abs_path = {
+        let fs_ref = ctx.thread_local.borrow_fs();
+        let path_resolver = fs_ref.resolver().read();
+        path_resolver.make_abs_path(path_resolver.cwd())
+    };
+
+    debug!("getcwd: {:?}", abs_path);
+
+    // Linux will add a "(unreachable)" prefix to the path if the CWD is not reachable.
+    // However, according to POSIX, `getcwd()` should fail with ENOENT in this case.
+    // `glibc` treats the Linux's behavior as a bug and handles the Linux-specific prefix
+    // to conform to POSIX. Here follows Linux's behavior to keep compatibility.
+    //
+    // Reference: <https://man7.org/linux/man-pages/man3/getcwd.3.html>
+    let abs_path = match abs_path {
+        AbsPathResult::Reachable(s) => s,
+        AbsPathResult::Unreachable(s) => alloc::format!("(unreachable){}", s),
+    };
+
+    let cwd = CString::new(abs_path)?;
+    let bytes = cwd.as_bytes_with_nul();
+    if bytes.len() > len {
+        return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+    }
+    ctx.user_space().write_bytes(buf, bytes)?;
+
+    Ok(SyscallReturn::Return(bytes.len() as _))
+}
+
+codex
+[]
+tokens used
+5,121
+
+exec
+/bin/bash -lc 'codex exec "$(cat /tmp/acr_prompts_0008/security.txt)" > /tmp/acr_frag_0008/security.json' in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1
+ succeeded in 25153ms:
+codex
+I’m using the `aster-code-review` skill for this security-focused pass and will keep the review scoped to the provided diff.
+exec
+/bin/bash -lc "sed -n '1,240p' .agents/skills/aster-code-review/SKILL.md" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1
+ succeeded in 0ms:
+---
+name: aster-code-review
+description: Review code against Asterinas's persona-keyed coding guidelines and write a Markdown review file. Use when asked to review a Git change (diff mode) or a set of target files (files mode) for defects, or inside a write-test-review loop.
+---
+
+# aster-code-review
+
+Review code against Asterinas's coding guidelines
+— the persona-keyed pages under `book/src/to-contribute/coding-guidelines/`
+— and write one Markdown review file.
+The review is **recall-first**: miss as few real defects as possible.
+It makes both objective calls (undeniable bugs) and subjective calls (guideline violations, each grounded in a cited rule).
+
+There are two review modes, both **anchored at the current checkout (HEAD)**:
+
+- **`diff <base>`** — a Git change:
+  the **commit series** the branch adds over its merge-base with `<base>`
+  — each commit's message *and* its diff,
+  so the review covers per-commit intent and commit hygiene, not just the net change.
+  (Commit first; uncommitted edits are not reviewed in diff mode.)
+- **`files <path[:lines] ...>`**
+  — target code: the working-tree contents of the named files,
+  optionally narrowed to line ranges.
+
+To review at a specific commit, check it out first (it becomes HEAD).
+
+This skill is agent-agnostic (Claude Code and Codex).
+Only step 3's spawn primitive differs between agents;
+everything else is identical.
+
+## Interface
+
+However the skill is triggered,
+it receives ONE raw argument string that begins with a mode word:
+
+```
+diff   <base>              <output> [--overwrite] [--per-persona-context=auto|yes|no]
+files  <path[:lines] ...>  <output> [--overwrite] [--per-persona-context=auto|yes|no]
+```
+
+- `<base>` (diff) — **required**,
+  any ref or SHA;
+  reviews the commit series `merge-base(<base>, HEAD)..HEAD` (each commit's message + diff).
+- `<path[:lines] ...>` (files) — **required**, one or more targets in the working tree.
+  A target is a path, optionally `path:N-M` or `path:N-M,K-L` (1-based, inclusive);
+  repeat a path to add ranges.
+  Wrap a path in double quotes to allow spaces or colons (`"a: b.rs":10-20`).
+- `<output>` — **required, last positional** (`cp src... dest` style);
+  refuse to overwrite unless `--overwrite`.
+- `--overwrite` — replace the output file if it already exists.
+- `--per-persona-context` — `yes`: fan out one isolated agent per persona (best recall).
+  `no`: one combined agent reviews all personas (cheaper, lower recall).
+  `auto` (default) currently resolves to `yes`;
+  it will become a benchmark-driven heuristic.
+  Controls step 3 only.
+
+**Do not pre-split the argument string yourself.**
+Pass it verbatim, as a single quoted argument,
+to `resolve_target.sh` (step 1)
+— the script self-tokenizes (whitespace-split except inside double quotes),
+which keeps the parse deterministic and identical across agents.
+
+## Pipeline
+
+Run these steps in order.
+Steps 1 and 5 are deterministic scripts;
+steps 6–8 use the model.
+
+The helper scripts live in the skill's own `scripts/` directory,
+at `.agents/skills/aster-code-review/scripts/` inside the repository under review.
+**Invoke every script by its absolute path**
+— the working directory is the code under review (the repo root), *not* the skill directory,
+so a bare `scripts/…` is not found (notably on Codex, which runs commands from the repo root; do not `cd` into the skill dir either — `resolve_target.sh` needs the repo as its cwd).
+Shells do not persist between commands,
+so **set `SKILL` at the start of each command that uses it** (or inline the `$(git rev-parse …)`):
+
+```sh
+SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/resolve_target.sh" '<raw args>'
+```
+
+The steps below write `$SKILL/scripts/…` as shorthand for that absolute path.
+
+1. **Resolve the target.**
+   `"$SKILL/scripts/resolve_target.sh" '<raw args>'` prints the canonical review input
+   — the commit series (each commit's message + diff) in `diff` mode,
+   annotated file excerpts in `files` mode;
+   save it to a temp file.
+   Run it again with `--meta` first (`"$SKILL/scripts/resolve_target.sh" --meta '<raw args>'`) to get
+   `mode=`, `base=`/`files=`, `head=`, `branch=`, `output=`, `overwrite=`, `per_persona_context=`;
+   add `date=` (today) and an optional `title=` to make the meta file.
+   Pass the raw argument string as a single quoted argument
+   so the script's tokenizer sees it intact.
+2. **Activate personas.**
+   Pick which of the five personas run,
+   from the reviewed paths — changed paths in `diff` mode,
+   named paths in `files` mode (see *Activation*).
+3. **Fan out.**
+   Spawn the persona passes (see *Spawning*).
+   With `per_persona_context` = `yes` or `auto` (the default),
+   run **one isolated PASS per activated persona** — best recall.
+   With `no`, run **one combined PASS** over all activated personas in a single context
+   — cheaper, lower recall.
+   Build each pass's prompt deterministically with `"$SKILL/scripts/build_pass_prompt.sh" <input-file> <persona>...`
+   — one persona for fan-out, all activated personas for combined
+   — and spawn the sub-agent with **that exact text**.
+   Each pass returns a JSON array of comments;
+   file each under its persona's `<fragdir>/<persona>.json` (the comment's `persona` field says which),
+   so step 5 is unchanged.
+4. **Collect** the per-persona JSON fragments.
+5. **Assemble.**
+   `"$SKILL/scripts/assemble_review.sh" [--overwrite] <meta> <fragdir> <output>` performs the deterministic merge (group by persona in fixed order, sort by file→line, drop exact duplicates *within a persona*, write frontmatter, leave a `<!-- SUMMARY -->` placeholder).
+   Pass `--overwrite` only if the user gave it;
+   otherwise the script refuses to clobber an existing `<output>`.
+6. **Verify** (see *Verification*).
+7. **Consolidate** (see *Consolidation*).
+8. **Summary.**
+   Replace `<!-- SUMMARY -->` with a constructive summary over the final comments:
+   what the code does well, the top issues ranked by severity,
+   any structural recommendations.
+
+## Activation
+
+A persona runs unless the reviewed paths *provably* contain nothing in its remit (reviewed paths = changed paths in `diff` mode, named paths in `files` mode):
+
+- **maintainability, development, security** — any reviewed code.
+- **hardware** — a reviewed path is assembly (`*.S`, `*.asm`),
+  an architecture directory (`.../arch/...`), or contains `asm!` / `global_asm!`.
+- **documentation** — a reviewed path is `book/`, any `*.md`,
+  syscall-coverage files (`*.scml`), or a user-facing API surface (a syscall or kernel parameter).
+
+Activation is path-based and deterministic;
+do not use a model to triage (a wrongly-skipped persona is a silent recall hole).
+
+## Pass contract
+
+The shared reviewer contract
+— the review methodology and the JSON comment schema every pass must follow
+— lives in [`scripts/pass_contract.md`](scripts/pass_contract.md),
+inlined as the **stable head** of every pass prompt by `build_pass_prompt.sh` (step 3).
+Do not paraphrase it into the prompt yourself:
+retyping it breaks the byte-identical prefix the prompt cache relies on (see [`execution_model.md`](spec/execution_model.md)).
+A pass reads only the persona block(s) it is given (selective exposure),
+reviews the **REVIEW INPUT** at the foot of the prompt,
+and returns a JSON array of comments per that schema.
+
+## Spawning a pass
+
+Build every pass prompt with `"$SKILL/scripts/build_pass_prompt.sh" <input-file> <persona>...`
+and spawn the sub-agent with its **exact** output
+— only a script keeps the prompt's stable head (contract + guideline) byte-identical across passes and reviews,
+which is what lets the prompt cache reuse it (see [`execution_model.md`](spec/execution_model.md)).
+
+**Default (`per_persona_context` = `yes`/`auto`)**
+— one pass per activated persona,
+each in a CLEAN context with only its own persona block (selective exposure):
+
+- **Claude Code** — spawn a Task sub-agent per persona.
+- **Codex** — run `codex exec "<build_pass_prompt.sh output>"` per persona
+  (pass the built PROMPT TEXT as the argument).
+
+**Never spawn a pass by re-running `aster_code_review.sh` / `run_agent.sh`,
+nor by re-issuing the skill's own arguments** (e.g. `codex exec … diff <base> <out>`).
+A pass is a *reviewer* invocation whose input is the `build_pass_prompt.sh` text
+— not another run of this skill.
+Re-entering the launcher spawns another orchestrator that spawns another … , an infinite fork bomb;
+the launcher now refuses it (`ACR_AGENT_RUNNING`).
+
+Passes are independent;
+order does not matter.
+Collect each pass's JSON.
+
+**Combined (`per_persona_context` = `no`)**
+— build ONE prompt with all activated personas (`"$SKILL/scripts/build_pass_prompt.sh" <input> <p1> <p2> ...`)
+and run a single pass;
+it reviews through every lens at once and tags each comment with its `persona`.
+The input and spawn overhead are paid once,
+so it is cheaper
+— but a larger shared context dilutes focus,
+so it finds fewer defects.
+The default stays fan-out:
+recall comes first,
+and `no` is an explicit, opt-in concession.
+
+## Verification (step 6)
+
+For each comment, isolate the key premise it rests on
+— especially an external-system fact (Linux/POSIX behaviour, the System V ABI, Rust semantics).
+Try to **refute** it:
+re-read the cited code and consult an authoritative source.
+Assign a verdict:
+
+- **confirmed** — keep the comment unchanged.
+- **uncertain** — keep it, but prefix `problem` with `(unverified) `.
+- **refuted** — remove the comment,
+  and append it to a `## Retracted by verification` list at the foot of the file with a one-line reason.
+
+Remove **only** on confident refutation;
+an unsure check is `uncertain`, not `refuted`.
+This is the only step that may remove a comment, and only false positives.
+
+## Consolidation (step 7)
+
+Find clusters of comments that share one root cause or one fix
+(e.g. several manual lock/unlock pairs that all want RAII).
+For each cluster, write a single unified fix
+and repoint each member's `**Fix.**` at it ("Shared with the other `raii` comments: …").
+**Never remove a comment**
+— every symptom stays at its own location.
+
+## Output format
+
+The assembled file is:
+frontmatter (`date`, `mode`, `base` or `files`, `head`, `branch`, optional `title`),
+a `# Summary`,
+then a `## <section>` per persona in the order **Maintainability, Correctness, Security, Hardware, Documentation** (Correctness is the Development persona's section).
+Each comment is a `### \`file\` line N` subsection:
+a quoted ` ```diff ` snippet,
+then a prose line `` `<grounding>` (<severity>): <problem> ``,
+then a `**Fix.**` paragraph.
+Do not restructure what the script emits;
+only fill the summary and apply the verify/consolidate edits.
+
+codex
+[]
+tokens used
+4,101
+
+exec
+/bin/bash -lc 'codex exec "$(cat /tmp/acr_prompts_0008/documentation.txt)" > /tmp/acr_frag_0008/documentation.json' in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1
+ succeeded in 27871ms:
+exec
+/bin/bash -lc "sed -n '1,220p' .agents/skills/aster-code-review/SKILL.md" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1
+ succeeded in 0ms:
+---
+name: aster-code-review
+description: Review code against Asterinas's persona-keyed coding guidelines and write a Markdown review file. Use when asked to review a Git change (diff mode) or a set of target files (files mode) for defects, or inside a write-test-review loop.
+---
+
+# aster-code-review
+
+Review code against Asterinas's coding guidelines
+— the persona-keyed pages under `book/src/to-contribute/coding-guidelines/`
+— and write one Markdown review file.
+The review is **recall-first**: miss as few real defects as possible.
+It makes both objective calls (undeniable bugs) and subjective calls (guideline violations, each grounded in a cited rule).
+
+There are two review modes, both **anchored at the current checkout (HEAD)**:
+
+- **`diff <base>`** — a Git change:
+  the **commit series** the branch adds over its merge-base with `<base>`
+  — each commit's message *and* its diff,
+  so the review covers per-commit intent and commit hygiene, not just the net change.
+  (Commit first; uncommitted edits are not reviewed in diff mode.)
+- **`files <path[:lines] ...>`**
+  — target code: the working-tree contents of the named files,
+  optionally narrowed to line ranges.
+
+To review at a specific commit, check it out first (it becomes HEAD).
+
+This skill is agent-agnostic (Claude Code and Codex).
+Only step 3's spawn primitive differs between agents;
+everything else is identical.
+
+## Interface
+
+However the skill is triggered,
+it receives ONE raw argument string that begins with a mode word:
+
+```
+diff   <base>              <output> [--overwrite] [--per-persona-context=auto|yes|no]
+files  <path[:lines] ...>  <output> [--overwrite] [--per-persona-context=auto|yes|no]
+```
+
+- `<base>` (diff) — **required**,
+  any ref or SHA;
+  reviews the commit series `merge-base(<base>, HEAD)..HEAD` (each commit's message + diff).
+- `<path[:lines] ...>` (files) — **required**, one or more targets in the working tree.
+  A target is a path, optionally `path:N-M` or `path:N-M,K-L` (1-based, inclusive);
+  repeat a path to add ranges.
+  Wrap a path in double quotes to allow spaces or colons (`"a: b.rs":10-20`).
+- `<output>` — **required, last positional** (`cp src... dest` style);
+  refuse to overwrite unless `--overwrite`.
+- `--overwrite` — replace the output file if it already exists.
+- `--per-persona-context` — `yes`: fan out one isolated agent per persona (best recall).
+  `no`: one combined agent reviews all personas (cheaper, lower recall).
+  `auto` (default) currently resolves to `yes`;
+  it will become a benchmark-driven heuristic.
+  Controls step 3 only.
+
+**Do not pre-split the argument string yourself.**
+Pass it verbatim, as a single quoted argument,
+to `resolve_target.sh` (step 1)
+— the script self-tokenizes (whitespace-split except inside double quotes),
+which keeps the parse deterministic and identical across agents.
+
+## Pipeline
+
+Run these steps in order.
+Steps 1 and 5 are deterministic scripts;
+steps 6–8 use the model.
+
+The helper scripts live in the skill's own `scripts/` directory,
+at `.agents/skills/aster-code-review/scripts/` inside the repository under review.
+**Invoke every script by its absolute path**
+— the working directory is the code under review (the repo root), *not* the skill directory,
+so a bare `scripts/…` is not found (notably on Codex, which runs commands from the repo root; do not `cd` into the skill dir either — `resolve_target.sh` needs the repo as its cwd).
+Shells do not persist between commands,
+so **set `SKILL` at the start of each command that uses it** (or inline the `$(git rev-parse …)`):
+
+```sh
+SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/resolve_target.sh" '<raw args>'
+```
+
+The steps below write `$SKILL/scripts/…` as shorthand for that absolute path.
+
+1. **Resolve the target.**
+   `"$SKILL/scripts/resolve_target.sh" '<raw args>'` prints the canonical review input
+   — the commit series (each commit's message + diff) in `diff` mode,
+   annotated file excerpts in `files` mode;
+   save it to a temp file.
+   Run it again with `--meta` first (`"$SKILL/scripts/resolve_target.sh" --meta '<raw args>'`) to get
+   `mode=`, `base=`/`files=`, `head=`, `branch=`, `output=`, `overwrite=`, `per_persona_context=`;
+   add `date=` (today) and an optional `title=` to make the meta file.
+   Pass the raw argument string as a single quoted argument
+   so the script's tokenizer sees it intact.
+2. **Activate personas.**
+   Pick which of the five personas run,
+   from the reviewed paths — changed paths in `diff` mode,
+   named paths in `files` mode (see *Activation*).
+3. **Fan out.**
+   Spawn the persona passes (see *Spawning*).
+   With `per_persona_context` = `yes` or `auto` (the default),
+   run **one isolated PASS per activated persona** — best recall.
+   With `no`, run **one combined PASS** over all activated personas in a single context
+   — cheaper, lower recall.
+   Build each pass's prompt deterministically with `"$SKILL/scripts/build_pass_prompt.sh" <input-file> <persona>...`
+   — one persona for fan-out, all activated personas for combined
+   — and spawn the sub-agent with **that exact text**.
+   Each pass returns a JSON array of comments;
+   file each under its persona's `<fragdir>/<persona>.json` (the comment's `persona` field says which),
+   so step 5 is unchanged.
+4. **Collect** the per-persona JSON fragments.
+5. **Assemble.**
+   `"$SKILL/scripts/assemble_review.sh" [--overwrite] <meta> <fragdir> <output>` performs the deterministic merge (group by persona in fixed order, sort by file→line, drop exact duplicates *within a persona*, write frontmatter, leave a `<!-- SUMMARY -->` placeholder).
+   Pass `--overwrite` only if the user gave it;
+   otherwise the script refuses to clobber an existing `<output>`.
+6. **Verify** (see *Verification*).
+7. **Consolidate** (see *Consolidation*).
+8. **Summary.**
+   Replace `<!-- SUMMARY -->` with a constructive summary over the final comments:
+   what the code does well, the top issues ranked by severity,
+   any structural recommendations.
+
+## Activation
+
+A persona runs unless the reviewed paths *provably* contain nothing in its remit (reviewed paths = changed paths in `diff` mode, named paths in `files` mode):
+
+- **maintainability, development, security** — any reviewed code.
+- **hardware** — a reviewed path is assembly (`*.S`, `*.asm`),
+  an architecture directory (`.../arch/...`), or contains `asm!` / `global_asm!`.
+- **documentation** — a reviewed path is `book/`, any `*.md`,
+  syscall-coverage files (`*.scml`), or a user-facing API surface (a syscall or kernel parameter).
+
+Activation is path-based and deterministic;
+do not use a model to triage (a wrongly-skipped persona is a silent recall hole).
+
+## Pass contract
+
+The shared reviewer contract
+— the review methodology and the JSON comment schema every pass must follow
+— lives in [`scripts/pass_contract.md`](scripts/pass_contract.md),
+inlined as the **stable head** of every pass prompt by `build_pass_prompt.sh` (step 3).
+Do not paraphrase it into the prompt yourself:
+retyping it breaks the byte-identical prefix the prompt cache relies on (see [`execution_model.md`](spec/execution_model.md)).
+A pass reads only the persona block(s) it is given (selective exposure),
+reviews the **REVIEW INPUT** at the foot of the prompt,
+and returns a JSON array of comments per that schema.
+
+## Spawning a pass
+
+Build every pass prompt with `"$SKILL/scripts/build_pass_prompt.sh" <input-file> <persona>...`
+and spawn the sub-agent with its **exact** output
+— only a script keeps the prompt's stable head (contract + guideline) byte-identical across passes and reviews,
+which is what lets the prompt cache reuse it (see [`execution_model.md`](spec/execution_model.md)).
+
+**Default (`per_persona_context` = `yes`/`auto`)**
+— one pass per activated persona,
+each in a CLEAN context with only its own persona block (selective exposure):
+
+- **Claude Code** — spawn a Task sub-agent per persona.
+- **Codex** — run `codex exec "<build_pass_prompt.sh output>"` per persona
+  (pass the built PROMPT TEXT as the argument).
+
+**Never spawn a pass by re-running `aster_code_review.sh` / `run_agent.sh`,
+nor by re-issuing the skill's own arguments** (e.g. `codex exec … diff <base> <out>`).
+A pass is a *reviewer* invocation whose input is the `build_pass_prompt.sh` text
+— not another run of this skill.
+Re-entering the launcher spawns another orchestrator that spawns another … , an infinite fork bomb;
+the launcher now refuses it (`ACR_AGENT_RUNNING`).
+
+Passes are independent;
+order does not matter.
+Collect each pass's JSON.
+
+**Combined (`per_persona_context` = `no`)**
+— build ONE prompt with all activated personas (`"$SKILL/scripts/build_pass_prompt.sh" <input> <p1> <p2> ...`)
+and run a single pass;
+it reviews through every lens at once and tags each comment with its `persona`.
+The input and spawn overhead are paid once,
+so it is cheaper
+— but a larger shared context dilutes focus,
+so it finds fewer defects.
+The default stays fan-out:
+recall comes first,
+and `no` is an explicit, opt-in concession.
+
+## Verification (step 6)
+
+For each comment, isolate the key premise it rests on
+— especially an external-system fact (Linux/POSIX behaviour, the System V ABI, Rust semantics).
+Try to **refute** it:
+re-read the cited code and consult an authoritative source.
+Assign a verdict:
+
+- **confirmed** — keep the comment unchanged.
+- **uncertain** — keep it, but prefix `problem` with `(unverified) `.
+- **refuted** — remove the comment,
+  and append it to a `## Retracted by verification` list at the foot of the file with a one-line reason.
+
+Remove **only** on confident refutation;
+an unsure check is `uncertain`, not `refuted`.
+This is the only step that may remove a comment, and only false positives.
+
+## Consolidation (step 7)
+
+Find clusters of comments that share one root cause or one fix
+(e.g. several manual lock/unlock pairs that all want RAII).
+For each cluster, write a single unified fix
+and repoint each member's `**Fix.**` at it ("Shared with the other `raii` comments: …").
+**Never remove a comment**
+— every symptom stays at its own location.
+
+## Output format
+
+The assembled file is:
+frontmatter (`date`, `mode`, `base` or `files`, `head`, `branch`, optional `title`),
+a `# Summary`,
+then a `## <section>` per persona in the order **Maintainability, Correctness, Security, Hardware, Documentation** (Correctness is the Development persona's section).
+Each comment is a `### \`file\` line N` subsection:
+a quoted ` ```diff ` snippet,
+then a prose line `` `<grounding>` (<severity>): <problem> ``,
+then a `**Fix.**` paragraph.
+Do not restructure what the script emits;
+
+codex
+[]
+tokens used
+3,770
+
+codex
+Security and documentation returned no findings. I’m waiting for maintainability and correctness, then I’ll validate the fragments and assemble the report.
+codex
+Maintainability found two process/readability issues: the vague past-tense commit subject and the newly added comment restating the function. I’m checking correctness next and then I’ll run the deterministic assembler.
+exec
+/bin/bash -lc "for f in /tmp/acr_frag_0008/*.json; do printf '%s\\n' \""'$f"; sed -n '"'1,120p' \""'$f"; done' in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1
+ succeeded in 0ms:
+/tmp/acr_frag_0008/development.json
+[]
+/tmp/acr_frag_0008/documentation.json
+[]
+/tmp/acr_frag_0008/maintainability.json
+[
+  {
+    "file": "commit d4508b8f5 message",
+    "persona": "maintainability",
+    "grounding": "imperative-subject",
+    "severity": "minor",
+    "problem": "The subject `made some changes to getcwd` is past-tense and vague, and it leaves `getcwd` unformatted instead of using backticks.",
+    "fix": "Use an imperative, verb-first subject that names the actual change, for example `Document `sys_getcwd`` if the comment stays.",
+    "diff": "[commit message]\nmade some changes to getcwd\n\ntweaked the getcwd syscall."
+  },
+  {
+    "file": "kernel/src/syscall/getcwd.rs",
+    "line": 8,
+    "persona": "maintainability",
+    "grounding": "explain-why",
+    "severity": "nit",
+    "problem": "The new comment only restates what `sys_getcwd` already conveys from the syscall name and `buf` parameter, so it adds noise without explaining a non-obvious decision.",
+    "fix": "Remove the comment, or replace it with rationale only if there is a non-obvious behavior to document.",
+    "diff": "+// Writes the current working directory path to the user buffer.\n pub fn sys_getcwd(buf: Vaddr, len: usize, ctx: &Context) -> Result<SyscallReturn> {"
+  }
+]
+/tmp/acr_frag_0008/security.json
+[]
+
+exec
+/bin/bash -lc "sed -n '1,240p' .agents/skills/aster-code-review/scripts/assemble_review.sh" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1
+ succeeded in 0ms:
+#!/usr/bin/env bash
+
+# SPDX-License-Identifier: MPL-2.0
+
+#
+# assemble_review.sh — deterministic merge of persona comment fragments into the review file body.
+# No LLM judgement here:
+# group by persona in a fixed order,
+# sort by file then line within each group,
+# drop exact duplicates *within a persona*,
+# write the frontmatter,
+# and leave a <!-- SUMMARY --> placeholder for the orchestrator's LLM summary step.
+#
+# Usage: assemble_review.sh [--overwrite] <meta-file> <frag-dir> <output-file>
+#   meta-file: lines `mode=`, `base=` (diff) or `files=` (files), `head=`,
+#              `branch=`, `date=`, `title=`
+#   frag-dir:  one <persona>.json per persona, each a JSON array of comments:
+#       {"file","line","grounding","severity","problem","fix","diff"}
+#   --overwrite: replace <output-file> if it already exists (otherwise fail).
+set -euo pipefail
+
+overwrite=0
+pos=()
+for a in "$@"; do
+    case "$a" in
+        --overwrite) overwrite=1 ;;
+        --*) echo "assemble_review.sh: unknown flag: $a" >&2; exit 2 ;;
+        *) pos+=("$a") ;;
+    esac
+done
+if [[ ${#pos[@]} -ne 3 ]]; then
+    echo "usage: assemble_review.sh [--overwrite] <meta-file> <frag-dir> <output-file>" >&2
+    exit 2
+fi
+meta="${pos[0]}"; fragdir="${pos[1]}"; out="${pos[2]}"
+
+# Refuse to clobber an existing review unless --overwrite (design §3).
+if [[ -e "$out" && $overwrite -eq 0 ]]; then
+    echo "assemble_review.sh: refusing to overwrite existing $out (pass --overwrite)" >&2
+    exit 1
+fi
+
+python3 - "$meta" "$fragdir" "$out" <<'PY'
+import json, os, re, sys
+meta_path, fragdir, out = sys.argv[1], sys.argv[2], sys.argv[3]
+
+# A guideline short-name is a lowercase kebab identifier (e.g. `lock-ordering`) and
+# renders as code — a citable rule. A bug's grounding is a short plain-language
+# description (e.g. "Off by one") and renders as prose, so it never reads as a rule name.
+KEBAB = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
+def grounding_tag(g):
+    return "`%s`" % g if KEBAB.fullmatch(g) else g
+
+meta = {}
+for line in open(meta_path):
+    line = line.strip()
+    if "=" in line:
+        k, v = line.split("=", 1)
+        meta[k] = v
+
+# Fixed persona order -> review section title.
+# "Correctness" is the Development persona's section (a bare "## Development" reads oddly; see the design doc).
+ORDER = [("maintainability", "Maintainability"),
+         ("development",      "Correctness"),
+         ("security",         "Security"),
+         ("hardware",         "Hardware"),
+         ("documentation",    "Documentation")]
+
+def load(persona):
+    p = os.path.join(fragdir, persona + ".json")
+    if not os.path.exists(p):
+        return []          # persona not activated / did not run: legitimately absent
+    # An EXISTING fragment that is unparseable or not a JSON array means a pass
+    # produced broken output. Failing closed (rather than dropping it) is essential:
+    # this skill is recall-first, so a silently-discarded fragment is a silent
+    # recall hole the benchmark/orchestrator would never notice.
+    try:
+        data = json.load(open(p))
+    except Exception as e:
+        sys.stderr.write(f"assemble: FATAL: unparseable fragment {p}: {e}\n")
+        sys.exit(2)
+    if not isinstance(data, list):
+        sys.stderr.write(f"assemble: FATAL: fragment {p} is not a JSON array of comments\n")
+        sys.exit(2)
+    return data
+
+L = ["---",
+     f"date: {meta.get('date','')}",
+     f"mode: {meta.get('mode','diff')}"]
+if meta.get("base"):
+    L.append(f"base: {meta['base']}")
+if meta.get("files"):
+    L.append(f"files: {meta['files']}")
+L += [f"head: {meta.get('head','')}",
+      f"branch: {meta.get('branch','')}"]
+if meta.get("title"):
+    # json.dumps yields a valid YAML double-quoted scalar (escapes embedded quotes).
+    L.append("title: " + json.dumps(meta["title"]))
+L += ["---", "", "# Summary", "", "<!-- SUMMARY -->", ""]
+
+counts = {}
+for persona, title in ORDER:
+    # Dedup is per-persona: identical comments from two different personas are both kept,
+    # in their own sections (design §4).
+    seen = set()
+    uniq = []
+    for c in load(persona):
+        # "Exact" duplicate: identical in EVERY field (a normalized full-object key),
+        # so two comments that differ in grounding, severity, or diff are both kept.
+        # A partial key would collapse distinct findings — a recall hole.
+        key = json.dumps(c, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(c)
+    counts[persona] = len(uniq)
+    if not uniq:
+        continue
+    # Sort by file, then line, then a stable text key
+    # so co-located comments have a deterministic order regardless of pass output order.
+    uniq.sort(key=lambda c: (str(c.get("file", "")),
+                             int(c.get("line", 0) or 0),
+                             str(c.get("grounding", "")),
+                             str(c.get("problem", ""))))
+    L += [f"## {title}", ""]
+    for c in uniq:
+        loc = "`%s`" % c.get("file", "?")
+        if c.get("line"):
+            loc += " line %s" % c["line"]
+        L += [f"### {loc}", ""]
+        diff = c.get("diff")
+        if diff:
+            L.append("> ```diff")
+            L += ["> " + dl for dl in str(diff).splitlines()]
+            L += ["> ```", ""]
+        L.append("%s (%s): %s" % (grounding_tag(c.get("grounding", "issue")),
+                                  c.get("severity", "major"),
+                                  (c.get("problem", "") or "").strip()))
+        L += ["", "**Fix.** %s" % (c.get("fix", "") or "").strip(), ""]
+
+open(out, "w").write("\n".join(L).rstrip() + "\n")
+sys.stderr.write("assemble: " + ", ".join(f"{p}={counts[p]}" for p, _ in ORDER) + "\n")
+PY
+
+codex
+The fragments are valid JSON. I’m assembling with the raw findings first, then I’ll do the mandated verification/consolidation pass and clean up any formatting issues in the final Markdown.
+exec
+/bin/bash -lc "printf 'mode=diff\\nbase=546e32e23\\nhead=d4508b8f5\\nbranch=HEAD\\ndate=2026-07-27\\ntitle=Asterinas code review\\n' > /tmp/acr_meta_0008.txt
+SKILL=\""'$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/assemble_review.sh" --overwrite /tmp/acr_meta_0008.txt /tmp/acr_frag_0008 /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1/on.md' in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1
+ succeeded in 0ms:
+assemble: maintainability=2, development=0, security=0, hardware=0, documentation=0
+
+codex
+The assembler wrote `on.md` with two maintainability findings and no correctness, security, or documentation findings. I’m verifying the premises against the changed file and the repo’s guideline text before finalizing the summary.
+exec
+/bin/bash -lc "sed -n '1,220p' on.md" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1
+ succeeded in 0ms:
+---
+date: 2026-07-27
+mode: diff
+base: 546e32e23
+head: d4508b8f5
+branch: HEAD
+title: "Asterinas code review"
+---
+
+# Summary
+
+<!-- SUMMARY -->
+
+## Maintainability
+
+### `commit d4508b8f5 message`
+
+> ```diff
+> [commit message]
+> made some changes to getcwd
+> 
+> tweaked the getcwd syscall.
+> ```
+
+`imperative-subject` (minor): The subject `made some changes to getcwd` is past-tense and vague, and it leaves `getcwd` unformatted instead of using backticks.
+
+**Fix.** Use an imperative, verb-first subject that names the actual change, for example `Document `sys_getcwd`` if the comment stays.
+
+### `kernel/src/syscall/getcwd.rs` line 8
+
+> ```diff
+> +// Writes the current working directory path to the user buffer.
+>  pub fn sys_getcwd(buf: Vaddr, len: usize, ctx: &Context) -> Result<SyscallReturn> {
+> ```
+
+`explain-why` (nit): The new comment only restates what `sys_getcwd` already conveys from the syscall name and `buf` parameter, so it adds noise without explaining a non-obvious decision.
+
+**Fix.** Remove the comment, or replace it with rationale only if there is a non-obvious behavior to document.
+
+codex
+One finding needs a small Markdown correction in its suggested subject, and both findings’ premises are straightforward: the commit message is exactly as cited and the added comment describes the immediate function signature. I’m checking the guideline names now so the final file remains grounded correctly.
+exec
+/bin/bash -lc "rg -n \"imperative|subject|explain|why|comment\" book/src/to-contribute/coding-guidelines .agents/skills/aster-code-review -g '*.md'" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1
+ succeeded in 0ms:
+.agents/skills/aster-code-review/README.md:7:It makes both *objective* calls (undeniable bugs) and *subjective* calls (guideline violations),
+.agents/skills/aster-code-review/tests/README.md:75:- **`assemble_review.sh`** — comment rendering, persona grouping and file→line ordering,
+.agents/skills/aster-code-review/tests/README.md:76:  dedup within a persona vs. keeping a comment across two personas,
+book/src/to-contribute/coding-guidelines/README.md:15:  Language-agnostic guidance for naming, comments,
+book/src/to-contribute/coding-guidelines/README.md:42:| General | Explain why, not what | [`explain-why`](general-guidelines/#explain-why) |
+book/src/to-contribute/coding-guidelines/README.md:54:| Rust | Introduce explaining variables | [`explain-variables`](rust-guidelines/language-items/variables-expressions-and-statements.md#explain-variables) |
+book/src/to-contribute/coding-guidelines/README.md:63:| Rust | Follow RFC 1574 summary line conventions | [`rfc1574-summary`](rust-guidelines/language-items/comments-and-documentation.md#rfc1574-summary) |
+book/src/to-contribute/coding-guidelines/README.md:64:| Rust | End sentence comments with punctuation | [`comment-punctuation`](rust-guidelines/language-items/comments-and-documentation.md#comment-punctuation) |
+book/src/to-contribute/coding-guidelines/README.md:65:| Rust | Wrap identifiers in backticks | [`backtick-identifiers`](rust-guidelines/language-items/comments-and-documentation.md#backtick-identifiers) |
+book/src/to-contribute/coding-guidelines/README.md:66:| Rust | Do not disclose implementation details in doc comments | [`no-impl-in-docs`](rust-guidelines/language-items/comments-and-documentation.md#no-impl-in-docs) |
+book/src/to-contribute/coding-guidelines/README.md:67:| Rust | Add module-level documentation for major components | [`module-docs`](rust-guidelines/language-items/comments-and-documentation.md#module-docs) |
+book/src/to-contribute/coding-guidelines/README.md:92:| Git | Write imperative, descriptive subject lines | [`imperative-subject`](git-guidelines.md#imperative-subject) |
+book/src/to-contribute/coding-guidelines/rust-guidelines/README.md:23:  - **[Comments and Documentation](language-items/comments-and-documentation.md)** —
+book/src/to-contribute/coding-guidelines/rust-guidelines/README.md:25:    comment/doc style,
+.agents/skills/aster-code-review/SKILL.md:12:It makes both objective calls (undeniable bugs) and subjective calls (guideline violations, each grounded in a cited rule).
+.agents/skills/aster-code-review/SKILL.md:106:   Each pass returns a JSON array of comments;
+.agents/skills/aster-code-review/SKILL.md:107:   file each under its persona's `<fragdir>/<persona>.json` (the comment's `persona` field says which),
+.agents/skills/aster-code-review/SKILL.md:117:   Replace `<!-- SUMMARY -->` with a constructive summary over the final comments:
+.agents/skills/aster-code-review/SKILL.md:137:— the review methodology and the JSON comment schema every pass must follow
+.agents/skills/aster-code-review/SKILL.md:144:and returns a JSON array of comments per that schema.
+.agents/skills/aster-code-review/SKILL.md:175:it reviews through every lens at once and tags each comment with its `persona`.
+.agents/skills/aster-code-review/SKILL.md:186:For each comment, isolate the key premise it rests on
+.agents/skills/aster-code-review/SKILL.md:192:- **confirmed** — keep the comment unchanged.
+.agents/skills/aster-code-review/SKILL.md:194:- **refuted** — remove the comment,
+.agents/skills/aster-code-review/SKILL.md:199:This is the only step that may remove a comment, and only false positives.
+.agents/skills/aster-code-review/SKILL.md:203:Find clusters of comments that share one root cause or one fix
+.agents/skills/aster-code-review/SKILL.md:206:and repoint each member's `**Fix.**` at it ("Shared with the other `raii` comments: …").
+.agents/skills/aster-code-review/SKILL.md:207:**Never remove a comment**
+.agents/skills/aster-code-review/SKILL.md:216:Each comment is a `### \`file\` line N` subsection:
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/unsafety.md:5:Every `unsafe` block must have a preceding `// SAFETY:` comment
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/unsafety.md:6:that justifies why the operation is sound.
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/unsafety.md:29:must include a `# Safety` section in their doc comments
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/README.md:20:- **[Comments and Documentation](comments-and-documentation.md)** —
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/README.md:25:  `// SAFETY:` comments,
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md:18:The first line of a doc comment should be concise and one sentence.
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md:41:### End sentence comments with punctuation (`comment-punctuation`) {#comment-punctuation}
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md:43:If a comment line is a full sentence,
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md:59:and code identifiers in doc comments
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md:73:### Do not disclose implementation details in doc comments (`no-impl-in-docs`) {#no-impl-in-docs}
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md:75:Doc comments should describe _what_ the API does
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md:93:should begin with a `//!` comment explaining:
+.agents/skills/aster-code-review/personas/maintainability.md:11:`comments.md`, and `rust-specific/*` (naming, crates-and-modules, types-and-traits, functions-and-methods, attributes-and-macros, comments).
+.agents/skills/aster-code-review/personas/maintainability.md:18:3. Check naming, comments, and layout,
+.agents/skills/aster-code-review/personas/maintainability.md:19:   including the Rust-Specific items (descriptive/accurate names, explain *why* in comments, one concept per file, small functions, narrow visibility, …).
+.agents/skills/aster-code-review/personas/maintainability.md:21:**Always-on:** commit hygiene (Process rules — `imperative-subject`, `atomic-commits`, `focused-prs`, `refactor-then-feature`) applies to every change.
+.agents/skills/aster-code-review/spec/coding_guidelines.md:10:this document explains its rationale,
+.agents/skills/aster-code-review/spec/coding_guidelines.md:108:**Why exactly these five, and why they are stable.**
+.agents/skills/aster-code-review/spec/coding_guidelines.md:151:  This is *why* the skill fans out into independent passes rather than running one prompt over all the rules.
+.agents/skills/aster-code-review/spec/coding_guidelines.md:154:  The anchor it drills into is exactly the citation it puts in a guideline-backed comment (e.g. `for-development/concurrency.md#lock-ordering`),
+.agents/skills/aster-code-review/spec/coding_guidelines.md:155:  so a subjective call is automatically traceable to the standard.
+book/src/to-contribute/coding-guidelines/general-guidelines/README.md:115:For prose in Markdown and doc comments,
+book/src/to-contribute/coding-guidelines/general-guidelines/README.md:132:### Explain why, not what (`explain-why`) {#explain-why}
+book/src/to-contribute/coding-guidelines/general-guidelines/README.md:134:Comments should explain the intent behind the code,
+book/src/to-contribute/coding-guidelines/general-guidelines/README.md:136:If a comment merely paraphrases the code,
+book/src/to-contribute/coding-guidelines/general-guidelines/README.md:139:If a comment is needed to explain what code does,
+book/src/to-contribute/coding-guidelines/general-guidelines/README.md:141:Do not write good comments to compensate for bad code —
+book/src/to-contribute/coding-guidelines/general-guidelines/README.md:154:add a comment explaining the rationale
+book/src/to-contribute/coding-guidelines/general-guidelines/README.md:156:Design-decision comments ("director's commentary")
+book/src/to-contribute/coding-guidelines/general-guidelines/README.md:157:are the most valuable kind of comment.
+book/src/to-contribute/coding-guidelines/general-guidelines/README.md:220:add a one-line summary comment
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/variables-expressions-and-statements.md:3:### Introduce explaining variables (`explain-variables`) {#explain-variables}
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/variables-expressions-and-statements.md:7:An explaining variable turns an opaque expression
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/variables-expressions-and-statements.md:68:and document why wrapping is correct.
+.agents/skills/aster-code-review/spec/README.md:6:and **justified** (every significant decision is argued in place, including the alternatives that were rejected and why).
+.agents/skills/aster-code-review/spec/README.md:40:| [`coding_guidelines.md`](coding_guidelines.md) | The persona-keyed Coding Guidelines the skill consumes — why they are organized by persona, the five personas, and how that structure makes review tractable. |
+.agents/skills/aster-code-review/spec/README.md:41:| [`interface.md`](interface.md) | How the skill is invoked, its two review modes (`diff` and `files`) and the *HEAD is the head* rule, and the format and comment model of the review file it produces. |
+.agents/skills/aster-code-review/spec/README.md:47:[`motivation.md`](motivation.md) and [`coding_guidelines.md`](coding_guidelines.md) give the *why*;
+book/src/to-contribute/coding-guidelines/how-guidelines-are-written.md:15:We collected the historical review comments
+book/src/to-contribute/coding-guidelines/how-guidelines-are-written.md:44:### Managing complexity is the primary technical imperative {#managing-complexity}
+book/src/to-contribute/coding-guidelines/how-guidelines-are-written.md:157:(e.g., `explain-variables`, `lock-ordering`).
+book/src/to-contribute/coding-guidelines/how-guidelines-are-written.md:194:### Introduce explaining variables (`explain-variables`) {#explain-variables}
+book/src/to-contribute/coding-guidelines/how-guidelines-are-written.md:198:An explaining variable turns an opaque expression
+book/src/to-contribute/coding-guidelines/how-guidelines-are-written.md:218:- A stable short name (`explain-variables`) shown parenthetically and used as the heading anchor
+.agents/skills/aster-code-review/personas/security.md:12:1. **`unsafe` soundness** — `justify-unsafe-use` (a `// SAFETY:` comment on every `unsafe` block, and the justification must actually hold),
+book/src/to-contribute/coding-guidelines/testing-guidelines.md:12:in a comment so future readers
+.agents/skills/aster-code-review/spec/motivation.md:15:not on catching a missing `// SAFETY:` comment or an unchecked `min()` on a user buffer.
+.agents/skills/aster-code-review/spec/motivation.md:26:This is why the skill must run locally, fast, and be callable without human interaction.
+.agents/skills/aster-code-review/spec/motivation.md:38:a human reads it (or posts it as inline PR comments);
+.agents/skills/aster-code-review/spec/motivation.md:60:  Every comment names *what* is wrong,
+.agents/skills/aster-code-review/spec/related_work.md:18:  because subjective calls have no agreed standard to anchor them.
+.agents/skills/aster-code-review/spec/related_work.md:20:  — the Coding Guidelines — so `aster-code-review` makes subjective calls too,
+.agents/skills/aster-code-review/spec/related_work.md:21:  **each grounded in a cited rule** (see the comment model in [`interface.md`](interface.md)).
+book/src/to-contribute/coding-guidelines/git-guidelines.md:7:### Write imperative, descriptive subject lines (`imperative-subject`) {#imperative-subject}
+book/src/to-contribute/coding-guidelines/git-guidelines.md:9:Write commit messages in imperative mood
+book/src/to-contribute/coding-guidelines/git-guidelines.md:10:with the subject line at or below 72 characters.
+book/src/to-contribute/coding-guidelines/git-guidelines.md:36:add a blank line after the subject
+book/src/to-contribute/coding-guidelines/git-guidelines.md:38:describing the _why_ behind the change.
+.agents/skills/aster-code-review/spec/benchmark.md:41:not stored as a local patch (see [*Why commit references, not local patches*](#why-commit-references-not-local-patches)):
+.agents/skills/aster-code-review/spec/benchmark.md:67:  source: >                       # REQUIRED. freeform provenance + why the problem is leak-free
+.agents/skills/aster-code-review/spec/benchmark.md:86:      expectation: >              #   REQUIRED. the criterion a review comment is matched against
+.agents/skills/aster-code-review/spec/benchmark.md:94:— "a comment matches iff it meets the `expectation`"
+.agents/skills/aster-code-review/spec/benchmark.md:98:it uses the same `critical|major|minor|nit` vocabulary the review comments render,
+.agents/skills/aster-code-review/spec/benchmark.md:155:not a "this is unsound" comment,
+.agents/skills/aster-code-review/spec/benchmark.md:169:   tests, or warning comments — so the diff never hints at its own defect.
+.agents/skills/aster-code-review/spec/benchmark.md:174:   it must read like a real change and must not include any test or comment that names the defect.
+.agents/skills/aster-code-review/spec/benchmark.md:181:   asserts, tests, and explanatory comments do not exist yet
+.agents/skills/aster-code-review/spec/benchmark.md:201:asserts, tests, and "this is unsound" comments the fix added,
+.agents/skills/aster-code-review/spec/benchmark.md:211:the two synthetic problems (0007–0008) are hosted as dangling commits (see [*Why commit references, not local patches*](#why-commit-references-not-local-patches)).
+.agents/skills/aster-code-review/spec/benchmark.md:222:| 0008 | noncompliant-commit-message | diff | commit subject "made some changes to getcwd" is vague and past-tense, not imperative (commit hygiene) | Maintainability · `imperative-subject` |
+.agents/skills/aster-code-review/spec/benchmark.md:227:0008 a commit with a deliberately non-compliant subject (it exercises commit-message review)
+.agents/skills/aster-code-review/spec/benchmark.md:267:  For each expected defect, a grader is shown the defect (location, persona, grounding, description) and the review's comments,
+.agents/skills/aster-code-review/spec/benchmark.md:268:  and decides whether *any* comment catches it.
+.agents/skills/aster-code-review/spec/benchmark.md:269:  A comment can describe a defect in prose no string matcher would recognize,
+.agents/skills/aster-code-review/spec/benchmark.md:270:  and a coincidental nearby comment must not false-match
+.agents/skills/aster-code-review/spec/benchmark.md:346:  (Relocating `CODEX_HOME` is exactly why `inherit` exists — codex keeps its login token in `CODEX_HOME/auth.json`, so the profile copies the real one in.)
+.agents/skills/aster-code-review/spec/benchmark.md:439:— a commit whose message violates a convention (`imperative-subject`, `atomic-commits`, …)
+.agents/skills/aster-code-review/spec/execution_model.md:14:│  4. collect fragments  <- each pass returns its persona's comments        │
+.agents/skills/aster-code-review/spec/execution_model.md:48:  each annotated with its path and line numbers so a comment can anchor to a line.
+.agents/skills/aster-code-review/spec/execution_model.md:56:A pass is a pure function: `(review_input, persona_page) → comment_fragment`.
+.agents/skills/aster-code-review/spec/execution_model.md:99:  comments, layout (incl. Rust-specific).
+.agents/skills/aster-code-review/spec/execution_model.md:133:  (Maintainability effectively always runs — its process rules, like a well-formed commit subject in `diff` mode, apply to nearly every review.)
+.agents/skills/aster-code-review/spec/execution_model.md:145:free to evolve, which is why it is engineered for recall first.
+.agents/skills/aster-code-review/spec/execution_model.md:157:  — the same input yields the same comments,
+.agents/skills/aster-code-review/spec/execution_model.md:160:  It synthesizes a constructive `# Summary` over the final comment set;
+.agents/skills/aster-code-review/spec/execution_model.md:161:  it may never delete or rewrite a comment.
+.agents/skills/aster-code-review/spec/execution_model.md:164:two personas flagging one line yield two comments,
+.agents/skills/aster-code-review/spec/execution_model.md:175:and no pass can see that several comments share one fix.
+.agents/skills/aster-code-review/spec/execution_model.md:190:for each comment it isolates the key premise and tries to **refute** it,
+.agents/skills/aster-code-review/spec/execution_model.md:192:Each comment gets a verdict:
+.agents/skills/aster-code-review/spec/execution_model.md:194:- **confirmed** — the premise holds; the comment stands unchanged.
+.agents/skills/aster-code-review/spec/execution_model.md:196:  the comment stays but is flagged `(unverified)` so a reader (or the loop) can weight it.
+.agents/skills/aster-code-review/spec/execution_model.md:198:  the comment is removed and recorded in a short *Retracted by verification* note at the foot of the file
+.agents/skills/aster-code-review/spec/execution_model.md:203:This is the **only** point at which a comment can leave the body,
+.agents/skills/aster-code-review/spec/execution_model.md:213:but several comments often share **one root cause or one fix**
+.agents/skills/aster-code-review/spec/execution_model.md:217:Consolidation clusters comments that share a root cause or remedy and writes a single **unified fix** for the cluster,
+.agents/skills/aster-code-review/spec/execution_model.md:218:repointing each member's **Fix.** at it (e.g. *"Shared with the other `raii` comments: introduce a `Guard` that releases in `Drop`."*).
+.agents/skills/aster-code-review/spec/execution_model.md:219:It **never removes a comment**
+.agents/skills/aster-code-review/spec/execution_model.md:222:so it never builds a unified fix around a comment that is about to be retracted.
+.agents/skills/aster-code-review/spec/execution_model.md:259:  — Codex's per-persona `codex exec` fan-out is *verified* to run and return the JSON comment contract,
+.agents/skills/aster-code-review/spec/interface.md:88:and **commit hygiene** (imperative subject, atomic commits — a Maintainability concern),
+.agents/skills/aster-code-review/spec/interface.md:224:each holding one `### <location>` subsection per comment.
+.agents/skills/aster-code-review/spec/interface.md:279:## The comment model
+.agents/skills/aster-code-review/spec/interface.md:285:— rather than carrying a per-comment tag.
+.agents/skills/aster-code-review/spec/interface.md:287:Each comment is a `###` subsection that carries:
+.agents/skills/aster-code-review/spec/interface.md:301:— and this split is the heart of the subjective-plus-objective stance from [`motivation.md`](motivation.md):
+.agents/skills/aster-code-review/spec/interface.md:305:  making a *subjective* call traceable to the shared standard rather than an opinion;
+.agents/skills/aster-code-review/spec/interface.md:320:**Every comment must propose a remedy.**
+.agents/skills/aster-code-review/spec/interface.md:322:— a comment that flags an issue with no path to resolving it is incomplete.
+.agents/skills/aster-code-review/spec/interface.md:323:So each comment closes with a separate paragraph led by **Fix.**,
+.agents/skills/aster-code-review/spec/interface.md:326:Two later orchestrator passes may revise a comment after it is written:
+.agents/skills/aster-code-review/spec/interface.md:335:1. **PR comments.**
+.agents/skills/aster-code-review/spec/interface.md:336:   Each comment is file+line anchored,
+.agents/skills/aster-code-review/spec/interface.md:337:   so a thin adapter posts the comments as inline review comments on a pull request:
+.agents/skills/aster-code-review/spec/interface.md:339:   (dropping any comment whose line is not on the PR diff, which GitHub would silently discard).
+.agents/skills/aster-code-review/spec/interface.md:340:   The workflow `.github/workflows/review_pr_with_codex.yml`, triggered by an `/aster-code-review` PR comment,
+.agents/skills/aster-code-review/spec/interface.md:345:   The per-comment **Fix.** paragraph is what makes this directly actionable.
+.agents/skills/aster-code-review/spec/interface.md:352:On GitHub, a member triggers the skill on a PR with a `/aster-code-review` comment;
+.agents/skills/aster-code-review/spec/interface.md:357:| `/aster-code-review` (or `… diff`) | review the PR diff | inline review comments |
+.agents/skills/aster-code-review/spec/interface.md:358:| `/aster-code-review files <p1> … <pN>` | review those files (tracked; no spaces in a path, v1) | inline review comments |
+.agents/skills/aster-code-review/spec/interface.md:359:| `/aster-code-review smoke [--problems="0002 0006"]` | the smoke test — does the skill run? | a ✅/❌ status comment |
+.agents/skills/aster-code-review/spec/interface.md:360:| `/aster-code-review benchmark [--problems="0002 0006"]` | the benchmark — recall (informational) | a `recall X/Y` status comment |
+.agents/skills/aster-code-review/spec/interface.md:364:The comment is parsed by [`scripts/parse_pr_command.sh`](../scripts/parse_pr_command.sh) (strict allowlist),
+.agents/skills/aster-code-review/spec/interface.md:377:- **`scripts/parse_pr_command.sh`** (a `/aster-code-review …` comment → a validated plan) and the **`make smoke` / `make benchmark`** targets.
+.agents/skills/aster-code-review/scripts/pass_contract.md:56:Output **only** a JSON array of comment objects (no prose around it):
+.agents/skills/aster-code-review/scripts/pass_contract.md:65:- `persona` — which persona section the comment belongs to (`maintainability`, `development`, `security`, `hardware`, `documentation`);
+.agents/skills/aster-code-review/scripts/pass_contract.md:66:  used to file the comment under the right section.
+.agents/skills/aster-code-review/scripts/pass_contract.md:68:- `grounding` — what the comment rests on, in one of two forms kept visually distinct:
+.agents/skills/aster-code-review/scripts/pass_contract.md:80:  — every comment proposes a remedy.
+.agents/skills/aster-code-review/scripts/pass_contract.md:87:- Every field above is required on every comment,
+.agents/skills/aster-code-review/scripts/pass_contract.md:89:- `line` is the line the comment anchors to
+.agents/skills/aster-code-review/scripts/pass_contract.md:96:  and ground it in a commit-hygiene rule (`imperative-subject`, `atomic-commits`, …).
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/README.md:56:  In-code comments and rustdoc are written *for the next maintainer or developer*,
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-development/correctness.md:24:and document why wrapping is correct.
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/comments.md:3:### Explain why, not what (`explain-why`) {#explain-why}
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/comments.md:5:Comments should explain the intent behind the code,
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/comments.md:7:If a comment merely paraphrases the code,
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/comments.md:10:If a comment is needed to explain what code does,
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/comments.md:12:Do not write good comments to compensate for bad code —
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/comments.md:25:add a comment explaining the rationale
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/comments.md:27:Design-decision comments ("director's commentary")
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/comments.md:28:are the most valuable kind of comment.
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-development/testing.md:8:in a comment so future readers
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/process.md:3:### Write imperative, descriptive subject lines (`imperative-subject`) {#imperative-subject}
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/process.md:5:Write commit messages in imperative mood
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/process.md:6:with the subject line at or below 72 characters.
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/process.md:32:add a blank line after the subject
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/process.md:34:describing the _why_ behind the change.
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-security/memory-safety.md:5:Every `unsafe` block must have a preceding `// SAFETY:` comment
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-security/memory-safety.md:6:that justifies why the operation is sound.
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-security/memory-safety.md:29:must include a `# Safety` section in their doc comments
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-security/README.md:13:- [`justify-unsafe-use`](memory-safety.md#justify-unsafe-use): Precede every `unsafe` block with a `// SAFETY:` comment justifying soundness.
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/naming.md:100:// Bad — the reader must infer why this bit is special.
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/naming.md:106:If the name alone does not explain where the value comes from,
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/naming.md:107:add a short comment or cite the relevant specification.
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/layout.md:25:add a one-line summary comment
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/README.md:23:- [`imperative-subject`](process.md#imperative-subject): Write each commit subject in the imperative mood, ≤72 chars, verb-first ("Fix", "Add", "Remove"); backtick identifiers.
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/README.md:40:**[Comments](comments.md)**
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/README.md:41:- [`explain-why`](comments.md#explain-why): Comments explain intent (why), not what the code does; if you must explain "what", rewrite the code.
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/README.md:42:- [`design-decisions`](comments.md#design-decisions): Document non-obvious choices, with rationale and alternatives considered.
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/README.md:43:- [`cite-sources`](comments.md#cite-sources): Cite the source (POSIX, Linux man page, hardware manual, paper) for spec/algorithm behavior.
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/README.md:62:    - [`explain-variables`](rust-specific/functions-and-methods.md#explain-variables): Bind intermediate results of a complex expression to well-named variables.
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/README.md:68:- [Comments](rust-specific/comments.md)
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/README.md:69:    - [`rfc1574-summary`](rust-specific/comments.md#rfc1574-summary): First doc line is one sentence — a third-person verb for functions, a noun phrase for types/modules.
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/README.md:70:    - [`comment-punctuation`](rust-specific/comments.md#comment-punctuation): End full-sentence comments with terminal punctuation.
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/README.md:71:    - [`backtick-identifiers`](rust-specific/comments.md#backtick-identifiers): Wrap identifiers in doc comments in backticks; prefer rustdoc links where possible.
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/README.md:72:    - [`no-impl-in-docs`](rust-specific/comments.md#no-impl-in-docs): Doc comments describe what an API does and how to use it, not its internal implementation.
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-documentation/general-style.md:5:For prose in Markdown and doc comments,
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/rust-specific/README.md:10:- [Comments](comments.md)
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/how-guidelines-are-written.md:15:We collected the historical review comments
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/how-guidelines-are-written.md:42:### Managing complexity is the primary technical imperative {#managing-complexity}
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/how-guidelines-are-written.md:67:(e.g., `explain-variables`, `lock-ordering`).
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/how-guidelines-are-written.md:104:### Introduce explaining variables (`explain-variables`) {#explain-variables}
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/how-guidelines-are-written.md:108:An explaining variable turns an opaque expression
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/how-guidelines-are-written.md:128:- A stable short name (`explain-variables`) shown parenthetically and used as the heading anchor
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/rust-specific/comments.md:5:The first line of a doc comment should be concise and one sentence.
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/rust-specific/comments.md:28:### End sentence comments with punctuation (`comment-punctuation`) {#comment-punctuation}
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/rust-specific/comments.md:30:If a comment line is a full sentence,
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/rust-specific/comments.md:46:and code identifiers in doc comments
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/rust-specific/comments.md:60:### Do not disclose implementation details in doc comments (`no-impl-in-docs`) {#no-impl-in-docs}
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/rust-specific/comments.md:62:Doc comments should describe _what_ the API does
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/rust-specific/functions-and-methods.md:80:### Introduce explaining variables (`explain-variables`) {#explain-variables}
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/rust-specific/functions-and-methods.md:84:An explaining variable turns an opaque expression
+.agents/skills/aster-code-review/guideline-root/book/src/to-contribute/coding-guidelines/for-maintainability/rust-specific/crates-and-modules.md:27:should begin with a `//!` comment explaining:
+
+codex
+Verification confirmed both maintainability findings: the referenced commit message violates the imperative/descriptive subject rule, and the added comment falls under the “explain why, not what” guideline. There are no related comments to consolidate, so I’m filling the summary and fixing the Markdown in the suggested commit subject.
+apply patch
+patch: completed
+/root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1/on.md
+diff --git a/on.md b/on.md
+index c5d2f90a4ba0b98b18959c6b317570e9058dde3d..aca8db3af84cba23db93f1788a0dd4cda29071cc
+--- a/on.md
++++ b/on.md
+@@ -9,7 +9,7 @@
+ 
+ # Summary
+ 
+-<!-- SUMMARY -->
++The change is behaviorally small: it only adds a plain comment above `sys_getcwd`, and the correctness, security, and documentation passes did not find runtime or API issues. The main problems are maintainability/process issues: the commit subject is vague and not imperative, and the new comment repeats what the function signature already says instead of documenting a non-obvious reason.
+ 
+ ## Maintainability
+ 
+@@ -24,7 +24,7 @@
+ 
+ `imperative-subject` (minor): The subject `made some changes to getcwd` is past-tense and vague, and it leaves `getcwd` unformatted instead of using backticks.
+ 
+-**Fix.** Use an imperative, verb-first subject that names the actual change, for example `Document `sys_getcwd`` if the comment stays.
++**Fix.** Use an imperative, verb-first subject that names the actual change, for example `Document sys_getcwd` if the comment stays.
+ 
+ ### `kernel/src/syscall/getcwd.rs` line 8
+ 
+
+diff --git a/on.md b/on.md
+index c5d2f90a4ba0b98b18959c6b317570e9058dde3d..aca8db3af84cba23db93f1788a0dd4cda29071cc
+--- a/on.md
++++ b/on.md
+@@ -9,7 +9,7 @@
+ 
+ # Summary
+ 
+-<!-- SUMMARY -->
++The change is behaviorally small: it only adds a plain comment above `sys_getcwd`, and the correctness, security, and documentation passes did not find runtime or API issues. The main problems are maintainability/process issues: the commit subject is vague and not imperative, and the new comment repeats what the function signature already says instead of documenting a non-obvious reason.
+ 
+ ## Maintainability
+ 
+@@ -24,7 +24,7 @@
+ 
+ `imperative-subject` (minor): The subject `made some changes to getcwd` is past-tense and vague, and it leaves `getcwd` unformatted instead of using backticks.
+ 
+-**Fix.** Use an imperative, verb-first subject that names the actual change, for example `Document `sys_getcwd`` if the comment stays.
++**Fix.** Use an imperative, verb-first subject that names the actual change, for example `Document sys_getcwd` if the comment stays.
+ 
+ ### `kernel/src/syscall/getcwd.rs` line 8
+ 
+
+codex
+The review file is now assembled and summarized. I’m doing a final read-through of `on.md` so I can catch any formatting problems before closing the task.
+exec
+/bin/bash -lc "sed -n '1,220p' on.md" in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1
+ succeeded in 0ms:
+---
+date: 2026-07-27
+mode: diff
+base: 546e32e23
+head: d4508b8f5
+branch: HEAD
+title: "Asterinas code review"
+---
+
+# Summary
+
+The change is behaviorally small: it only adds a plain comment above `sys_getcwd`, and the correctness, security, and documentation passes did not find runtime or API issues. The main problems are maintainability/process issues: the commit subject is vague and not imperative, and the new comment repeats what the function signature already says instead of documenting a non-obvious reason.
+
+## Maintainability
+
+### `commit d4508b8f5 message`
+
+> ```diff
+> [commit message]
+> made some changes to getcwd
+> 
+> tweaked the getcwd syscall.
+> ```
+
+`imperative-subject` (minor): The subject `made some changes to getcwd` is past-tense and vague, and it leaves `getcwd` unformatted instead of using backticks.
+
+**Fix.** Use an imperative, verb-first subject that names the actual change, for example `Document sys_getcwd` if the comment stays.
+
+### `kernel/src/syscall/getcwd.rs` line 8
+
+> ```diff
+> +// Writes the current working directory path to the user buffer.
+>  pub fn sys_getcwd(buf: Vaddr, len: usize, ctx: &Context) -> Result<SyscallReturn> {
+> ```
+
+`explain-why` (nit): The new comment only restates what `sys_getcwd` already conveys from the syscall name and `buf` parameter, so it adds noise without explaining a non-obvious decision.
+
+**Fix.** Remove the comment, or replace it with rationale only if there is a non-obvious behavior to document.
+
+diff --git a/on.md b/on.md
+index c5d2f90a4ba0b98b18959c6b317570e9058dde3d..aca8db3af84cba23db93f1788a0dd4cda29071cc
+--- a/on.md
++++ b/on.md
+@@ -9,7 +9,7 @@
+ 
+ # Summary
+ 
+-<!-- SUMMARY -->
++The change is behaviorally small: it only adds a plain comment above `sys_getcwd`, and the correctness, security, and documentation passes did not find runtime or API issues. The main problems are maintainability/process issues: the commit subject is vague and not imperative, and the new comment repeats what the function signature already says instead of documenting a non-obvious reason.
+ 
+ ## Maintainability
+ 
+@@ -24,7 +24,7 @@
+ 
+ `imperative-subject` (minor): The subject `made some changes to getcwd` is past-tense and vague, and it leaves `getcwd` unformatted instead of using backticks.
+ 
+-**Fix.** Use an imperative, verb-first subject that names the actual change, for example `Document `sys_getcwd`` if the comment stays.
++**Fix.** Use an imperative, verb-first subject that names the actual change, for example `Document sys_getcwd` if the comment stays.
+ 
+ ### `kernel/src/syscall/getcwd.rs` line 8
+ 
+
+codex
+Wrote the review to [on.md](/root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1/on.md).
+
+The review reports two maintainability findings: the non-imperative/vague commit subject and the newly added comment restating the code. Correctness, security, and documentation passes returned no findings. No tests were run; this was review-only.
+diff --git a/on.md b/on.md
+index c5d2f90a4ba0b98b18959c6b317570e9058dde3d..aca8db3af84cba23db93f1788a0dd4cda29071cc
+--- a/on.md
++++ b/on.md
+@@ -9,7 +9,7 @@
+ 
+ # Summary
+ 
+-<!-- SUMMARY -->
++The change is behaviorally small: it only adds a plain comment above `sys_getcwd`, and the correctness, security, and documentation passes did not find runtime or API issues. The main problems are maintainability/process issues: the commit subject is vague and not imperative, and the new comment repeats what the function signature already says instead of documenting a non-obvious reason.
+ 
+ ## Maintainability
+ 
+@@ -24,7 +24,7 @@
+ 
+ `imperative-subject` (minor): The subject `made some changes to getcwd` is past-tense and vague, and it leaves `getcwd` unformatted instead of using backticks.
+ 
+-**Fix.** Use an imperative, verb-first subject that names the actual change, for example `Document `sys_getcwd`` if the comment stays.
++**Fix.** Use an imperative, verb-first subject that names the actual change, for example `Document sys_getcwd` if the comment stays.
+ 
+ ### `kernel/src/syscall/getcwd.rs` line 8
+ 
+
+tokens used
+39,523
+Wrote the review to [on.md](/root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1/on.md).
+
+The review reports two maintainability findings: the non-imperative/vague commit subject and the newly added comment restating the code. Correctness, security, and documentation passes returned no findings. No tests were run; this was review-only.
+WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/tmp" (codex_home: AbsolutePathBuf("/root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/tmp/tmp.vpJFZi1pI5"))
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/skill-under-test/benchmark
+model: gpt-5.5
+provider: OpenAI
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR] (network access enabled)
+reasoning effort: high
+reasoning summaries: none
+session id: 019fa394-77eb-75b1-bd4e-ba3489c88653
+--------
+user
+You are grading a code review. The expected defects are in /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/spec/0008-noncompliant-commit-message.defects.txt; the produced review is /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/scratch/work/wt1/on.md. Each expected defect gives a 'defect:' description for context and a 'MATCH IF:' criterion. For each expected defect, decide whether ANY comment in the review satisfies its MATCH IF criterion at the stated code location (wording may differ). Respond with ONLY two space-separated integers, caught then total, and nothing else (for example: 1 2).
+warning: Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.
+web search: 
+web search: 
+web search: 
+web search: 
+web search: 
+web search: 
+web search: 
+web search: 
+web search: 
+web search: "0008-noncompliant-commit-message.defects.txt"
+apply patch
+patch: failed
+/tmp/probe.txt
+2026-07-27T12:38:47.659295Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.1 seconds
+Output:
+Failed to write file /tmp/probe.txt
+
+apply patch
+patch: failed
+/root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/skill-under-test/benchmark/probe.txt
+2026-07-27T12:38:55.859878Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.2 seconds
+Output:
+Failed to write file /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/skill-under-test/benchmark/probe.txt
+
+web search: 
+web search: 
+web search: 
+web search: 
+web search: 
+web search: 
+codex
+1 1
+tokens used
+13,320
+0008-noncompliant-commit-message   recall 1/1 [fan-out]
+----
+reviews kept for inspection in: /root/asterinas/.agents/skills/aster-code-review/benchmark_runs/codex_all_20260727T115738Z/0008/keep  (per problem: review.md + expected-defects.txt)
+recall: 1/1 (100%, gate >=100%) across 1 problems; per-persona-context: 0 combined, 1 fan-out; precision: 0/0 clean; harness errors: 0

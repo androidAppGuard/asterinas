@@ -1,0 +1,3 @@
+validate_problem_yaml.sh: PyYAML not available
+run.sh: problems.yaml failed validation; aborting
+make: *** [Makefile:41: benchmark] Error 2

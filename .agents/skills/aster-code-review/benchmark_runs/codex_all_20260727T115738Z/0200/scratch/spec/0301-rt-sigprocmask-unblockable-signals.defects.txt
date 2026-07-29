@@ -1,0 +1,13 @@
+# Expected defects
+
+1. location: kernel/src/syscall/rt_sigprocmask.rs (persona: development, grounding: Incorrect signal semantics, severity: critical)
+   defect: `sys_rt_sigprocmask` sanitizes `read_mask` for `MaskOp::Block`, but the `MaskOp::SetMask` arm stores the user-provided mask verbatim with `sig_mask_ref.store(read_mask, Ordering::Relaxed)`. A caller using `SIG_SETMASK` can therefore place `SIGKILL` or `SIGSTOP` in the thread's blocked signal mask. Linux requires attempts to block these two signals to be silently ignored, so accepting them in the set-mask path can make user tasks unkillable or unstoppable and breaks signal semantics.
+   MATCH IF: A reviewer should flag that every path installing a blocked signal mask, including `SIG_SETMASK`, must preserve the invariant that `SIGKILL` and `SIGSTOP` cannot be blocked.
+
+2. location: kernel/src/syscall/rt_sigprocmask.rs (persona: development, grounding: Incorrect argument validation, severity: major)
+   defect: `sys_rt_sigprocmask` converts `how` with `MaskOp::try_from(how)?` before it checks whether `set_ptr` is null. Linux ignores the `how` argument when `set` is `NULL`, because that call only reads the current signal mask through `oldset`. A call such as `rt_sigprocmask(999, NULL, oldset, 8)` should therefore succeed and report the old mask, but this implementation returns `EINVAL` before it reaches the `oldset_ptr` write.
+   MATCH IF: A reviewer should flag that `rt_sigprocmask` must ignore invalid `how` values when `set` is `NULL`; only calls that install or change a signal mask should validate the operation.
+
+3. location: kernel/src/syscall/rt_sigprocmask.rs (persona: maintainability, grounding: narrow-visibility, severity: minor)
+   defect: `MaskOp` is declared `pub`, but it is only used inside `kernel/src/syscall/rt_sigprocmask.rs` to decode the syscall's `how` argument. Exposing this syscall-local enum creates an unnecessary module interface for an implementation detail that no other module needs to name.
+   MATCH IF: A reviewer should flag that syscall-local decode enums should not be public when all uses are contained in the same source file.
