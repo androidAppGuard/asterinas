@@ -20,5 +20,19 @@ and will the next reader understand it without archaeology?
 
 **Always-on:** commit hygiene (Process rules — `imperative-subject`, `atomic-commits`, `focused-prs`, `refactor-then-feature`) applies to every change.
 
+When changed code uses a bare literal to encode a rule, limit, mask, unit,
+policy, or external contract, check whether the literal has a semantic name at
+the point of use. Repeated literals in related code are strong evidence of
+duplicated policy; flag them under `no-magic-number` and ask for a named
+constant, typed value, or shared helper.
+
+When checking comments, inspect both rustdoc comments and ordinary code comments.
+In code-oriented comments, names of types, functions, modules, constants,
+syscalls, flags, paths, and literals should be visually distinguishable from
+prose when that affects readability. Apply `backtick-identifiers` to changed
+ordinary comments when they are explaining code or API behavior and leave such
+identifiers as plain prose; ask for Markdown code formatting or rustdoc links
+where appropriate.
+
 You own readability and structure,
 not runtime correctness (Correctness persona) or doc currency (Documentation persona).

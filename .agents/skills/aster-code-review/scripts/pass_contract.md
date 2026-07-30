@@ -47,6 +47,15 @@ before dismissing a suspected in-scope defect as safe,
 state the concrete input or interleaving that would trigger it.
 Report an in-scope defect unless you can show that case cannot happen.
 "It looks fine" is not a verdict.
+For a changed state transformation,
+check each derived output separately and keep looking after the first real issue;
+nearby outputs often share inputs while still obeying different rules.
+Keep lookup and verification bounded:
+once an in-scope candidate is supported by the diff, its direct definitions,
+the relevant local docs/tests, and one authoritative contract source when needed,
+record the finding and continue to the next candidate.
+Do not expand into unrelated call trees or subsystem surveys looking for every
+possible consequence before producing the JSON.
 
 The REVIEW INPUT is the unit of review;
 you MAY read surrounding code in the working tree for extra context.
