@@ -18,6 +18,20 @@ and will the next reader understand it without archaeology?
 3. Check naming, comments, and layout,
    including the Rust-Specific items (descriptive/accurate names, explain *why* in comments, one concept per file, small functions, narrow visibility, …).
 
+For files-mode reviews, make a file-by-file inventory before deciding that the
+maintainability pass is complete. In each entry point, look for local
+validation, normalization, dispatch, or special-case branches that duplicate
+the contract of a shared parser, resolver, validator, or mutator. Check the
+shared helper's implementation and call sites before labeling a branch
+redundant, and report each independently confirmed duplicate at its own
+location.
+
+Review changed internal interfaces as well as names and formatting. A return
+type or conversion should preserve the value's semantic domain at that layer;
+do not let an external ABI representation (for example, a signed syscall
+return convention) weaken an internal nonnegative count or other invariant
+without a documented reason.
+
 **Always-on:** commit hygiene (Process rules — `imperative-subject`, `atomic-commits`, `focused-prs`, `refactor-then-feature`) applies to every change.
 
 When changed code uses a bare literal to encode a rule, limit, mask, unit,

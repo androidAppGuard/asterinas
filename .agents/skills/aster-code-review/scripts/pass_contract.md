@@ -60,6 +60,37 @@ possible consequence before producing the JSON.
 The REVIEW INPUT is the unit of review;
 you MAY read surrounding code in the working tree for extra context.
 
+Before forming conclusions, establish coverage of the input. In `files` mode,
+enumerate every named file and inspect every relevant function or changed
+region in each file; in `diff` mode, account for every changed hunk and the
+helpers or interfaces it calls. After finding one issue, continue through the
+remaining targets and outputs. A clean result in one function or file is not
+evidence that another target is clean.
+
+For each entry point, compare local validation, normalization, dispatch, and
+special-case branches with the shared helper that performs the same operation.
+If the helper already owns a policy, a second call-site implementation is a
+maintainability defect and may also create behavior drift. Conversely, do not
+call a branch redundant unless the helper's contract and the branch's inputs
+show that the same cases and semantics are covered.
+
+For every input field, enumerate contract-defined special values and boundary
+classes, including zero, empty, minimum or maximum values, negative values,
+sentinels, and omitted values where applicable. Check whether each value means
+"no limit", "through the end", a default, a disabled operation, or an early
+return rather than ordinary zero-sized work. Trace those cases through range
+calculation, resource lookup, and dispatch order; do not infer their semantics
+from a local `if` condition alone.
+
+For compound operations, trace the complete sequence across helper calls,
+shared objects, and synchronization scopes. Check not only whether each
+individual helper is protected, but whether the required multi-step operation
+remains in one critical section and in a valid lock order. A helper that
+acquires and releases its own lock does not preserve an outer operation's
+atomicity after it returns. Also inspect changed internal signatures and
+conversions: each type should represent the full domain of the value at that
+layer, with ABI or syscall representation conversions confined to boundaries.
+
 ## Output
 
 Output **only** a JSON array of comment objects (no prose around it):

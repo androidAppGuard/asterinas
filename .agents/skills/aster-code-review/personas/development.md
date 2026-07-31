@@ -44,6 +44,13 @@ the failing case, or a proof of its impossibility, is.
    `careful-atomics` (ad-hoc multi-word lock-free schemes across separate atomics are usually unsound),
    `atomic-critical-sections` (re-validate after the action in check-then-act sequences — TOCTOU),
    `no-io-under-spinlock`.
+   For an operation that touches multiple shared objects or calls helpers that
+   wake, notify, publish, or otherwise mutate shared state, trace the entire
+   operation's lock ownership and release points. Verify that all steps covered
+   by the external atomicity/order contract execute while the necessary locks
+   are held; do not treat separately serialized helper calls as one atomic
+   transaction. When two objects can map to different locks, check the
+   same-lock case and the cross-lock acquisition order.
 4. **Hot-path efficiency** — `no-linear-hot-paths`,
    `minimize-copies`, `no-premature-optimization`.
 5. **Observability and tests** — `ostd-log-only`,

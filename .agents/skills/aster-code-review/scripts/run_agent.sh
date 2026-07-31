@@ -19,6 +19,8 @@
 # and, by convention, an optional config.toml seeded into a private {workdir}.
 # {prompt}/{workdir}/{home} in the profile are substituted.
 # Runs in the current cwd and inherits the current env PLUS the profile env.
+# ACR_PROFILE_WORKDIR_ROOT, when set, keeps the per-invocation profile workdir
+# under that directory for benchmark artifact collection instead of deleting it.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SKILL="$(cd "$HERE/.." && pwd)"
@@ -52,8 +54,20 @@ if [[ "$ACR_AGENT_PROFILE" == */* ]]; then PROFILE_DIR="$ACR_AGENT_PROFILE"; els
 [[ -f "$PROFILE_DIR/profile.json" ]] || { echo "run_agent.sh: profile not found: $PROFILE_DIR/profile.json (available: $(list_profiles))" >&2; exit 2; }
 PROFILE_DIR="$(cd "$PROFILE_DIR" && pwd)"
 PROFILE_SMOKE=0; [[ "${ACR_PROFILE_VARIANT:-}" == smoke ]] && PROFILE_SMOKE=1
-PROFILE_WORKDIR="$(mktemp -d)"          # the {workdir}: config.toml + auth land here (e.g. CODEX_HOME)
-trap 'rm -rf "$PROFILE_WORKDIR"' EXIT
+PROFILE_WORKDIR_ROOT="${ACR_PROFILE_WORKDIR_ROOT:-}"
+if [[ -n "$PROFILE_WORKDIR_ROOT" ]]; then
+    mkdir -p "$PROFILE_WORKDIR_ROOT"
+    PROFILE_WORKDIR="$(mktemp -d "$PROFILE_WORKDIR_ROOT/profile-XXXXXX")"
+    PROFILE_WORKDIR_KEPT=1
+else
+    PROFILE_WORKDIR="$(mktemp -d)"
+    PROFILE_WORKDIR_KEPT=0
+fi
+# The {workdir}: config.toml + auth land here (e.g. CODEX_HOME).
+cleanup_profile_workdir() {
+    [[ "$PROFILE_WORKDIR_KEPT" -eq 1 ]] || rm -rf "$PROFILE_WORKDIR"
+}
+trap cleanup_profile_workdir EXIT
 declare -a PROFILE_CMD=() PROFILE_ENV=() INH_SRC=() INH_DEST=()
 
 # Parse the (smoke-merged) profile.json into C<TAB>token | E<TAB>KEY=VAL | I<TAB>src<TAB>dest,
