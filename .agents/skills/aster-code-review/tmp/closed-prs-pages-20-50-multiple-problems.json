@@ -1,0 +1,258 @@
+{
+  "repository": "https://github.com/asterinas/asterinas",
+  "query": "is:pr is:closed",
+  "pages": "20-50",
+  "collected_on": "2026-08-05",
+  "scope_note": "GitHub currently returns 25 PRs per page for pages 20-40. Pages 41-50 return no results because GitHub search pagination is limited to its first 1000 results.",
+  "counting_rule": "Counts are conservative and include only independently resolved behavior, correctness, concurrency, safety, or compatibility problems. Pure refactors, formatting, test-only changes, and unresolved FIXME items are excluded.",
+  "pull_requests": [
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2273",
+      "problem_count": 2,
+      "problem_descriptions": [
+        "get_cpuid_level() returned the TSC frequency denominator instead of the highest supported CPUID level.",
+        "get_clflush_size() returned the cache-line size without the required 8-byte scaling."
+      ]
+    },
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2280",
+      "problem_count": 3,
+      "problem_descriptions": [
+        "Signal-stack flags were handled without separating user-controlled flags from internally managed state.",
+        "Signal-stack settings were not preserved on the user stack and restored correctly by rt_sigreturn.",
+        "The handler_count-based active-stack tracking was incorrect when SS_AUTODISARM disabled the stack."
+      ]
+    },
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2290",
+      "problem_count": 3,
+      "problem_descriptions": [
+        "The CI workflow always forced release mode and KVM mode instead of honoring the requested debug configuration.",
+        "Receiving an empty UNIX SEQPACKET packet could trigger a kernel assertion failure.",
+        "pause_timeout() could miss a signal that arrived between signal setup and entering the wait."
+      ]
+    },
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2315",
+      "problem_count": 2,
+      "problem_descriptions": [
+        "Mountpoint state was cleared incorrectly when one dentry corresponded to multiple mounts.",
+        "Mount flags were not updated in all detach and mount-point replacement paths."
+      ]
+    },
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2327",
+      "problem_count": 2,
+      "problem_descriptions": [
+        "Shebang parsing rejected valid interpreter lines containing multiple arguments.",
+        "Whitespace after #! produced an incorrect empty interpreter argument."
+      ]
+    },
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2390",
+      "problem_count": 3,
+      "problem_descriptions": [
+        "MADV_NOHUGEPAGE caused a panic even though huge pages were unsupported.",
+        "capget did not implement the Linux behavior for an unsupported capability version with a null output address.",
+        "openat did not return ENOENT for an empty pathname."
+      ]
+    },
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2430",
+      "problem_count": 3,
+      "problem_descriptions": [
+        "ReadCString returned the wrong error when a string reached the user-space address limit without a NUL terminator.",
+        "Netlink attribute parsing stopped at an embedded NUL or required a NUL terminator when Linux permits the attribute to end at the reader boundary.",
+        "Netlink parsing errors could leave the reader at the wrong position or be swallowed instead of being reported."
+      ]
+    },
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2434",
+      "problem_count": 3,
+      "problem_descriptions": [
+        "Blocking FIFO open did not wait for both a reader and a writer.",
+        "FIFO read and write operations ignored the nonblocking flag.",
+        "FIFO status_flags were shared at the pipe level instead of being independent per file descriptor."
+      ]
+    },
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2453",
+      "problem_count": 3,
+      "problem_descriptions": [
+        "A typo in the mount-namespace changes caused CI failure.",
+        "switch_to_mnt_ns could reject a valid operation with EINVAL and did not combine mount-tree cloning with resolver update atomically.",
+        "Setting a non-mount namespace incorrectly reset the filesystem resolver."
+      ]
+    },
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2477",
+      "problem_count": 5,
+      "problem_descriptions": [
+        "A clone argument check was performed in the wrong place and could be skipped.",
+        "CloneArgs::check missed invalid flag combinations such as CLONE_SIGHAND without CLONE_VM.",
+        "clone3() did not validate the relationship and user-space range of stack and stack-size arguments.",
+        "find_reaper_process() could lose the ancestor during concurrent parent reaping instead of retrying.",
+        "The memory orderings for child-subreaper state were inconsistent with the required synchronization."
+      ]
+    },
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2482",
+      "problem_count": 3,
+      "problem_descriptions": [
+        "getrandom rejected or accepted flags incorrectly.",
+        "getrandom could perform an unbounded allocation based on user input.",
+        "getrandom did not permit short writes according to the expected interface behavior."
+      ]
+    },
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2488",
+      "problem_count": 2,
+      "problem_descriptions": [
+        "Run queues were accessed without IRQ-disabled locking, allowing a deadlock through the registered IRQ callback.",
+        "The init process was not woken after dead children were moved, leaving LTP wait/reap tests stuck."
+      ]
+    },
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2490",
+      "problem_count": 2,
+      "problem_descriptions": [
+        "procfs uid_map/gid_map output was formatted without the required field separation.",
+        "procfs meminfo computed MemFree from MemTotal - MemAvailable, producing nonsensical values."
+      ]
+    },
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2492",
+      "problem_count": 2,
+      "problem_descriptions": [
+        "MMIO allocation used an unnecessarily strict 4 GiB alignment and failed for valid low-memory layouts.",
+        "PIO allocation consumed the range during the existence check and then iterated an empty range, causing a later recycle assertion failure."
+      ]
+    },
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2553",
+      "problem_count": 5,
+      "problem_descriptions": [
+        "procfs used inconsistent process-table and cached-entry lock orders.",
+        "procfs acquired a mutex while holding the file-table spinlock, causing an atomic-mode violation.",
+        "procfs returned incorrect information after execve was performed by a non-main thread.",
+        "procfs returned incorrect information after the file table was unshared.",
+        "A task directory could remain visible after its thread exited."
+      ]
+    },
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2563",
+      "problem_count": 2,
+      "problem_descriptions": [
+        "MemfdFile lacked access-mode checks, which would become observable when reopening a memfd.",
+        "InodeHandle did not map O_PATH to the correct empty rights set."
+      ]
+    },
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2575",
+      "problem_count": 3,
+      "problem_descriptions": [
+        "sched_setattr incorrectly converted user-memory EFAULT into EINVAL.",
+        "sched_getattr performed an unbounded allocation from user-controlled size.",
+        "sched_getattr did not report the required size to userspace when returning E2BIG."
+      ]
+    },
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2616",
+      "problem_count": 6,
+      "problem_descriptions": [
+        "evdev lseek returned the wrong error code instead of ESPIPE.",
+        "evdev failed to update event counters when copying an event to userspace failed.",
+        "evdev skipped required validation when max_events was zero.",
+        "evdev's full-buffer handling could fail to enqueue SYN_DROPPED events.",
+        "evdev could deadlock when dropping the last EvdevFile reference while a lock was held.",
+        "evdev could enter atomic mode break by registering while the caller held the input-handler lock."
+      ]
+    },
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2675",
+      "problem_count": 3,
+      "problem_descriptions": [
+        "ext2 SuperBlock reconstruction dropped fields from RawSuperBlock and could corrupt metadata on write-back.",
+        "FsState was declared with values that did not support its Linux bit-flag semantics.",
+        "The recovery calculation for log_*_size was incorrect except for the accidental value 2."
+      ]
+    },
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2704",
+      "problem_count": 3,
+      "problem_descriptions": [
+        "The previous ktest fix used the wrong option and caused kernel tests not to run.",
+        "Merged Rust 2024 changes left code unformatted.",
+        "The Rust 2024 update left cargo doc/publish checks failing."
+      ]
+    },
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2766",
+      "problem_count": 6,
+      "problem_descriptions": [
+        "mmap flag combinations and error codes did not match the Linux contract.",
+        "MM syscalls inconsistently handled address/length alignment and integer-overflow validation.",
+        "msync and mprotect did not return ENOMEM when part of the requested range was unmapped.",
+        "madvise used an incorrect dummy implementation for MADV_DONTNEED.",
+        "madvise implemented MADV_FREE with incorrect semantics.",
+        "madvise used an incorrect dummy implementation for MADV_DONTFORK."
+      ]
+    },
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2777",
+      "problem_count": 4,
+      "problem_descriptions": [
+        "Corrupted ELF headers could trigger assertions instead of a normal load error.",
+        "Untrusted ELF memory and file ranges could overflow arithmetic.",
+        "ELF loading returned incorrect error codes for malformed input.",
+        "VM activation occurred too early, hiding interpreter/segment-load errors from userspace."
+      ]
+    },
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2785",
+      "problem_count": 2,
+      "problem_descriptions": [
+        "Using LOGGER in TDX release mode generated CMP instructions while accessing MMIO.",
+        "virtio PCI num_queues() generated CMP instructions while accessing MMIO."
+      ]
+    },
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2843",
+      "problem_count": 2,
+      "problem_descriptions": [
+        "The OSDK option was misspelled as --ktest, so kernel tests were not selected.",
+        "Non-OSDK crates were not checked in both cfg(test) and non-cfg(test) configurations, allowing warnings to escape validation."
+      ]
+    },
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2924",
+      "problem_count": 6,
+      "problem_descriptions": [
+        "Deleting sparse files could leave incorrect ext2 sparse-file state.",
+        "Reading a sparse block did not return zero directly.",
+        "Writing a sparse block did not dynamically allocate a disk block.",
+        "fallocate PunchHoleKeepSize did not preserve sparse-hole semantics.",
+        "lseek-based sparse block creation was unsupported.",
+        "ftruncate expansion did not create sparse blocks."
+      ]
+    },
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2942",
+      "problem_count": 2,
+      "problem_descriptions": [
+        "Inconsistent heap-lock/MM-lock ordering could deadlock while generating /proc/[pid]/maps.",
+        "Concurrent fork() and brk() could leave the child with an incorrect heap region."
+      ]
+    },
+    {
+      "pr": "https://github.com/asterinas/asterinas/pull/2952",
+      "problem_count": 4,
+      "problem_descriptions": [
+        "Credential permission checks used effective-root status instead of CAP_SETUID/CAP_SETGID.",
+        "The implementation treated UID 0 as invalid even though it represents root.",
+        "setfsuid() and setfsgid() did not follow the required always-return-old-ID behavior.",
+        "setuid() and setgid() did not correctly report failure conditions."
+      ]
+    }
+  ]
+}
