@@ -15,6 +15,10 @@ work that persona's concerns in the order its file gives.
 For each candidate rule,
 read its one-line gist first
 and drill into the full rule (its linked subsections) only on a suspected violation.
+When a rule has `#### Steps`,
+use those steps as the review procedure for deciding whether the code violates that rule.
+Emit a JSON comment object only for a confirmed violation;
+emit nothing for compliant code.
 Stay within the remit of the persona(s) you are given.
 
 Each persona searches only for defects whose failure belongs to that persona.

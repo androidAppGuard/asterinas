@@ -41,6 +41,13 @@ pub fn sys_connect(sockfd: i32, addr: Vaddr, len: u32) -> Result<()> {
 }
 ```
 
+#### Steps
+
+1. For each changed module, type, and function, state its responsibility in one short sentence.
+2. Look for mixed abstraction levels, unrelated reasons to change, long functions, or files that combine separate concepts.
+3. Ask whether any extracted helper would have a meaningful name that describes a separate concept rather than restating code.
+4. Require splitting or moving code when one unit handles independent policy, parsing, validation, I/O, state mutation, or formatting concerns.
+
 See also:
 _Clean Code_, Chapter 3 "Functions";
 PR [#639](https://github.com/asterinas/asterinas/pull/639#discussion_r1524629393).
@@ -53,6 +60,13 @@ Duplication harms readability and maintainability.
 When the same pattern appears three or more times,
 eliminate the duplication (e.g., by adding a helper function).
 
+#### Steps
+
+1. Search the diff and nearby code for repeated constants, conditions, conversions, error handling, state transitions, or code blocks.
+2. Decide whether the repetition represents the same knowledge or merely similar-looking code with different meaning.
+3. Require a shared helper, type, constant, table, or method when one rule is repeated in multiple places.
+4. Prefer leaving duplication alone when abstraction would hide genuinely different concepts or make call sites harder to understand.
+
 ### Hide details behind interfaces (`information-hiding`) {#information-hiding}
 
 Hide details behind well-defined interfaces.
@@ -62,6 +76,13 @@ Internal data structures, helper types,
 and bookkeeping fields should remain private,
 and implementation details should not leak
 through public APIs (including their documentation).
+
+#### Steps
+
+1. Inspect new `pub`, `pub(crate)`, `pub(super)`, public fields, trait methods, and documented API promises.
+2. Ask which current consumer needs each exposed item and whether a narrower interface would serve that consumer.
+3. Reject APIs that expose storage layout, bookkeeping fields, helper types, or implementation-specific terminology.
+4. Prefer methods or domain-specific operations that preserve invariants and leave room to change the representation later.
 
 See also:
 [`narrow-visibility`](rust-specific/crates-and-modules.md#narrow-visibility)
@@ -79,6 +100,13 @@ through existing interfaces
 instead of repeatedly editing established call paths.
 Do not introduce extension points preemptively;
 add them when there is a concrete extension need.
+
+#### Steps
+
+1. Identify edits to stable modules, shared call paths, public traits, enums, and component interfaces.
+2. Check whether new behavior can be added through an existing extension point without modifying unrelated established logic.
+3. Require a concrete current use case before accepting a new abstraction, trait hook, callback, or configuration point.
+4. Reject changes that make future extension easier only by increasing today's complexity without a demonstrated need.
 
 ### Follow the principle of least surprise (`least-surprise`) {#least-surprise}
 
@@ -101,12 +129,26 @@ pub fn length(&self) -> usize { ... }
 pub fn to_pointer(&self) -> *const u8 { ... }
 ```
 
+#### Steps
+
+1. Review new names, signatures, return types, errors, side effects, and trait implementations from a caller's perspective.
+2. Compare them with Rust standard-library conventions, Linux terminology, and nearby Asterinas APIs.
+3. Flag APIs whose names understate cost, hide I/O or mutation, imply a missing behavior, or use unfamiliar synonyms for known concepts.
+4. Require either a conventional API shape or a clearly documented reason for surprising behavior.
+
 ### Aim for loose coupling and strong cohesion (`coupling-cohesion`) {#coupling-cohesion}
 
 Connections between modules should be
 small, visible, and flexible.
 Within a module, every part should contribute
 to a single, well-defined purpose.
+
+#### Steps
+
+1. Trace new dependencies, imports, callbacks, trait bounds, and cross-module data access introduced by the change.
+2. Check whether each dependency points to the abstraction the module should know about, rather than to a concrete implementation detail.
+3. Look for modules that now need knowledge from unrelated subsystems or contain code serving different purposes.
+4. Require moving code, narrowing interfaces, or introducing an existing local abstraction when coupling grows without a clear ownership reason.
 
 ### Be consistent (`consistency`) {#consistency}
 
@@ -116,6 +158,13 @@ even when neither approach is objectively superior.
 When a convention already exists, follow it;
 do not introduce a competing convention
 without compelling justification.
+
+#### Steps
+
+1. Search nearby files and the owning subsystem for the same kind of operation, type, error, layout, or API.
+2. Compare naming, control flow, error handling, locking, documentation, and test style against those examples.
+3. Ask for the change to follow the established convention when the alternatives are roughly equivalent.
+4. Accept divergence only when the PR explains a material reason and the new pattern is intended to become the convention.
 
 ### Take a Rust-native approach (`rust-native`) {#rust-native}
 
@@ -129,3 +178,10 @@ Rust offers compiler-enforced, zero-cost abstractions
 Learn from Linux's design, not its idioms.
 The result should read like idiomatic Rust,
 not like C written in Rust syntax.
+
+#### Steps
+
+1. Look for C-style patterns: manual cleanup pairs, output parameters, status codes, flags, sentinels, or header-like modules.
+2. Ask whether Rust features such as `Result`, `Option`, RAII, enums, traits, iterators, ownership, or newtypes can express the contract directly.
+3. Check that the Rust abstraction remains zero-cost or justified for kernel use.
+4. Preserve Linux-compatible behavior while rejecting unnecessary C idioms in the internal Rust API.

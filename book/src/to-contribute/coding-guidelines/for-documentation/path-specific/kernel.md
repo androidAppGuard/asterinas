@@ -14,3 +14,10 @@ so the documented coverage keeps matching the code.
   to reflect the newly supported flags, arguments, and behaviors.
 - For a **kernel parameter**:
   update the [Kernel Parameters](../../../../kernel/linux-compatibility/kernel-parameters.md) page.
+
+#### Steps
+
+1. Review `kernel/` changes for new or changed system calls, syscall flags, syscall argument semantics, return values, errors, and kernel parameters.
+2. For syscall changes, check the matching Syscall Flag Coverage page and `.scml` file for updated flags, arguments, and behavior.
+3. For kernel parameter changes, check the Kernel Parameters page for the new or changed name, value format, default, and effect.
+4. Require documentation updates in the same PR whenever user-visible Linux compatibility behavior changes.

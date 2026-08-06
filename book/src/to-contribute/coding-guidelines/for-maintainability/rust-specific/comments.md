@@ -25,6 +25,13 @@ pub enum EmptyPathStr { /* ... */ }
 pub struct SpinLockGuard<'a, T> { /* ... */ }
 ```
 
+#### Steps
+
+1. Inspect the first sentence of each added or changed `///` and `//!` comment.
+2. Check that function and method summaries start with a third-person verb such as "Returns", "Creates", or "Acquires".
+3. Check that type, trait, module, and field summaries are noun phrases rather than actions.
+4. Require the first line to be a concise sentence that can stand alone in rustdoc summaries.
+
 ### End sentence comments with punctuation (`comment-punctuation`) {#comment-punctuation}
 
 If a comment line is a full sentence,
@@ -39,6 +46,13 @@ and avoids fragmented prose.
 // Bad — complete sentence without punctuation
 // SAFETY: The pointer is derived from a live allocation
 ```
+
+#### Steps
+
+1. Review changed `//`, `///`, `//!`, and block comments.
+2. Decide whether each line is a complete sentence or a fragment, label, list item, or short note.
+3. Require terminal punctuation for complete sentences, including `SAFETY:` comments.
+4. Leave fragments unpunctuated when punctuation would make them look like full prose.
 
 ### Wrap identifiers in backticks (`backtick-identifiers`) {#backtick-identifiers}
 
@@ -57,6 +71,13 @@ prefer rustdoc links (`[TypeName]`) where possible.
 pub fn acquire(&self) -> SpinLockGuard<'_, T> { ... }
 ```
 
+#### Steps
+
+1. Scan doc comments for references to types, traits, methods, fields, modules, constants, macros, parameters, and keywords used as code.
+2. Require backticks around code identifiers that are not linked.
+3. Prefer rustdoc links for types, traits, and important APIs when the target is in scope and stable.
+4. Do not backtick ordinary English words that are not identifiers in the documented API.
+
 ### Do not disclose implementation details in doc comments (`no-impl-in-docs`) {#no-impl-in-docs}
 
 Doc comments should describe _what_ the API does
@@ -71,3 +92,10 @@ not _how it is implemented internally_.
 /// Returns the length of the internal `HashMap`
 /// that tracks connections by socket address.
 ```
+
+#### Steps
+
+1. Read each public doc comment as an API user rather than as an implementer.
+2. Separate behavior, guarantees, parameters, errors, and usage from internal storage, helper calls, caches, and algorithms.
+3. Flag implementation details unless they are part of the public contract, performance guarantee, or safety requirement.
+4. If the implementation detail is useful for maintainers only, move it to an internal comment near the code.

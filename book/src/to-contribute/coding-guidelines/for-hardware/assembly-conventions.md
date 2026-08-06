@@ -19,6 +19,13 @@ boot_stack_bottom:
 boot_stack_top:
 ```
 
+#### Steps
+
+1. Inspect each changed assembly section declaration in `.S` files and `global_asm!` blocks.
+2. Require short built-in directives such as `.text` when using built-in sections.
+3. Require `.section "name", "flags", @type` when defining a custom section, with flags and type matching linker and runtime expectations.
+4. Check that a blank line separates the section definition from labels or instructions that follow.
+
 ### Place code-width directives after the section definition (`asm-code-width`) {#asm-code-width}
 
 In x86-64, if an executable section contains only 64-bit code,
@@ -37,6 +44,13 @@ foo:
     ret
 ```
 
+#### Steps
+
+1. Review x86 assembly sections that use `.code64` or `.code32`.
+2. If the whole executable section uses one mode, require the code-width directive immediately after the section directive.
+3. If a section mixes 32-bit and 64-bit code, treat the directive as part of the specific function or code block it applies to.
+4. Verify that the directive placement matches the processor mode expected at entry to that code.
+
 ### Place attributes directly before the function (`asm-function-attributes`) {#asm-function-attributes}
 
 Function attributes (`.global`, `.balign`, `.type`)
@@ -51,6 +65,13 @@ foo:
     mov rax, 1
     ret
 ```
+
+#### Steps
+
+1. For every changed assembly function label, inspect the preceding directives.
+2. Require `.global`, `.balign`, `.type`, and mode directives that apply to a single function to appear directly before that function label.
+3. Check that these directives are not indented as instructions.
+4. Prefer `.global` spelling over `.globl` unless the file already has a strong local reason for the alternate spelling.
 
 ### Add `.type` and `.size` for Rust-callable functions (`asm-type-and-size`) {#asm-type-and-size}
 
@@ -72,6 +93,13 @@ exception trampolines, or interrupt trampolines —
 they may not fit the typical definition of "function"
 and their sizes may be ill-defined.
 
+#### Steps
+
+1. Identify assembly labels that Rust or C code can call as functions.
+2. Require `.type label, @function` before the label and `.size label, .-label` after the function body.
+3. Exempt boot entry points, exception trampolines, and interrupt trampolines only when their control flow or boundaries are not ordinary functions.
+4. Check that `.size` uses the matching label and still covers the intended body after local labels or fall-through code.
+
 See also:
 PR [#2320](https://github.com/asterinas/asterinas/pull/2320).
 
@@ -92,6 +120,13 @@ ap_boot_stack_top:
 boot_stack_top:
 ```
 
+#### Steps
+
+1. List labels introduced by changed `global_asm!` blocks.
+2. Check whether the label name could collide with another label in the same Rust crate translation unit.
+3. Require a subsystem, path, or purpose prefix for non-local labels in `global_asm!`.
+4. Compare with nearby assembly files to keep prefix conventions consistent.
+
 See also:
 PR [#2571](https://github.com/asterinas/asterinas/pull/2571)
 and [#2573](https://github.com/asterinas/asterinas/pull/2573).
@@ -110,6 +145,13 @@ Use `.balign` for unambiguous byte-count alignment.
 # Bad — architecture-dependent meaning
 .align 12
 ```
+
+#### Steps
+
+1. Search changed assembly for `.align`.
+2. Require `.balign` with an explicit byte count for alignment.
+3. If the old value was a power-of-two exponent, require conversion to the equivalent byte count.
+4. Verify stack, page, and function alignment values against the relevant ABI or hardware requirement.
 
 See also:
 PR [#2368](https://github.com/asterinas/asterinas/pull/2368).

@@ -18,6 +18,13 @@ pub(super) fn set_control(
 }
 ```
 
+#### Steps
+
+1. List every lock acquired by the changed code, including locks acquired indirectly through helper calls.
+2. Check whether any path can hold two or more locks at once; compare the acquisition order with nearby code and existing comments.
+3. Require an explicit lock-order comment when the order is non-obvious or spans multiple objects or subsystems.
+4. Report any path that can acquire the same lock pair in the opposite order, including error paths and callbacks invoked while locked.
+
 See also:
 PR [#2942](https://github.com/asterinas/asterinas/pull/2942).
 
@@ -40,6 +47,13 @@ self.device.write(&data)?;
 let guard = self.state.lock(); // state: SpinLock<...>
 self.device.write(&guard.pending_data)?;
 ```
+
+#### Steps
+
+1. Find critical sections protected by spinlocks or IRQ-disabling guards in the changed code.
+2. Inspect calls made while the guard is live, including trait methods and logging paths.
+3. Flag I/O, sleeping, waiting, scheduling, user-memory access, or blocking allocation under the guard.
+4. Require dropping the guard before blocking work, or using a sleeping mutex when the work must stay protected.
 
 See also:
 PR [#925](https://github.com/asterinas/asterinas/pull/925).
@@ -69,6 +83,13 @@ struct Stats {
 }
 ```
 
+#### Steps
+
+1. Identify newly added atomics and changes to existing atomic fields.
+2. Determine whether each atomic value is independent or must stay consistent with another field, flag, counter, or state transition.
+3. Require a lock or a single combined state representation when multiple values must be observed or updated together.
+4. For accepted atomics, check that the ordering is justified by the synchronization contract and is not chosen casually.
+
 ### Critical sections must not be split across lock boundaries (`atomic-critical-sections`) {#atomic-critical-sections}
 
 Operations that must be atomic
@@ -93,6 +114,13 @@ if is_ready {
     self.inner.lock().start();
 }
 ```
+
+#### Steps
+
+1. Look for check-then-act sequences: lookup then insert, state check then transition, permission check then use, or capacity check then allocation.
+2. Verify that the checked state cannot change before the action runs.
+3. Require one lock acquisition, transaction, or equivalent synchronization primitive to cover the whole sequence.
+4. Pay special attention to helper calls and dropped guards that make the critical section look continuous while actually splitting it.
 
 See also:
 PR [#2277](https://github.com/asterinas/asterinas/pull/2277).

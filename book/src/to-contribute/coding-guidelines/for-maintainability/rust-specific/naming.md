@@ -19,6 +19,13 @@ NVMe
 TCP
 ```
 
+#### Steps
+
+1. Inspect new or renamed Rust type names, trait names, enum variants, and type aliases.
+2. Identify acronyms and initialisms inside CamelCase names.
+3. Require Rust-style title casing for acronyms, such as `Pci`, `Io`, `Tcp`, and `Nvme`.
+4. Leave externally mandated spellings only when the external name is part of the exact public contract.
+
 ### End closure variables with `_fn` (`closure-fn-suffix`) {#closure-fn-suffix}
 
 Variables holding closures or function pointers
@@ -39,6 +46,13 @@ let expired_fn = move |_guard: TimerGuard| {
     pollee.notify(IoEvents::IN);
 };
 ```
+
+#### Steps
+
+1. Find variables, fields, and parameters whose values are closures or function pointers.
+2. Check whether the name makes callability clear at the use site.
+3. Require a `_fn` suffix for stored or passed callable values when the type is not obvious from immediate context.
+4. Do not require `_fn` for function items called directly by their declared function name.
 
 See also:
 PR [#395](https://github.com/asterinas/asterinas/pull/395#discussion_r1402964415)

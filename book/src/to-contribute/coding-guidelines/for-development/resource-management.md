@@ -28,5 +28,12 @@ rather than calling `drop()` manually.
 When the default drop order is incorrect,
 use explicit `drop()` calls.
 
+#### Steps
+
+1. Identify acquired resources: locks, IRQ state, fds, ports, mappings, DMA buffers, allocations, and callbacks.
+2. Check every return, `?`, early-exit, panic-relevant path, and cancellation path to see whether the resource is released exactly once.
+3. Require a guard type with `Drop` when acquisition and release must be paired across more than a small local scope.
+4. Prefer lexical drop order; accept explicit `drop()` only when the ordering is intentional and visible at the point where it matters.
+
 See also:
 PR [#164](https://github.com/asterinas/asterinas/pull/164).

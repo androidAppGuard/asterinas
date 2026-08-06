@@ -52,10 +52,17 @@ Asterinas uses this pattern widely,
 for example with newtypes such as `CpuId`
 and `AlignedUsize<const N: u16>`.
 
+#### Steps
+
+1. Identify values with restricted domains: modes, flags, permissions, IDs, states, units, ranges, and typestate-like properties.
+2. Check whether invalid values can be constructed with the proposed types.
+3. Prefer newtypes, enums, const generics, marker types, or trait bounds that encode the invariant at compile time.
+4. Require runtime validation at construction boundaries when the invariant comes from userspace, hardware, or serialized data.
+
+
 See also:
 PR [#2265](https://github.com/asterinas/asterinas/pull/2265#discussion_r2266214191)
 and [#2514](https://github.com/asterinas/asterinas/pull/2514).
-
 ### Prefer enum over trait objects for closed sets (`enum-over-dyn`) {#enum-over-dyn}
 
 When the set of variants is known and closed,
@@ -70,6 +77,13 @@ pub enum TermStatus {
     Killed(SigNum),
 }
 ```
+
+#### Steps
+
+1. Find new `dyn Trait`, `Box<dyn Trait>`, `Arc<dyn Trait>`, and trait-object-based dispatch.
+2. Determine whether the implementer set is closed and known inside the crate or subsystem.
+3. Prefer an enum when callers benefit from exhaustive matching, compact representation, or static dispatch.
+4. Keep trait objects when third-party extension, plugin-style openness, object safety, or type erasure is the actual requirement.
 
 ### Encapsulate fields behind getters (`getter-encapsulation`) {#getter-encapsulation}
 
@@ -95,3 +109,10 @@ pub struct Vma {
     pub perms: VmPerms,
 }
 ```
+
+#### Steps
+
+1. Inspect new public fields and fields whose visibility was widened.
+2. Ask whether external code needs direct mutation or only read access.
+3. Prefer private fields with getters for read access so representation and invariants remain changeable.
+4. Allow public fields mainly for simple data carriers whose representation is the intended API contract.

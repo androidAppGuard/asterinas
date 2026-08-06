@@ -25,6 +25,13 @@ fn select_cpu(&self) -> CpuId {
 }
 ```
 
+#### Steps
+
+1. Identify changed code on frequent paths: syscalls, scheduling, page faults, networking, descriptor lookup, or interrupt-adjacent work.
+2. For each loop, scan, sort, allocation, or traversal there, name `n` and whether it can be large.
+3. Require an indexed, cached, queued, tree-based, or otherwise sub-linear design when the operation repeats on a hot path over large `n`.
+4. Accept a linear operation only when the bound is small and explicit, or when measured evidence shows it is not on a hot path.
+
 See also:
 PR [#1790](https://github.com/asterinas/asterinas/pull/1790).
 
@@ -49,6 +56,13 @@ fn process(&self, stream: &DmaStream) {
 }
 ```
 
+#### Steps
+
+1. Search the diff for `clone`, `to_vec`, `collect`, temporary buffers, serialization steps, and ownership changes from references to owned values.
+2. Decide whether the new owner is needed for lifetime, mutation, sharing across tasks, or storage beyond the call.
+3. Require borrowing, slicing, iterator chaining, or moving an existing value when ownership or allocation is not necessary.
+4. Keep copies that cross protection, DMA, userspace, or lifetime boundaries only when the boundary makes the copy part of the correctness contract.
+
 See also:
 PR [#2582](https://github.com/asterinas/asterinas/pull/2582)
 and [#2725](https://github.com/asterinas/asterinas/pull/2725).
@@ -61,3 +75,10 @@ Introducing complexity
 to solve a non-existent problem is rejected.
 If you claim a change improves performance,
 show the numbers.
+
+#### Steps
+
+1. Identify changes whose main justification is speed, memory use, cache behavior, or reduced instruction count.
+2. Ask for benchmark data, profiling output, or a concrete complexity argument that matches the affected workload.
+3. Compare the performance gain against added branches, unsafe code, synchronization complexity, API complexity, and maintenance cost.
+4. Prefer the simpler implementation when the optimization lacks evidence or targets an unimportant path.

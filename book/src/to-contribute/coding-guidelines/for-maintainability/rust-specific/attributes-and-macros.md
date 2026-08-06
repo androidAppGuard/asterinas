@@ -22,10 +22,17 @@ For example, it is fine to add ABI constants
 that are unused because the corresponding feature
 is partially implemented.
 
+#### Steps
+
+1. Search the diff for `#[expect(dead_code)]`, `#[allow(dead_code)]`, unused items, and newly added code without call sites.
+2. Require the future use case to be concrete, nearby, and likely rather than speculative.
+3. Check that the dead item is simple enough to review without tests and mirrors an existing used counterpart when applicable.
+4. Reject dead abstractions whose semantics are unclear or whose correctness depends on unimplemented future behavior.
+
+
 See also:
 [Rust Reference: Diagnostic attributes](https://doc.rust-lang.org/reference/attributes/diagnostics.html)
 and rustc [`unfulfilled_lint_expectations`](https://doc.rust-lang.org/rustc/lints/listing/warn-by-default.html#unfulfilled-lint-expectations).
-
 ### Sort attributes and derive traits alphabetically (`alphabetical-attrs`) {#alphabetical-attrs}
 
 When an item carries multiple outer attributes,
@@ -60,12 +67,19 @@ Sorting the remaining attributes alphabetically
 eliminates hesitation over placement
 and reduces noise in diffs.
 
+#### Steps
+
+1. Inspect items with multiple outer attributes in the changed Rust code.
+2. Require non-derive attributes to be sorted alphabetically by attribute name.
+3. Place `#[derive(...)]` after the other outer attributes and sort its traits alphabetically.
+4. Keep derive helper attributes immediately after `#[derive(...)]` and verify attribute macros still run before derives.
+
+
 See also:
 PR [#3080](https://github.com/asterinas/asterinas/pull/3080#discussion_r3031834321)
 (motivating discussion)
 and PR [#2898](https://github.com/asterinas/asterinas/pull/2898#discussion_r2763969731)
 (earlier ad-hoc ordering choice).
-
 ### Suppress lints at the narrowest scope (`narrow-lint-suppression`) {#narrow-lint-suppression}
 
 When suppressing lints,
@@ -105,11 +119,18 @@ enum SomeEnum {
 }
 ```
 
+#### Steps
+
+1. Search the diff for `#[allow(...)]` and `#[expect(...)]`.
+2. Identify the exact item, expression, field, method, or variant that triggers the lint.
+3. Require the suppression to move to that narrow scope unless every member of the broader item demonstrably triggers the same lint.
+4. Prefer `expect` over `allow` when the lint is expected to fire and should become visible if it stops firing.
+
+
 See also:
 [Clippy `allow_attributes`](https://rust-lang.github.io/rust-clippy/master/#allow_attributes),
 [Clippy `allow_attributes_without_reason`](https://rust-lang.github.io/rust-clippy/master/#allow_attributes_without_reason),
 and rustc [`unfulfilled_lint_expectations`](https://doc.rust-lang.org/rustc/lints/listing/warn-by-default.html#unfulfilled-lint-expectations).
-
 ### Prefer functions over macros (`macros-as-last-resort`) {#macros-as-last-resort}
 
 Prefer functions and generics over macros.
@@ -135,6 +156,13 @@ macro_rules! align_up {
     };
 }
 ```
+
+#### Steps
+
+1. Review every new or expanded `macro_rules!`, procedural macro use, and macro-generated API.
+2. Ask whether a function, generic function, trait, const generic, enum, or iterator would express the same code safely and clearly.
+3. Accept a macro only for needs Rust cannot express well otherwise, such as variadic syntax, compile-time code generation, or a constrained DSL.
+4. Require macro call sites, error behavior, hygiene, and generated names to remain understandable to reviewers and rustdoc users.
 
 See also:
 _The Rust Programming Language_, Chapter 20.5 "Macros";

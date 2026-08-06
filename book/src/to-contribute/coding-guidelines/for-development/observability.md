@@ -31,6 +31,13 @@ log::info!("VirtIO block device initialized: {} sectors", num_sectors);
 println!("VirtIO block device initialized: {} sectors", num_sectors);
 ```
 
+#### Steps
+
+1. Search changed OSTD-based crates for `log::`, `println!`, custom print macros, serial writes used as logs, and ad hoc debug output.
+2. Require first-party production logs to use macros from the prelude or `ostd::log`.
+3. Check whether any exception is truly early-boot code that runs before logging initialization.
+4. Reject manual textual prefixes when the crate or module should use `__log_prefix` instead.
+
 [`ostd::log`]: https://asterinas.github.io/ostd/ostd/log/
 
 ### Choose appropriate log levels (`log-levels`) {#log-levels}
@@ -53,6 +60,13 @@ Use `error!` for failures that the system can recover from.
 Use `crit!` or `emerg!` only for failures immediately before a halt or abort.
 A log statement that fires on every syscall
 or every timer tick must use `debug!`.
+
+#### Steps
+
+1. Review each added or changed log statement and identify the condition that emits it and how often it can occur.
+2. Match the condition to the severity table rather than to the author's desire for visibility.
+3. Require routine, high-frequency, or diagnostic logs to use `debug!`.
+4. Require `crit!`, `alert!`, or `emerg!` only when the surrounding control flow is handling an unrecoverable or immediately actionable condition.
 
 [`syslog(2)`]: https://man7.org/linux/man-pages/man2/syslog.2.html
 
@@ -93,3 +107,10 @@ it causes a compiler ambiguity error (E0659).
 
 Do not use manual bracket prefixes like `[IOMMU]` or `[Virtio]:`.
 The `__log_prefix` mechanism replaces them.
+
+#### Steps
+
+1. For each changed OSTD-based crate or module that emits logs, open its crate root or `mod.rs`.
+2. Check that `__log_prefix` appears before any `mod` declaration and has no attributes.
+3. Verify that the prefix is lowercase, stable, and follows the crate or subsystem naming convention with a trailing `: `.
+4. Flag manual prefixes in individual log messages once the macro supplies the source label.

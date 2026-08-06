@@ -12,6 +12,13 @@ first try to rewrite the code.
 Do not write good comments to compensate for bad code —
 rewrite it to be straightforward.
 
+#### Steps
+
+1. Read each added or changed comment next to the code it describes.
+2. Flag comments that merely repeat names, control flow, or obvious operations.
+3. When a comment explains what confusing code does, ask whether clearer names, smaller helpers, or simpler structure would remove the need.
+4. Keep comments that explain intent, constraints, surprising behavior, compatibility choices, or non-local context.
+
 See also:
 _The Art of Readable Code_, Chapter 6 "Knowing What to Comment";
 PR [#2265](https://github.com/asterinas/asterinas/pull/2265#discussion_r2266220943)
@@ -36,6 +43,13 @@ are the most valuable kind of comment.
 // which is unacceptable on the page fault path.
 ```
 
+#### Steps
+
+1. Identify non-obvious choices in the change: data structures, locking schemes, algorithms, compatibility deviations, and tradeoffs.
+2. Check whether the code or nearby comments explain why this option was chosen over plausible alternatives.
+3. Require a short rationale when the decision affects correctness, performance, security, compatibility, or future extension.
+4. Prefer comments placed where future maintainers will encounter the decision, not only in the PR discussion.
+
 See also:
 PR [#2265](https://github.com/asterinas/asterinas/pull/2265#discussion_r2266220943)
 and [#2050](https://github.com/asterinas/asterinas/pull/2050#discussion_r2224106025).
@@ -55,3 +69,10 @@ hardware reference manual, or academic paper.
 /// <https://man7.org/linux/man-pages/man7/pipe.7.html>.
 const PIPE_BUF: usize = 4096;
 ```
+
+#### Steps
+
+1. Find behavior copied from Linux, POSIX, hardware manuals, protocol specs, papers, or non-trivial algorithms.
+2. Check whether the code cites the exact source close to the constants, rules, or algorithmic steps it implements.
+3. Require a stable link, manual section, or document name precise enough for a reviewer to verify the claim.
+4. Ask for a source when a magic number or compatibility behavior cannot be validated from the code alone.
