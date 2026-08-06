@@ -10,9 +10,9 @@ with a one-line gist so a reader (or a review tool) can grasp the guideline befo
 ## Index
 
 **[General Style](general-style.md)**
-- [`semantic-line-breaks`](general-style.md#semantic-line-breaks): Break prose at sentence/clause boundaries, one idea per line.
-- [`readme-as-crate-doc`](general-style.md#readme-as-crate-doc): For a published crate, make `README.md` the crate-level doc (`#![doc = include_str!("../README.md")]`) so crates.io and docs.rs stay in sync.
+- [`semantic-line-breaks`](general-style.md#semantic-line-breaks): Break prose at sentence and clause boundaries so each line carries one idea; apply when writing Markdown or doc comments, except mostly read-only RFC documents.
+- [`readme-as-crate-doc`](general-style.md#readme-as-crate-doc): Use a published crate's `README.md` as its crate-level Rust doc; apply when documenting a crate published to crates.io and rendered on docs.rs.
 
 **[Path-Specific](path-specific/)**
 - [`kernel/`](path-specific/kernel.md)
-    - [`linux-compat-docs`](path-specific/kernel.md#linux-compat-docs): When a user-visible API (syscall or kernel parameter) changes, update the Linux Compatibility docs (Syscall Flag Coverage + `.scml`, or Kernel Parameters).
+    - [`linux-compat-docs`](path-specific/kernel.md#linux-compat-docs): Keep Linux Compatibility docs synchronized with syscall and kernel-parameter support; apply when a `kernel/` change adds or enhances a user-visible syscall or kernel parameter.

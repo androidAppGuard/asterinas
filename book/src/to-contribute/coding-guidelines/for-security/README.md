@@ -10,12 +10,12 @@ with a one-line gist so a reader (or a review tool) can grasp the guideline befo
 ## Index
 
 **[Memory Safety](memory-safety.md)**
-- [`justify-unsafe-use`](memory-safety.md#justify-unsafe-use): Precede every `unsafe` block with a `// SAFETY:` comment justifying soundness.
-- [`document-safety-conds`](memory-safety.md#document-safety-conds): Give every `unsafe` fn/trait a `# Safety` section stating caller obligations.
-- [`deny-unsafe-kernel`](memory-safety.md#deny-unsafe-kernel): All `kernel/` crates `#![deny(unsafe_code)]`; only OSTD crates may use `unsafe`.
-- [`module-boundary-safety`](memory-safety.md#module-boundary-safety): An `unsafe` block's soundness spans all code touching the same private state; minimize that module.
+- [`justify-unsafe-use`](memory-safety.md#justify-unsafe-use): Explain why each `unsafe` block is sound in a preceding `// SAFETY:` comment; apply whenever writing or reviewing an unsafe block.
+- [`document-safety-conds`](memory-safety.md#document-safety-conds): State caller obligations in a `# Safety` section; apply when declaring an `unsafe` function or trait.
+- [`deny-unsafe-kernel`](memory-safety.md#deny-unsafe-kernel): Keep `unsafe` out of `kernel/` and expose needed operations through safe OSTD APIs; apply when adding or changing kernel or OSTD code.
+- [`module-boundary-safety`](memory-safety.md#module-boundary-safety): Keep unsafe abstractions and their private state in the smallest auditable module; apply when designing or reviewing an unsafe abstraction.
 
 **[Security Properties](security-properties.md)**
-- [`validate-at-boundaries`](security-properties.md#validate-at-boundaries): Validate all user-supplied data at boundaries (e.g. syscall entry), then trust it internally.
+- [`validate-at-boundaries`](security-properties.md#validate-at-boundaries): Validate user-supplied pointers, descriptors, sizes, flags, and strings at entry boundaries; apply when data enters the kernel through a syscall or other user-facing interface.
 
 No **path-specific** guidelines yet.
