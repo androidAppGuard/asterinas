@@ -1,0 +1,1419 @@
+OK: 13 problems (10 diff, 3 files), 24 defects (0 negative), problem_ids unique (numeric ids too)
+WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp" (codex_home: AbsolutePathBuf("/tmp/tmp.C486OUScNf"))
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /tmp/tmp.rZWoUxP10r/wt1
+model: gpt-5.5
+provider: OpenAI
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR] (network access enabled)
+reasoning effort: high
+reasoning summaries: none
+session id: 019fd735-2934-7512-87bb-2c0ca0337c37
+--------
+user
+Use the aster-code-review skill with these arguments: diff 546e32e231429bbb0b5b40ba0fe9e75f38387c9f --per-persona-context=yes /tmp/tmp.rZWoUxP10r/wt1.on.md --overwrite. Review this working tree.
+warning: Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.
+codex
+I’ll use the `aster-code-review` skill as requested and first read its instructions, then I’ll review the working-tree diff against `546e32e231429bbb0b5b40ba0fe9e75f38387c9f` and write the Markdown report to the requested path.
+exec
+/bin/bash -lc "sed -n '1,240p' /tmp/tmp.rZWoUxP10r/wt1/.agents/skills/aster-code-review/SKILL.md" in /tmp/tmp.rZWoUxP10r/wt1
+ succeeded in 0ms:
+---
+name: aster-code-review
+description: Review code against Asterinas's persona-keyed coding guidelines and write a Markdown review file. Use when asked to review a Git change (diff mode) or a set of target files (files mode) for defects, or inside a write-test-review loop.
+---
+
+# aster-code-review
+
+Review code against Asterinas's coding guidelines
+— the persona-keyed pages under `book/src/to-contribute/coding-guidelines/`
+— and write one Markdown review file.
+The review is **recall-first**: miss as few real defects as possible.
+It makes both objective calls (undeniable bugs) and subjective calls (guideline violations, each grounded in a cited rule).
+
+There are two review modes, both **anchored at the current checkout (HEAD)**:
+
+- **`diff <base>`** — a Git change:
+  the **commit series** the branch adds over its merge-base with `<base>`
+  — each commit's message *and* its diff,
+  so the review covers per-commit intent and commit hygiene, not just the net change.
+  (Commit first; uncommitted edits are not reviewed in diff mode.)
+- **`files <path[:lines] ...>`**
+  — target code: the working-tree contents of the named files,
+  optionally narrowed to line ranges.
+
+To review at a specific commit, check it out first (it becomes HEAD).
+
+This skill is agent-agnostic (Claude Code and Codex).
+Only step 3's spawn primitive differs between agents;
+everything else is identical.
+
+## Interface
+
+However the skill is triggered,
+it receives ONE raw argument string that begins with a mode word:
+
+```
+diff   <base>              <output> [--overwrite] [--per-persona-context=auto|yes|no]
+files  <path[:lines] ...>  <output> [--overwrite] [--per-persona-context=auto|yes|no]
+```
+
+- `<base>` (diff) — **required**,
+  any ref or SHA;
+  reviews the commit series `merge-base(<base>, HEAD)..HEAD` (each commit's message + diff).
+- `<path[:lines] ...>` (files) — **required**, one or more targets in the working tree.
+  A target is a path, optionally `path:N-M` or `path:N-M,K-L` (1-based, inclusive);
+  repeat a path to add ranges.
+  Wrap a path in double quotes to allow spaces or colons (`"a: b.rs":10-20`).
+- `<output>` — **required, last positional** (`cp src... dest` style);
+  refuse to overwrite unless `--overwrite`.
+- `--overwrite` — replace the output file if it already exists.
+- `--per-persona-context` — `yes`: fan out one isolated agent per persona (best recall).
+  `no`: one combined agent reviews all personas (cheaper, lower recall).
+  `auto` (default) currently resolves to `yes`;
+  it will become a benchmark-driven heuristic.
+  Controls step 3 only.
+
+**Do not pre-split the argument string yourself.**
+Pass it verbatim, as a single quoted argument,
+to `resolve_target.sh` (step 1)
+— the script self-tokenizes (whitespace-split except inside double quotes),
+which keeps the parse deterministic and identical across agents.
+
+## Pipeline
+
+Run these steps in order.
+Steps 1 and 5 are deterministic scripts;
+steps 6–8 use the model.
+
+The helper scripts live in the skill's own `scripts/` directory,
+at `.agents/skills/aster-code-review/scripts/` inside the repository under review.
+**Invoke every script by its absolute path**
+— the working directory is the code under review (the repo root), *not* the skill directory,
+so a bare `scripts/…` is not found (notably on Codex, which runs commands from the repo root; do not `cd` into the skill dir either — `resolve_target.sh` needs the repo as its cwd).
+Shells do not persist between commands,
+so **set `SKILL` at the start of each command that uses it** (or inline the `$(git rev-parse …)`):
+
+```sh
+SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/resolve_target.sh" '<raw args>'
+```
+
+The steps below write `$SKILL/scripts/…` as shorthand for that absolute path.
+
+1. **Resolve the target.**
+   `"$SKILL/scripts/resolve_target.sh" '<raw args>'` prints the canonical review input
+   — the commit series (each commit's message + diff) in `diff` mode,
+   annotated file excerpts in `files` mode;
+   save it to a temp file.
+   Run it again with `--meta` first (`"$SKILL/scripts/resolve_target.sh" --meta '<raw args>'`) to get
+   `mode=`, `base=`/`files=`, `head=`, `branch=`, `output=`, `overwrite=`, `per_persona_context=`;
+   add `date=` (today) and an optional `title=` to make the meta file.
+   Pass the raw argument string as a single quoted argument
+   so the script's tokenizer sees it intact.
+2. **Activate personas.**
+   Pick which of the five personas run,
+   from the reviewed paths — changed paths in `diff` mode,
+   named paths in `files` mode (see *Activation*).
+3. **Fan out.**
+   Spawn the persona passes (see *Spawning*).
+   With `per_persona_context` = `yes` or `auto` (the default),
+   run **one isolated PASS per activated persona** — best recall.
+   With `no`, run **one combined PASS** over all activated personas in a single context
+   — cheaper, lower recall.
+   Build each pass's prompt deterministically with `"$SKILL/scripts/build_pass_prompt.sh" <input-file> <persona>...`
+   — one persona for fan-out, all activated personas for combined
+   — and spawn the sub-agent with **that exact text**.
+   Each pass returns a JSON array of comments;
+   file each under its persona's `<fragdir>/<persona>.json` (the comment's `persona` field says which),
+   so step 5 is unchanged.
+4. **Collect** the per-persona JSON fragments.
+5. **Assemble.**
+   `"$SKILL/scripts/assemble_review.sh" [--overwrite] <meta> <fragdir> <output>` performs the deterministic merge (group by persona in fixed order, sort by file→line, drop exact duplicates *within a persona*, write frontmatter, leave a `<!-- SUMMARY -->` placeholder).
+   Pass `--overwrite` only if the user gave it;
+   otherwise the script refuses to clobber an existing `<output>`.
+6. **Verify** (see *Verification*).
+7. **Consolidate** (see *Consolidation*).
+8. **Summary.**
+   Replace `<!-- SUMMARY -->` with a constructive summary over the final comments:
+   what the code does well, the top issues ranked by severity,
+   any structural recommendations.
+
+## Activation
+
+A persona runs unless the reviewed paths *provably* contain nothing in its remit (reviewed paths = changed paths in `diff` mode, named paths in `files` mode):
+
+- **maintainability, development, security** — any reviewed code.
+- **hardware** — a reviewed path is assembly (`*.S`, `*.asm`),
+  an architecture directory (`.../arch/...`), or contains `asm!` / `global_asm!`.
+- **documentation** — a reviewed path is `book/`, any `*.md`,
+  syscall-coverage files (`*.scml`), or a user-facing API surface (a syscall or kernel parameter).
+
+Activation is path-based and deterministic;
+do not use a model to triage (a wrongly-skipped persona is a silent recall hole).
+
+## Pass contract
+
+The shared reviewer contract
+— the review methodology and the JSON comment schema every pass must follow
+— lives in [`scripts/pass_contract.md`](scripts/pass_contract.md),
+inlined as the **stable head** of every pass prompt by `build_pass_prompt.sh` (step 3).
+Do not paraphrase it into the prompt yourself:
+retyping it breaks the byte-identical prefix the prompt cache relies on (see [`execution_model.md`](spec/execution_model.md)).
+A pass reads only the persona block(s) it is given (selective exposure),
+reviews the **REVIEW INPUT** at the foot of the prompt,
+and returns a JSON array of comments per that schema.
+
+## Spawning a pass
+
+Build every pass prompt with `"$SKILL/scripts/build_pass_prompt.sh" <input-file> <persona>...`
+and spawn the sub-agent with its **exact** output
+— only a script keeps the prompt's stable head (contract + guideline) byte-identical across passes and reviews,
+which is what lets the prompt cache reuse it (see [`execution_model.md`](spec/execution_model.md)).
+
+**Default (`per_persona_context` = `yes`/`auto`)**
+— one pass per activated persona,
+each in a CLEAN context with only its own persona block (selective exposure):
+
+- **Claude Code** — spawn a Task sub-agent per persona.
+- **Codex** — run `codex exec "<build_pass_prompt.sh output>"` per persona
+  (pass the built PROMPT TEXT as the argument).
+
+**Never spawn a pass by re-running `aster_code_review.sh` / `run_agent.sh`,
+nor by re-issuing the skill's own arguments** (e.g. `codex exec … diff <base> <out>`).
+A pass is a *reviewer* invocation whose input is the `build_pass_prompt.sh` text
+— not another run of this skill.
+Re-entering the launcher spawns another orchestrator that spawns another … , an infinite fork bomb;
+the launcher now refuses it (`ACR_AGENT_RUNNING`).
+
+Passes are independent;
+order does not matter.
+Collect each pass's JSON.
+
+**Combined (`per_persona_context` = `no`)**
+— build ONE prompt with all activated personas (`"$SKILL/scripts/build_pass_prompt.sh" <input> <p1> <p2> ...`)
+and run a single pass;
+it reviews through every lens at once and tags each comment with its `persona`.
+The input and spawn overhead are paid once,
+so it is cheaper
+— but a larger shared context dilutes focus,
+so it finds fewer defects.
+The default stays fan-out:
+recall comes first,
+and `no` is an explicit, opt-in concession.
+
+## Verification (step 6)
+
+For each comment, isolate the key premise it rests on
+— especially an external-system fact (Linux/POSIX behaviour, the System V ABI, Rust semantics).
+Try to **refute** it:
+re-read the cited code and consult an authoritative source.
+Assign a verdict:
+
+- **confirmed** — keep the comment unchanged.
+- **uncertain** — keep it, but prefix `problem` with `(unverified) `.
+- **refuted** — remove the comment,
+  and append it to a `## Retracted by verification` list at the foot of the file with a one-line reason.
+
+Remove **only** on confident refutation;
+an unsure check is `uncertain`, not `refuted`.
+This is the only step that may remove a comment, and only false positives.
+
+## Consolidation (step 7)
+
+Find clusters of comments that share one root cause or one fix
+(e.g. several manual lock/unlock pairs that all want RAII).
+For each cluster, write a single unified fix
+and repoint each member's `**Fix.**` at it ("Shared with the other `raii` comments: …").
+**Never remove a comment**
+— every symptom stays at its own location.
+
+## Output format
+
+The assembled file is:
+frontmatter (`date`, `mode`, `base` or `files`, `head`, `branch`, optional `title`),
+a `# Summary`,
+then a `## <section>` per persona in the order **Maintainability, Correctness, Security, Hardware, Documentation** (Correctness is the Development persona's section).
+Each comment is a `### \`file\` line N` subsection:
+a quoted ` ```diff ` snippet,
+then a prose line `` `<grounding>` (<severity>): <problem> ``,
+then a `**Fix.**` paragraph.
+Do not restructure what the script emits;
+only fill the summary and apply the verify/consolidate edits.
+
+codex
+The skill defines a deterministic pipeline: resolve metadata/input, activate personas by changed paths, run isolated reviewer passes, assemble, then verify and summarize. I’m resolving the target now so the review covers the intended commit series.
+exec
+/bin/bash -lc 'SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/resolve_target.sh" --meta '"'diff 546e32e231429bbb0b5b40ba0fe9e75f38387c9f --per-persona-context=yes /tmp/tmp.rZWoUxP10r/wt1.on.md --overwrite'" in /tmp/tmp.rZWoUxP10r/wt1
+ succeeded in 0ms:
+mode=diff
+base=546e32e23
+head=d4508b8f5
+branch=HEAD
+output=/tmp/tmp.rZWoUxP10r/wt1.on.md
+overwrite=1
+per_persona_context=yes
+
+exec
+/bin/bash -lc 'SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/resolve_target.sh" '"'diff 546e32e231429bbb0b5b40ba0fe9e75f38387c9f --per-persona-context=yes /tmp/tmp.rZWoUxP10r/wt1.on.md --overwrite' > /tmp/aster-review-input.txt; wc -l /tmp/aster-review-input.txt" in /tmp/tmp.rZWoUxP10r/wt1
+ succeeded in 0ms:
+23 /tmp/aster-review-input.txt
+
+codex
+The resolved review input is small, so this appears to be a focused diff from `546e32e23` to `d4508b8f5`. I’m checking the changed paths and worktree state before activating personas, because diff mode only includes committed changes by the skill’s definition.
+exec
+/bin/bash -lc 'git status --short' in /tmp/tmp.rZWoUxP10r/wt1
+ succeeded in 0ms:
+ D .claude/settings.json
+?? .agents/
+?? .claude/skills/
+
+exec
+/bin/bash -lc "sed -n '1,220p' /tmp/aster-review-input.txt" in /tmp/tmp.rZWoUxP10r/wt1
+ succeeded in 0ms:
+
+===== commit d4508b8f5 =====
+
+[commit message]
+made some changes to getcwd
+
+tweaked the getcwd syscall.
+
+[changes]
+
+
+diff --git a/kernel/src/syscall/getcwd.rs b/kernel/src/syscall/getcwd.rs
+index c2ba62e37..9df0b9300 100644
+--- a/kernel/src/syscall/getcwd.rs
++++ b/kernel/src/syscall/getcwd.rs
+@@ -5,6 +5,7 @@ use ostd::mm::VmIo;
+ use super::SyscallReturn;
+ use crate::{fs::vfs::path::AbsPathResult, prelude::*};
+ 
++// Writes the current working directory path to the user buffer.
+ pub fn sys_getcwd(buf: Vaddr, len: usize, ctx: &Context) -> Result<SyscallReturn> {
+     let abs_path = {
+         let fs_ref = ctx.thread_local.borrow_fs();
+
+exec
+/bin/bash -lc 'git diff --name-only 546e32e231429bbb0b5b40ba0fe9e75f38387c9f...HEAD' in /tmp/tmp.rZWoUxP10r/wt1
+ succeeded in 0ms:
+kernel/src/syscall/getcwd.rs
+
+codex
+The only reviewed path is `kernel/src/syscall/getcwd.rs`; that activates Maintainability, Correctness, Security, and Documentation. There are uncommitted tool/config changes in the tree, but the requested `diff` mode input excludes them, so I’m keeping the review scoped to the commit series per the skill contract.
+codex
+I’m going to run the persona passes in parallel, since `--per-persona-context=yes` asks for isolated context per persona. Before that I’m generating the prompt inputs and metadata files the assembler expects.
+exec
+/bin/bash -lc 'ls .agents/skills/aster-code-review/scripts' in /tmp/tmp.rZWoUxP10r/wt1
+exec
+/bin/bash -lc "sed -n '1,220p' .agents/skills/aster-code-review/scripts/assemble_review.sh" in /tmp/tmp.rZWoUxP10r/wt1
+exec
+/bin/bash -lc "sed -n '1,220p' .agents/skills/aster-code-review/scripts/build_pass_prompt.sh" in /tmp/tmp.rZWoUxP10r/wt1
+exec
+/bin/bash -lc 'find .agents/skills/aster-code-review -maxdepth 3 -type f | sort' in /tmp/tmp.rZWoUxP10r/wt1
+ succeeded in 131ms:
+assemble_review.sh
+build_pass_prompt.sh
+parse_pr_command.sh
+parse_review.py
+pass_contract.md
+post_reviews_to_github.sh
+resolve_target.sh
+run_agent.sh
+
+ succeeded in 131ms:
+#!/usr/bin/env bash
+
+# SPDX-License-Identifier: MPL-2.0
+
+#
+# assemble_review.sh — deterministic merge of persona comment fragments into the review file body.
+# No LLM judgement here:
+# group by persona in a fixed order,
+# sort by file then line within each group,
+# drop exact duplicates *within a persona*,
+# write the frontmatter,
+# and leave a <!-- SUMMARY --> placeholder for the orchestrator's LLM summary step.
+#
+# Usage: assemble_review.sh [--overwrite] <meta-file> <frag-dir> <output-file>
+#   meta-file: lines `mode=`, `base=` (diff) or `files=` (files), `head=`,
+#              `branch=`, `date=`, `title=`
+#   frag-dir:  one <persona>.json per persona, each a JSON array of comments:
+#       {"file","line","grounding","severity","problem","fix","diff"}
+#   --overwrite: replace <output-file> if it already exists (otherwise fail).
+set -euo pipefail
+
+overwrite=0
+pos=()
+for a in "$@"; do
+    case "$a" in
+        --overwrite) overwrite=1 ;;
+        --*) echo "assemble_review.sh: unknown flag: $a" >&2; exit 2 ;;
+        *) pos+=("$a") ;;
+    esac
+done
+if [[ ${#pos[@]} -ne 3 ]]; then
+    echo "usage: assemble_review.sh [--overwrite] <meta-file> <frag-dir> <output-file>" >&2
+    exit 2
+fi
+meta="${pos[0]}"; fragdir="${pos[1]}"; out="${pos[2]}"
+
+# Refuse to clobber an existing review unless --overwrite (design §3).
+if [[ -e "$out" && $overwrite -eq 0 ]]; then
+    echo "assemble_review.sh: refusing to overwrite existing $out (pass --overwrite)" >&2
+    exit 1
+fi
+
+python3 - "$meta" "$fragdir" "$out" <<'PY'
+import json, os, re, sys
+meta_path, fragdir, out = sys.argv[1], sys.argv[2], sys.argv[3]
+
+# A guideline short-name is a lowercase kebab identifier (e.g. `lock-ordering`) and
+# renders as code — a citable rule. A bug's grounding is a short plain-language
+# description (e.g. "Off by one") and renders as prose, so it never reads as a rule name.
+KEBAB = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
+def grounding_tag(g):
+    return "`%s`" % g if KEBAB.fullmatch(g) else g
+
+meta = {}
+for line in open(meta_path):
+    line = line.strip()
+    if "=" in line:
+        k, v = line.split("=", 1)
+        meta[k] = v
+
+# Fixed persona order -> review section title.
+# "Correctness" is the Development persona's section (a bare "## Development" reads oddly; see the design doc).
+ORDER = [("maintainability", "Maintainability"),
+         ("development",      "Correctness"),
+         ("security",         "Security"),
+         ("hardware",         "Hardware"),
+         ("documentation",    "Documentation")]
+
+def load(persona):
+    p = os.path.join(fragdir, persona + ".json")
+    if not os.path.exists(p):
+        return []          # persona not activated / did not run: legitimately absent
+    # An EXISTING fragment that is unparseable or not a JSON array means a pass
+    # produced broken output. Failing closed (rather than dropping it) is essential:
+    # this skill is recall-first, so a silently-discarded fragment is a silent
+    # recall hole the benchmark/orchestrator would never notice.
+    try:
+        data = json.load(open(p))
+    except Exception as e:
+        sys.stderr.write(f"assemble: FATAL: unparseable fragment {p}: {e}\n")
+        sys.exit(2)
+    if not isinstance(data, list):
+        sys.stderr.write(f"assemble: FATAL: fragment {p} is not a JSON array of comments\n")
+        sys.exit(2)
+    return data
+
+L = ["---",
+     f"date: {meta.get('date','')}",
+     f"mode: {meta.get('mode','diff')}"]
+if meta.get("base"):
+    L.append(f"base: {meta['base']}")
+if meta.get("files"):
+    L.append(f"files: {meta['files']}")
+L += [f"head: {meta.get('head','')}",
+      f"branch: {meta.get('branch','')}"]
+if meta.get("title"):
+    # json.dumps yields a valid YAML double-quoted scalar (escapes embedded quotes).
+    L.append("title: " + json.dumps(meta["title"]))
+L += ["---", "", "# Summary", "", "<!-- SUMMARY -->", ""]
+
+counts = {}
+for persona, title in ORDER:
+    # Dedup is per-persona: identical comments from two different personas are both kept,
+    # in their own sections (design §4).
+    seen = set()
+    uniq = []
+    for c in load(persona):
+        # "Exact" duplicate: identical in EVERY field (a normalized full-object key),
+        # so two comments that differ in grounding, severity, or diff are both kept.
+        # A partial key would collapse distinct findings — a recall hole.
+        key = json.dumps(c, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(c)
+    counts[persona] = len(uniq)
+    if not uniq:
+        continue
+    # Sort by file, then line, then a stable text key
+    # so co-located comments have a deterministic order regardless of pass output order.
+    uniq.sort(key=lambda c: (str(c.get("file", "")),
+                             int(c.get("line", 0) or 0),
+                             str(c.get("grounding", "")),
+                             str(c.get("problem", ""))))
+    L += [f"## {title}", ""]
+    for c in uniq:
+        loc = "`%s`" % c.get("file", "?")
+        if c.get("line"):
+            loc += " line %s" % c["line"]
+        L += [f"### {loc}", ""]
+        diff = c.get("diff")
+        if diff:
+            L.append("> ```diff")
+            L += ["> " + dl for dl in str(diff).splitlines()]
+            L += ["> ```", ""]
+        L.append("%s (%s): %s" % (grounding_tag(c.get("grounding", "issue")),
+                                  c.get("severity", "major"),
+                                  (c.get("problem", "") or "").strip()))
+        L += ["", "**Fix.** %s" % (c.get("fix", "") or "").strip(), ""]
+
+open(out, "w").write("\n".join(L).rstrip() + "\n")
+sys.stderr.write("assemble: " + ", ".join(f"{p}={counts[p]}" for p, _ in ORDER) + "\n")
+PY
+
+ succeeded in 137ms:
+#!/usr/bin/env bash
+
+# SPDX-License-Identifier: MPL-2.0
+
+#
+# build_pass_prompt.sh — assemble a persona pass prompt DETERMINISTICALLY,
+# ordered for prompt-cache reuse.
+# The STABLE blocks come first and are byte-identical across passes and across reviews:
+# the shared reviewer contract,
+# then one block per persona (its template + its inlined guideline page).
+# The VOLATILE review input comes LAST,
+# so everything above it is a reusable cache prefix.
+#
+# The orchestrator must spawn the pass with this script's EXACT output
+# — retyping or paraphrasing it loses the byte-identical prefix, and with it the cache hit.
+#
+#   one persona  => a fan-out pass   (--per-persona-context=yes/auto)
+#   several      => the combined pass (--per-persona-context=no)
+#
+# Usage: build_pass_prompt.sh <input-file> <persona> [<persona> ...]
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+SKILLDIR="$(cd "$HERE/.." && pwd)"
+REPO="$(cd "$SKILLDIR/../../.." && pwd)"   # .agents/skills/aster-code-review -> repo root
+
+# Where to read the guideline pages from.
+# Priority:
+#   1. explicit ACR_GUIDELINE_ROOT, for tests or external harnesses;
+#   2. a guideline snapshot bundled beside the overlaid skill;
+#   3. the current repo, for normal in-tree use.
+#
+# The benchmark cannot rely on the review agent preserving ACR_GUIDELINE_ROOT
+# across its own shell commands, so overlay_skill.sh bundles a current snapshot
+# into the skill package. This keeps historical worktrees on current guidelines
+# without modifying their tracked book/ tree.
+if [[ -n "${ACR_GUIDELINE_ROOT:-}" ]]; then
+    GROOT="$ACR_GUIDELINE_ROOT"
+elif [[ -f "$SKILLDIR/guideline-root" ]]; then
+    GROOT="$SKILLDIR/guideline-root"
+else
+    GROOT="$REPO"
+fi
+
+input="${1:-}"; shift || true
+[[ -n "$input" && -f "$input" ]] || { echo "build_pass_prompt.sh: a readable <input-file> is required" >&2; exit 2; }
+[[ $# -ge 1 ]] || { echo "build_pass_prompt.sh: at least one <persona> is required" >&2; exit 2; }
+
+linked_guideline_pages() { # <guideline-page-path-relative-to-GROOT>
+    python3 - "$1" "$GROOT/$1" <<'PY'
+import posixpath
+import re
+import sys
+
+root_page = sys.argv[1]
+root_file = sys.argv[2]
+base_dir = posixpath.dirname(root_page)
+seen = set()
+
+with open(root_file, encoding="utf-8") as file:
+    page_text = file.read()
+
+for link in re.findall(r"\[[^\]]+\]\(([^)]+)\)", page_text):
+    link = link.split("#", 1)[0]
+    if not link or "://" in link or link.startswith("#"):
+        continue
+    if link.endswith("/"):
+        link += "README.md"
+    path = posixpath.normpath(posixpath.join(base_dir, link))
+    if not path.startswith("book/src/to-contribute/coding-guidelines/"):
+        continue
+    if path == root_page or path in seen:
+        continue
+    seen.add(path)
+    print(path)
+PY
+}
+
+inline_guidelines() { # <guideline-page-path-relative-to-GROOT>
+    local gp="$1" gfile="$GROOT/$gp" sub
+    [[ -f "$gfile" ]] || return 0
+
+    printf 'Rely on the inlined guideline material below as the authoritative guideline context for this pass. Do not re-read `book/src/to-contribute/coding-guidelines/` from the worktree under review for guideline content.\n\n'
+    printf -- '--- guideline page (%s) ---\n\n' "$gp"
+    cat "$gfile"; printf '\n'
+
+    while IFS= read -r sub; do
+        [[ -f "$GROOT/$sub" ]] || continue
+        printf '\n--- guideline subpage (%s) ---\n\n' "$sub"
+        cat "$GROOT/$sub"; printf '\n'
+    done < <(linked_guideline_pages "$gp")
+}
+
+# --- STABLE: the shared reviewer contract ------------------------------------
+cat "$SKILLDIR/scripts/pass_contract.md"
+printf '\n'
+
+# --- STABLE: one block per persona (template + inlined guideline page) --------
+for persona in "$@"; do
+    pf="$SKILLDIR/personas/$persona.md"
+    [[ -f "$pf" ]] || { echo "build_pass_prompt.sh: no such persona: $persona" >&2; exit 2; }
+    printf '===== PERSONA: %s =====\n\n' "$persona"
+    cat "$pf"; printf '\n'
+    gp="$(grep -oE 'book/[A-Za-z0-9/_-]+README\.md' "$pf" | head -1 || true)"
+    [[ -n "$gp" ]] && inline_guidelines "$gp"
+done
+
+# --- VOLATILE: the review input (LAST; everything above is the cache prefix) ---
+printf '===== REVIEW INPUT =====\n\n'
+cat "$input"
+
+ succeeded in 135ms:
+.agents/skills/aster-code-review/Makefile
+.agents/skills/aster-code-review/README.md
+.agents/skills/aster-code-review/SKILL.md
+.agents/skills/aster-code-review/agent_profiles/claude/profile.json
+.agents/skills/aster-code-review/agent_profiles/claude/profile.smoke.json
+.agents/skills/aster-code-review/agent_profiles/codex/config.smoke.toml
+.agents/skills/aster-code-review/agent_profiles/codex/config.toml
+.agents/skills/aster-code-review/agent_profiles/codex/profile.json
+.agents/skills/aster-code-review/agent_profiles/codex_workflow/config.smoke.toml
+.agents/skills/aster-code-review/agent_profiles/codex_workflow/config.toml
+.agents/skills/aster-code-review/agent_profiles/codex_workflow/profile.json
+.agents/skills/aster-code-review/aster_code_review.sh
+.agents/skills/aster-code-review/personas/development.md
+.agents/skills/aster-code-review/personas/documentation.md
+.agents/skills/aster-code-review/personas/hardware.md
+.agents/skills/aster-code-review/personas/maintainability.md
+.agents/skills/aster-code-review/personas/security.md
+.agents/skills/aster-code-review/scripts/assemble_review.sh
+.agents/skills/aster-code-review/scripts/build_pass_prompt.sh
+.agents/skills/aster-code-review/scripts/parse_pr_command.sh
+.agents/skills/aster-code-review/scripts/parse_review.py
+.agents/skills/aster-code-review/scripts/pass_contract.md
+.agents/skills/aster-code-review/scripts/post_reviews_to_github.sh
+.agents/skills/aster-code-review/scripts/resolve_target.sh
+.agents/skills/aster-code-review/scripts/run_agent.sh
+.agents/skills/aster-code-review/spec/README.md
+.agents/skills/aster-code-review/spec/benchmark.md
+.agents/skills/aster-code-review/spec/coding_guidelines.md
+.agents/skills/aster-code-review/spec/execution_model.md
+.agents/skills/aster-code-review/spec/interface.md
+.agents/skills/aster-code-review/spec/motivation.md
+.agents/skills/aster-code-review/spec/related_work.md
+.agents/skills/aster-code-review/tests/Makefile
+.agents/skills/aster-code-review/tests/README.md
+.agents/skills/aster-code-review/tests/lib.sh
+.agents/skills/aster-code-review/tests/test_assemble_review.sh
+.agents/skills/aster-code-review/tests/test_build_pass_prompt.sh
+.agents/skills/aster-code-review/tests/test_parse_pr_command.sh
+.agents/skills/aster-code-review/tests/test_post_reviews.sh
+.agents/skills/aster-code-review/tests/test_problems_schema.sh
+.agents/skills/aster-code-review/tests/test_resolve_target.sh
+
+codex
+I’m writing the meta and prompt files under `/tmp`, leaving repository files untouched until the final assembled report. The actual code change is just a syscall doc-comment addition, so I expect the review to hinge on style/API documentation rules rather than runtime behavior.
+exec
+/bin/bash -lc 'mkdir -p /tmp/aster-review-frags /tmp/aster-review-prompts; {
+  SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review";
+  "$SKILL/scripts/resolve_target.sh" --meta '"'diff 546e32e231429bbb0b5b40ba0fe9e75f38387c9f --per-persona-context=yes /tmp/tmp.rZWoUxP10r/wt1.on.md --overwrite';
+  printf 'date=2026-08-06\\n';
+  printf 'title=Asterinas getcwd review\\n';
+} > /tmp/aster-review-meta.txt
+SKILL=\""'$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"
+for persona in maintainability development security documentation; do
+  "$SKILL/scripts/build_pass_prompt.sh" /tmp/aster-review-input.txt "$persona" > "/tmp/aster-review-prompts/$persona.txt"
+done
+wc -l /tmp/aster-review-prompts/*.txt' in /tmp/tmp.rZWoUxP10r/wt1
+ succeeded in 150ms:
+  659 /tmp/aster-review-prompts/development.txt
+  244 /tmp/aster-review-prompts/documentation.txt
+ 1296 /tmp/aster-review-prompts/maintainability.txt
+  285 /tmp/aster-review-prompts/security.txt
+ 2484 total
+
+exec
+/bin/bash -lc 'command -v codex && codex --version' in /tmp/tmp.rZWoUxP10r/wt1
+ succeeded in 0ms:
+/root/.local/bin/codex
+WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp" (codex_home: AbsolutePathBuf("/tmp/tmp.C486OUScNf"))
+codex-cli 0.142.5
+
+codex
+I’ve built four isolated pass prompts. I’m invoking `codex exec` for each prompt and capturing the raw JSON fragments under `/tmp/aster-review-frags`; after that I’ll assemble and verify the report.
+exec
+/bin/bash -lc 'codex exec "$(cat /tmp/aster-review-prompts/security.txt)" > /tmp/aster-review-frags/security.raw 2> /tmp/aster-review-frags/security.err; status=$?; printf '"'security status=%s\\n' \""'$status"; tail -n 20 /tmp/aster-review-frags/security.err' in /tmp/tmp.rZWoUxP10r/wt1
+exec
+/bin/bash -lc 'codex exec "$(cat /tmp/aster-review-prompts/maintainability.txt)" > /tmp/aster-review-frags/maintainability.raw 2> /tmp/aster-review-frags/maintainability.err; status=$?; printf '"'maintainability status=%s\\n' \""'$status"; tail -n 20 /tmp/aster-review-frags/maintainability.err' in /tmp/tmp.rZWoUxP10r/wt1
+exec
+/bin/bash -lc 'codex exec "$(cat /tmp/aster-review-prompts/development.txt)" > /tmp/aster-review-frags/development.raw 2> /tmp/aster-review-frags/development.err; status=$?; printf '"'development status=%s\\n' \""'$status"; tail -n 20 /tmp/aster-review-frags/development.err' in /tmp/tmp.rZWoUxP10r/wt1
+exec
+/bin/bash -lc 'codex exec "$(cat /tmp/aster-review-prompts/documentation.txt)" > /tmp/aster-review-frags/documentation.raw 2> /tmp/aster-review-frags/documentation.err; status=$?; printf '"'documentation status=%s\\n' \""'$status"; tail -n 20 /tmp/aster-review-frags/documentation.err' in /tmp/tmp.rZWoUxP10r/wt1
+ succeeded in 27938ms:
+security status=0
+     // Reference: <https://man7.org/linux/man-pages/man3/getcwd.3.html>
+     let abs_path = match abs_path {
+         AbsPathResult::Reachable(s) => s,
+         AbsPathResult::Unreachable(s) => alloc::format!("(unreachable){}", s),
+     };
+ 
+     let cwd = CString::new(abs_path)?;
+     let bytes = cwd.as_bytes_with_nul();
+     if bytes.len() > len {
+         return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+     }
+     ctx.user_space().write_bytes(buf, bytes)?;
+ 
+     Ok(SyscallReturn::Return(bytes.len() as _))
+ }
+
+codex
+[]
+tokens used
+11,586
+
+ succeeded in 28189ms:
+documentation status=0
+**Never remove a comment**
+— every symptom stays at its own location.
+
+## Output format
+
+The assembled file is:
+frontmatter (`date`, `mode`, `base` or `files`, `head`, `branch`, optional `title`),
+a `# Summary`,
+then a `## <section>` per persona in the order **Maintainability, Correctness, Security, Hardware, Documentation** (Correctness is the Development persona's section).
+Each comment is a `### \`file\` line N` subsection:
+a quoted ` ```diff ` snippet,
+then a prose line `` `<grounding>` (<severity>): <problem> ``,
+then a `**Fix.**` paragraph.
+Do not restructure what the script emits;
+only fill the summary and apply the verify/consolidate edits.
+
+codex
+[]
+tokens used
+16,183
+
+ succeeded in 40834ms:
+development status=0
+    
+    tweaked the getcwd syscall.
+
+diff --git a/kernel/src/syscall/getcwd.rs b/kernel/src/syscall/getcwd.rs
+index c2ba62e37..9df0b9300 100644
+--- a/kernel/src/syscall/getcwd.rs
++++ b/kernel/src/syscall/getcwd.rs
+@@ -5,6 +5,7 @@ use ostd::mm::VmIo;
+ use super::SyscallReturn;
+ use crate::{fs::vfs::path::AbsPathResult, prelude::*};
+ 
++// Writes the current working directory path to the user buffer.
+ pub fn sys_getcwd(buf: Vaddr, len: usize, ctx: &Context) -> Result<SyscallReturn> {
+     let abs_path = {
+         let fs_ref = ctx.thread_local.borrow_fs();
+
+codex
+[]
+tokens used
+15,745
+
+codex
+Security and Documentation returned empty JSON arrays, meaning no comments from those passes. Maintainability and Correctness are still running; I’m waiting on those before assembling the review.
+ succeeded in 62727ms:
+maintainability status=0
+    "persona": "maintainability",
+    "grounding": "imperative-subject",
+    "severity": "minor",
+    "problem": "The subject `made some changes to getcwd` is vague, not imperative, and does not wrap the identifier `getcwd` in backticks.",
+    "fix": "Use an imperative, descriptive subject such as `Document `sys_getcwd``.",
+    "diff": "made some changes to getcwd\n\ntweaked the getcwd syscall."
+  },
+  {
+    "file": "kernel/src/syscall/getcwd.rs",
+    "line": 8,
+    "persona": "maintainability",
+    "grounding": "explain-why",
+    "severity": "nit",
+    "problem": "The new comment `Writes the current working directory path to the user buffer.` only restates what `sys_getcwd` does, so it adds maintenance noise without explaining any non-obvious intent.",
+    "fix": "Remove the comment, or replace it with a `///` doc comment only if there is API behavior worth documenting beyond the function name.",
+    "diff": "+// Writes the current working directory path to the user buffer.\n pub fn sys_getcwd(buf: Vaddr, len: usize, ctx: &Context) -> Result<SyscallReturn> {"
+  }
+]
+tokens used
+21,441
+
+exec
+/bin/bash -lc "for f in /tmp/aster-review-frags/*.raw; do printf '%s: ' \""'$f"; wc -c < "$f"; done' in /tmp/tmp.rZWoUxP10r/wt1
+ succeeded in 0ms:
+/tmp/aster-review-frags/development.raw: 3
+/tmp/aster-review-frags/documentation.raw: 3
+/tmp/aster-review-frags/maintainability.raw: 1129
+/tmp/aster-review-frags/security.raw: 3
+
+codex
+The remaining passes finished. Maintainability raised two minor/nit comments; Correctness found none. I’m validating the JSON fragments now, then I’ll assemble the report and verify whether each finding is supported by the source and guidelines.
+exec
+/bin/bash -lc "python3 -m json.tool /tmp/aster-review-frags/maintainability.raw >/tmp/aster-review-frags/maintainability.json && cp /tmp/aster-review-frags/development.raw /tmp/aster-review-frags/development.json && cp /tmp/aster-review-frags/security.raw /tmp/aster-review-frags/security.json && cp /tmp/aster-review-frags/documentation.raw /tmp/aster-review-frags/documentation.json && for f in /tmp/aster-review-frags/*.json; do printf '%s\\n' \""'$f"; python3 -m json.tool "$f"; done' in /tmp/tmp.rZWoUxP10r/wt1
+exec
+/bin/bash -lc "sed -n '1,220p' /tmp/aster-review-frags/maintainability.raw" in /tmp/tmp.rZWoUxP10r/wt1
+exec
+/bin/bash -lc "nl -ba kernel/src/syscall/getcwd.rs | sed -n '1,60p'" in /tmp/tmp.rZWoUxP10r/wt1
+exec
+/bin/bash -lc "rg -n \"imperative|subject|comments|explain|why|Doc comments|third-person|sentence\" book/src/to-contribute/coding-guidelines -g '*.md'" in /tmp/tmp.rZWoUxP10r/wt1
+ succeeded in 139ms:
+[
+  {
+    "file": "commit d4508b8f5 message",
+    "persona": "maintainability",
+    "grounding": "imperative-subject",
+    "severity": "minor",
+    "problem": "The subject `made some changes to getcwd` is vague, not imperative, and does not wrap the identifier `getcwd` in backticks.",
+    "fix": "Use an imperative, descriptive subject such as `Document `sys_getcwd``.",
+    "diff": "made some changes to getcwd\n\ntweaked the getcwd syscall."
+  },
+  {
+    "file": "kernel/src/syscall/getcwd.rs",
+    "line": 8,
+    "persona": "maintainability",
+    "grounding": "explain-why",
+    "severity": "nit",
+    "problem": "The new comment `Writes the current working directory path to the user buffer.` only restates what `sys_getcwd` does, so it adds maintenance noise without explaining any non-obvious intent.",
+    "fix": "Remove the comment, or replace it with a `///` doc comment only if there is API behavior worth documenting beyond the function name.",
+    "diff": "+// Writes the current working directory path to the user buffer.\n pub fn sys_getcwd(buf: Vaddr, len: usize, ctx: &Context) -> Result<SyscallReturn> {"
+  }
+]
+
+ succeeded in 139ms:
+     1	// SPDX-License-Identifier: MPL-2.0
+     2	
+     3	use ostd::mm::VmIo;
+     4	
+     5	use super::SyscallReturn;
+     6	use crate::{fs::vfs::path::AbsPathResult, prelude::*};
+     7	
+     8	// Writes the current working directory path to the user buffer.
+     9	pub fn sys_getcwd(buf: Vaddr, len: usize, ctx: &Context) -> Result<SyscallReturn> {
+    10	    let abs_path = {
+    11	        let fs_ref = ctx.thread_local.borrow_fs();
+    12	        let path_resolver = fs_ref.resolver().read();
+    13	        path_resolver.make_abs_path(path_resolver.cwd())
+    14	    };
+    15	
+    16	    debug!("getcwd: {:?}", abs_path);
+    17	
+    18	    // Linux will add a "(unreachable)" prefix to the path if the CWD is not reachable.
+    19	    // However, according to POSIX, `getcwd()` should fail with ENOENT in this case.
+    20	    // `glibc` treats the Linux's behavior as a bug and handles the Linux-specific prefix
+    21	    // to conform to POSIX. Here follows Linux's behavior to keep compatibility.
+    22	    //
+    23	    // Reference: <https://man7.org/linux/man-pages/man3/getcwd.3.html>
+    24	    let abs_path = match abs_path {
+    25	        AbsPathResult::Reachable(s) => s,
+    26	        AbsPathResult::Unreachable(s) => alloc::format!("(unreachable){}", s),
+    27	    };
+    28	
+    29	    let cwd = CString::new(abs_path)?;
+    30	    let bytes = cwd.as_bytes_with_nul();
+    31	    if bytes.len() > len {
+    32	        return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+    33	    }
+    34	    ctx.user_space().write_bytes(buf, bytes)?;
+    35	
+    36	    Ok(SyscallReturn::Return(bytes.len() as _))
+    37	}
+
+ succeeded in 147ms:
+book/src/to-contribute/coding-guidelines/README.md:15:  Language-agnostic guidance for naming, comments,
+book/src/to-contribute/coding-guidelines/README.md:42:| General | Explain why, not what | [`explain-why`](general-guidelines/#explain-why) |
+book/src/to-contribute/coding-guidelines/README.md:54:| Rust | Introduce explaining variables | [`explain-variables`](rust-guidelines/language-items/variables-expressions-and-statements.md#explain-variables) |
+book/src/to-contribute/coding-guidelines/README.md:63:| Rust | Follow RFC 1574 summary line conventions | [`rfc1574-summary`](rust-guidelines/language-items/comments-and-documentation.md#rfc1574-summary) |
+book/src/to-contribute/coding-guidelines/README.md:64:| Rust | End sentence comments with punctuation | [`comment-punctuation`](rust-guidelines/language-items/comments-and-documentation.md#comment-punctuation) |
+book/src/to-contribute/coding-guidelines/README.md:65:| Rust | Wrap identifiers in backticks | [`backtick-identifiers`](rust-guidelines/language-items/comments-and-documentation.md#backtick-identifiers) |
+book/src/to-contribute/coding-guidelines/README.md:66:| Rust | Do not disclose implementation details in doc comments | [`no-impl-in-docs`](rust-guidelines/language-items/comments-and-documentation.md#no-impl-in-docs) |
+book/src/to-contribute/coding-guidelines/README.md:67:| Rust | Add module-level documentation for major components | [`module-docs`](rust-guidelines/language-items/comments-and-documentation.md#module-docs) |
+book/src/to-contribute/coding-guidelines/README.md:92:| Git | Write imperative, descriptive subject lines | [`imperative-subject`](git-guidelines.md#imperative-subject) |
+book/src/to-contribute/coding-guidelines/how-guidelines-are-written.md:15:We collected the historical review comments
+book/src/to-contribute/coding-guidelines/how-guidelines-are-written.md:44:### Managing complexity is the primary technical imperative {#managing-complexity}
+book/src/to-contribute/coding-guidelines/how-guidelines-are-written.md:157:(e.g., `explain-variables`, `lock-ordering`).
+book/src/to-contribute/coding-guidelines/how-guidelines-are-written.md:194:### Introduce explaining variables (`explain-variables`) {#explain-variables}
+book/src/to-contribute/coding-guidelines/how-guidelines-are-written.md:198:An explaining variable turns an opaque expression
+book/src/to-contribute/coding-guidelines/how-guidelines-are-written.md:218:- A stable short name (`explain-variables`) shown parenthetically and used as the heading anchor
+book/src/to-contribute/coding-guidelines/how-guidelines-are-written.md:219:- A one-sentence actionable recommendation followed by a code example
+book/src/to-contribute/coding-guidelines/rust-guidelines/README.md:23:  - **[Comments and Documentation](language-items/comments-and-documentation.md)** —
+book/src/to-contribute/coding-guidelines/git-guidelines.md:7:### Write imperative, descriptive subject lines (`imperative-subject`) {#imperative-subject}
+book/src/to-contribute/coding-guidelines/git-guidelines.md:9:Write commit messages in imperative mood
+book/src/to-contribute/coding-guidelines/git-guidelines.md:10:with the subject line at or below 72 characters.
+book/src/to-contribute/coding-guidelines/git-guidelines.md:36:add a blank line after the subject
+book/src/to-contribute/coding-guidelines/git-guidelines.md:38:describing the _why_ behind the change.
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/unsafety.md:6:that justifies why the operation is sound.
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/unsafety.md:29:must include a `# Safety` section in their doc comments
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/README.md:20:- **[Comments and Documentation](comments-and-documentation.md)** —
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/README.md:25:  `// SAFETY:` comments,
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md:18:The first line of a doc comment should be concise and one sentence.
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md:21:- **Functions and methods** — third-person singular present indicative verb
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md:41:### End sentence comments with punctuation (`comment-punctuation`) {#comment-punctuation}
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md:43:If a comment line is a full sentence,
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md:49:// Good — complete sentence with punctuation.
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md:52:// Bad — complete sentence without punctuation
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md:59:and code identifiers in doc comments
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md:73:### Do not disclose implementation details in doc comments (`no-impl-in-docs`) {#no-impl-in-docs}
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md:75:Doc comments should describe _what_ the API does
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md:93:should begin with a `//!` comment explaining:
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/variables-expressions-and-statements.md:3:### Introduce explaining variables (`explain-variables`) {#explain-variables}
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/variables-expressions-and-statements.md:7:An explaining variable turns an opaque expression
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/variables-expressions-and-statements.md:68:and document why wrapping is correct.
+book/src/to-contribute/coding-guidelines/general-guidelines/README.md:115:For prose in Markdown and doc comments,
+book/src/to-contribute/coding-guidelines/general-guidelines/README.md:118:At minimum, break at sentence boundaries.
+book/src/to-contribute/coding-guidelines/general-guidelines/README.md:119:For longer sentences, also consider breaking at clause boundaries.
+book/src/to-contribute/coding-guidelines/general-guidelines/README.md:132:### Explain why, not what (`explain-why`) {#explain-why}
+book/src/to-contribute/coding-guidelines/general-guidelines/README.md:134:Comments should explain the intent behind the code,
+book/src/to-contribute/coding-guidelines/general-guidelines/README.md:139:If a comment is needed to explain what code does,
+book/src/to-contribute/coding-guidelines/general-guidelines/README.md:141:Do not write good comments to compensate for bad code —
+book/src/to-contribute/coding-guidelines/general-guidelines/README.md:154:add a comment explaining the rationale
+book/src/to-contribute/coding-guidelines/general-guidelines/README.md:156:Design-decision comments ("director's commentary")
+
+ succeeded in 263ms:
+/tmp/aster-review-frags/development.json
+[]
+/tmp/aster-review-frags/documentation.json
+[]
+/tmp/aster-review-frags/maintainability.json
+[
+    {
+        "file": "commit d4508b8f5 message",
+        "persona": "maintainability",
+        "grounding": "imperative-subject",
+        "severity": "minor",
+        "problem": "The subject `made some changes to getcwd` is vague, not imperative, and does not wrap the identifier `getcwd` in backticks.",
+        "fix": "Use an imperative, descriptive subject such as `Document `sys_getcwd``.",
+        "diff": "made some changes to getcwd\n\ntweaked the getcwd syscall."
+    },
+    {
+        "file": "kernel/src/syscall/getcwd.rs",
+        "line": 8,
+        "persona": "maintainability",
+        "grounding": "explain-why",
+        "severity": "nit",
+        "problem": "The new comment `Writes the current working directory path to the user buffer.` only restates what `sys_getcwd` does, so it adds maintenance noise without explaining any non-obvious intent.",
+        "fix": "Remove the comment, or replace it with a `///` doc comment only if there is API behavior worth documenting beyond the function name.",
+        "diff": "+// Writes the current working directory path to the user buffer.\n pub fn sys_getcwd(buf: Vaddr, len: usize, ctx: &Context) -> Result<SyscallReturn> {"
+    }
+]
+/tmp/aster-review-frags/security.json
+[]
+
+codex
+Verification is catching one overreach: the commit subject is clearly vague and non-imperative, but the guideline I found does not require backticks in commit subjects. I’m going to keep the supported part of that finding and trim the unsupported wording before assembling the final review.
+exec
+/bin/bash -lc "sed -n '1,80p' book/src/to-contribute/coding-guidelines/git-guidelines.md" in /tmp/tmp.rZWoUxP10r/wt1
+ succeeded in 0ms:
+# Git Guidelines
+
+These guidelines cover commit hygiene and pull request conventions.
+For the underlying philosophy, see
+[How Guidelines Are Written](how-guidelines-are-written.md).
+
+### Write imperative, descriptive subject lines (`imperative-subject`) {#imperative-subject}
+
+Write commit messages in imperative mood
+with the subject line at or below 72 characters.
+Wrap identifiers in backticks.
+
+Common prefixes used in the Asterinas commit log:
+
+- `Fix` — correct a bug
+- `Add` — introduce new functionality
+- `Remove` — delete code or features
+- `Refactor` — restructure without changing behavior
+- `Rename` — change names of files, modules, or symbols
+- `Implement` — add a new subsystem or feature
+- `Enable` — turn on a previously disabled capability
+- `Clean up` — minor tidying without functional change
+- `Bump` — update a dependency version
+
+Examples:
+
+```
+Fix deadlock in `Vmar::protect` when holding the page table lock
+
+Add initial support for the io_uring subsystem
+
+Refactor `TcpSocket` to separate connection state from I/O logic
+```
+
+If the commit requires further explanation,
+add a blank line after the subject
+followed by a body paragraph
+describing the _why_ behind the change.
+
+See also:
+PR [#2877](https://github.com/asterinas/asterinas/pull/2877)
+and [#2700](https://github.com/asterinas/asterinas/pull/2700).
+
+### One logical change per commit (`atomic-commits`) {#atomic-commits}
+
+Each commit should represent one logical change.
+Do not mix unrelated changes in a single commit.
+When fixing an issue discovered during review
+on a local or private branch,
+use `git rebase -i` to amend the commit
+that introduced the issue
+rather than appending a fixup commit at the end.
+
+See also:
+PR [#2791](https://github.com/asterinas/asterinas/pull/2791)
+and [#2260](https://github.com/asterinas/asterinas/pull/2260).
+
+### Separate refactoring from features (`refactor-then-feature`) {#refactor-then-feature}
+
+If a feature requires preparatory refactoring,
+put the refactoring in its own commit(s)
+before the feature commit.
+This makes each commit easier to review and bisect.
+
+See also:
+PR [#2877](https://github.com/asterinas/asterinas/pull/2877).
+
+### Keep pull requests focused (`focused-prs`) {#focused-prs}
+
+Keep pull requests focused on a single topic.
+A PR that mixes a bug fix, a refactoring,
+and a new feature is difficult to review.
+
+Ensure that CI passes before requesting review.
+If CI fails on an unrelated flake,
+note it in the PR description.
+
+exec
+/bin/bash -lc "sed -n '128,170p' book/src/to-contribute/coding-guidelines/general-guidelines/README.md" in /tmp/tmp.rZWoUxP10r/wt1
+ succeeded in 0ms:
+
+See also:
+[Semantic Line Breaks](https://sembr.org/).
+
+### Explain why, not what (`explain-why`) {#explain-why}
+
+Comments should explain the intent behind the code,
+not restate what the code does.
+If a comment merely paraphrases the code,
+it adds noise without insight.
+
+If a comment is needed to explain what code does,
+first try to rewrite the code.
+Do not write good comments to compensate for bad code —
+rewrite it to be straightforward.
+
+See also:
+_The Art of Readable Code_, Chapter 6 "Knowing What to Comment";
+PR [#2265](https://github.com/asterinas/asterinas/pull/2265#discussion_r2266220943)
+and [#2050](https://github.com/asterinas/asterinas/pull/2050#discussion_r2224106025).
+
+### Document design decisions (`design-decisions`) {#design-decisions}
+
+When the code makes a non-obvious choice —
+a particular data structure, a locking strategy,
+a deviation from Linux behavior —
+add a comment explaining the rationale
+and any alternatives considered.
+Design-decision comments ("director's commentary")
+are the most valuable kind of comment.
+
+```rust
+// We use a radix tree rather than a HashMap
+// because lookups must be O(log n) worst-case
+// for the page fault handler.
+// A HashMap gives O(1) amortized
+// but O(n) worst-case due to rehashing,
+// which is unacceptable on the page fault path.
+```
+
+See also:
+PR [#2265](https://github.com/asterinas/asterinas/pull/2265#discussion_r2266220943)
+and [#2050](https://github.com/asterinas/asterinas/pull/2050#discussion_r2224106025).
+
+exec
+/bin/bash -lc "sed -n '1,90p' book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md" in /tmp/tmp.rZWoUxP10r/wt1
+ succeeded in 0ms:
+# Comments and Documentation
+
+API documentation describes API meaning and usage
+and is rendered by rustdoc.
+Public APIs should be documented,
+including crates, modules, structs, traits, functions, and macros.
+The `#![warn(missing_docs)]` lint helps enforce this baseline.
+
+Asterinas follows Rust community documentation conventions.
+Two primary references are:
+1. The rustdoc book:
+   [How to write documentation](https://doc.rust-lang.org/rustdoc/how-to-write-documentation.html)
+2. The Rust RFC book:
+   [API Documentation Conventions](https://rust-lang.github.io/rfcs/1574-more-api-documentation-conventions.html#appendix-a-full-conventions-text)
+
+### Follow RFC 1574 summary line conventions (`rfc1574-summary`) {#rfc1574-summary}
+
+The first line of a doc comment should be concise and one sentence.
+Its grammatical form depends on what the item is:
+
+- **Functions and methods** — third-person singular present indicative verb
+  ("Returns", "Creates", "Acquires"), describing the action performed.
+- **Types (structs, enums, traits, type aliases), modules, and fields** —
+  a noun phrase naming the thing, not describing an action.
+  This matches the Rust standard library convention
+  (e.g., `Vec` is "A contiguous growable array type").
+
+```rust
+/// Returns the mapping's start address.
+pub fn map_to_addr(&self) -> Vaddr {
+    self.map_to_addr
+}
+
+/// A policy for how [`FsPath::from_fd_at`] treats an empty `path_str`.
+pub enum EmptyPathStr { /* ... */ }
+
+/// A guard that releases a [`SpinLock`] when dropped.
+pub struct SpinLockGuard<'a, T> { /* ... */ }
+```
+
+### End sentence comments with punctuation (`comment-punctuation`) {#comment-punctuation}
+
+If a comment line is a full sentence,
+end it with proper punctuation.
+This improves readability in dense code
+and avoids fragmented prose.
+
+```rust
+// Good — complete sentence with punctuation.
+// SAFETY: The pointer is derived from a live allocation.
+
+// Bad — complete sentence without punctuation
+// SAFETY: The pointer is derived from a live allocation
+```
+
+### Wrap identifiers in backticks (`backtick-identifiers`) {#backtick-identifiers}
+
+Type names, method names,
+and code identifiers in doc comments
+should be wrapped in backticks for rustdoc rendering.
+When referring to types,
+prefer rustdoc links (`[TypeName]`) where possible.
+
+```rust
+/// Acquires the [`SpinLock`] and returns a guard
+/// that releases the lock on [`Drop`].
+///
+/// Callers must not call `acquire` while holding
+/// a [`RwMutex`] to avoid deadlock.
+pub fn acquire(&self) -> SpinLockGuard<'_, T> { ... }
+```
+
+### Do not disclose implementation details in doc comments (`no-impl-in-docs`) {#no-impl-in-docs}
+
+Doc comments should describe _what_ the API does
+and _how to use it_,
+not _how it is implemented internally_.
+
+```rust
+// Good — behavior-oriented
+/// Returns the number of active connections.
+
+// Bad — leaks implementation details
+/// Returns the length of the internal `HashMap`
+/// that tracks connections by socket address.
+```
+
+### Add module-level documentation for major components (`module-docs`) {#module-docs}
+
+A module file that serves as
+
+codex
+Both findings are confirmed against the in-tree guidelines: commit subjects should be imperative/descriptive and wrap identifiers, and comments should explain intent rather than paraphrase code. I’m normalizing the fragment wording so the assembled Markdown renders cleanly.
+exec
+/bin/bash -lc "python3 - <<'PY'
+import json
+path='/tmp/aster-review-frags/maintainability.json'
+data=json.load(open(path))
+data[0]['fix']='Use an imperative, descriptive subject such as: Document "'`sys_getcwd`.'"'
+json.dump(data, open(path,'w'), indent=2)
+PY
+SKILL=\""'$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"
+"$SKILL/scripts/assemble_review.sh" --overwrite /tmp/aster-review-meta.txt /tmp/aster-review-frags /tmp/tmp.rZWoUxP10r/wt1.on.md
+sed -n '"'1,220p' /tmp/tmp.rZWoUxP10r/wt1.on.md" in /tmp/tmp.rZWoUxP10r/wt1
+ succeeded in 0ms:
+assemble: maintainability=2, development=0, security=0, hardware=0, documentation=0
+---
+date: 2026-08-06
+mode: diff
+base: 546e32e23
+head: d4508b8f5
+branch: HEAD
+title: "Asterinas getcwd review"
+---
+
+# Summary
+
+<!-- SUMMARY -->
+
+## Maintainability
+
+### `commit d4508b8f5 message`
+
+> ```diff
+> made some changes to getcwd
+> 
+> tweaked the getcwd syscall.
+> ```
+
+`imperative-subject` (minor): The subject `made some changes to getcwd` is vague, not imperative, and does not wrap the identifier `getcwd` in backticks.
+
+**Fix.** Use an imperative, descriptive subject such as: Document `sys_getcwd`.
+
+### `kernel/src/syscall/getcwd.rs` line 8
+
+> ```diff
+> +// Writes the current working directory path to the user buffer.
+>  pub fn sys_getcwd(buf: Vaddr, len: usize, ctx: &Context) -> Result<SyscallReturn> {
+> ```
+
+`explain-why` (nit): The new comment `Writes the current working directory path to the user buffer.` only restates what `sys_getcwd` does, so it adds maintenance noise without explaining any non-obvious intent.
+
+**Fix.** Remove the comment, or replace it with a `///` doc comment only if there is API behavior worth documenting beyond the function name.
+
+codex
+The review file has been assembled with two maintainability comments. I’m adding the final summary now, then I’ll do a quick format/content check of the generated Markdown.
+apply patch
+patch: completed
+/tmp/tmp.rZWoUxP10r/wt1.on.md
+diff --git a//tmp/tmp.rZWoUxP10r/wt1.on.md b//tmp/tmp.rZWoUxP10r/wt1.on.md
+index e102836aaf883ec60577184f3fa26f805f7c0ae6..afa24b93dc7ec03450d712d407741684fc0dd432
+--- a//tmp/tmp.rZWoUxP10r/wt1.on.md
++++ b//tmp/tmp.rZWoUxP10r/wt1.on.md
+@@ -9,7 +9,9 @@
+ 
+ # Summary
+ 
+-<!-- SUMMARY -->
++This change adds a single explanatory comment to `sys_getcwd`. The code behavior is unchanged, and the correctness, security, and documentation passes did not find runtime or API-surface defects.
++
++The main issues are maintainability concerns: the commit subject should be rewritten to follow Asterinas commit-message conventions, and the new inline comment should be removed unless it can document non-obvious behavior instead of restating the function name.
+ 
+ ## Maintainability
+ 
+
+diff --git a//tmp/tmp.rZWoUxP10r/wt1.on.md b//tmp/tmp.rZWoUxP10r/wt1.on.md
+index e102836aaf883ec60577184f3fa26f805f7c0ae6..afa24b93dc7ec03450d712d407741684fc0dd432
+--- a//tmp/tmp.rZWoUxP10r/wt1.on.md
++++ b//tmp/tmp.rZWoUxP10r/wt1.on.md
+@@ -9,7 +9,9 @@
+ 
+ # Summary
+ 
+-<!-- SUMMARY -->
++This change adds a single explanatory comment to `sys_getcwd`. The code behavior is unchanged, and the correctness, security, and documentation passes did not find runtime or API-surface defects.
++
++The main issues are maintainability concerns: the commit subject should be rewritten to follow Asterinas commit-message conventions, and the new inline comment should be removed unless it can document non-obvious behavior instead of restating the function name.
+ 
+ ## Maintainability
+ 
+
+codex
+The final report is written. I’m doing one last read of the Markdown and checking the worktree status so I can report exactly what changed and any scope caveats.
+exec
+/bin/bash -lc "python3 - <<'PY'
+from pathlib import Path
+p=Path('/tmp/tmp.rZWoUxP10r/wt1.on.md')
+text=p.read_text()
+assert '<"'!-- SUMMARY -->'"' not in text
+assert '## Maintainability' in text
+assert text.count('### ') == 2
+print('review markdown sanity check passed')
+PY" in /tmp/tmp.rZWoUxP10r/wt1
+exec
+/bin/bash -lc 'git status --short' in /tmp/tmp.rZWoUxP10r/wt1
+exec
+/bin/bash -lc "sed -n '1,220p' /tmp/tmp.rZWoUxP10r/wt1.on.md" in /tmp/tmp.rZWoUxP10r/wt1
+ succeeded in 0ms:
+---
+date: 2026-08-06
+mode: diff
+base: 546e32e23
+head: d4508b8f5
+branch: HEAD
+title: "Asterinas getcwd review"
+---
+
+# Summary
+
+This change adds a single explanatory comment to `sys_getcwd`. The code behavior is unchanged, and the correctness, security, and documentation passes did not find runtime or API-surface defects.
+
+The main issues are maintainability concerns: the commit subject should be rewritten to follow Asterinas commit-message conventions, and the new inline comment should be removed unless it can document non-obvious behavior instead of restating the function name.
+
+## Maintainability
+
+### `commit d4508b8f5 message`
+
+> ```diff
+> made some changes to getcwd
+> 
+> tweaked the getcwd syscall.
+> ```
+
+`imperative-subject` (minor): The subject `made some changes to getcwd` is vague, not imperative, and does not wrap the identifier `getcwd` in backticks.
+
+**Fix.** Use an imperative, descriptive subject such as: Document `sys_getcwd`.
+
+### `kernel/src/syscall/getcwd.rs` line 8
+
+> ```diff
+> +// Writes the current working directory path to the user buffer.
+>  pub fn sys_getcwd(buf: Vaddr, len: usize, ctx: &Context) -> Result<SyscallReturn> {
+> ```
+
+`explain-why` (nit): The new comment `Writes the current working directory path to the user buffer.` only restates what `sys_getcwd` does, so it adds maintenance noise without explaining any non-obvious intent.
+
+**Fix.** Remove the comment, or replace it with a `///` doc comment only if there is API behavior worth documenting beyond the function name.
+
+diff --git a//tmp/tmp.rZWoUxP10r/wt1.on.md b//tmp/tmp.rZWoUxP10r/wt1.on.md
+index e102836aaf883ec60577184f3fa26f805f7c0ae6..afa24b93dc7ec03450d712d407741684fc0dd432
+--- a//tmp/tmp.rZWoUxP10r/wt1.on.md
++++ b//tmp/tmp.rZWoUxP10r/wt1.on.md
+@@ -9,7 +9,9 @@
+ 
+ # Summary
+ 
+-<!-- SUMMARY -->
++This change adds a single explanatory comment to `sys_getcwd`. The code behavior is unchanged, and the correctness, security, and documentation passes did not find runtime or API-surface defects.
++
++The main issues are maintainability concerns: the commit subject should be rewritten to follow Asterinas commit-message conventions, and the new inline comment should be removed unless it can document non-obvious behavior instead of restating the function name.
+ 
+ ## Maintainability
+ 
+
+ succeeded in 115ms:
+review markdown sanity check passed
+
+ succeeded in 133ms:
+ D .claude/settings.json
+?? .agents/
+?? .claude/skills/
+
+codex
+Wrote the review to [/tmp/tmp.rZWoUxP10r/wt1.on.md](/tmp/tmp.rZWoUxP10r/wt1.on.md).
+
+It contains 2 verified Maintainability findings:
+- Commit subject is vague/non-imperative and does not backtick `getcwd`.
+- New `sys_getcwd` comment restates the function instead of explaining intent.
+
+Correctness, Security, and Documentation passes returned no findings. Note: per the requested `diff` mode, the review covered committed changes from `546e32e23..d4508b8f5`; uncommitted `.agents/` / `.claude/` worktree changes were not reviewed.
+diff --git a//tmp/tmp.rZWoUxP10r/wt1.on.md b//tmp/tmp.rZWoUxP10r/wt1.on.md
+index e102836aaf883ec60577184f3fa26f805f7c0ae6..afa24b93dc7ec03450d712d407741684fc0dd432
+--- a//tmp/tmp.rZWoUxP10r/wt1.on.md
++++ b//tmp/tmp.rZWoUxP10r/wt1.on.md
+@@ -9,7 +9,9 @@
+ 
+ # Summary
+ 
+-<!-- SUMMARY -->
++This change adds a single explanatory comment to `sys_getcwd`. The code behavior is unchanged, and the correctness, security, and documentation passes did not find runtime or API-surface defects.
++
++The main issues are maintainability concerns: the commit subject should be rewritten to follow Asterinas commit-message conventions, and the new inline comment should be removed unless it can document non-obvious behavior instead of restating the function name.
+ 
+ ## Maintainability
+ 
+
+tokens used
+44,713
+Wrote the review to [/tmp/tmp.rZWoUxP10r/wt1.on.md](/tmp/tmp.rZWoUxP10r/wt1.on.md).
+
+It contains 2 verified Maintainability findings:
+- Commit subject is vague/non-imperative and does not backtick `getcwd`.
+- New `sys_getcwd` comment restates the function instead of explaining intent.
+
+Correctness, Security, and Documentation passes returned no findings. Note: per the requested `diff` mode, the review covered committed changes from `546e32e23..d4508b8f5`; uncommitted `.agents/` / `.claude/` worktree changes were not reviewed.
+WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp" (codex_home: AbsolutePathBuf("/tmp/tmp.T2bXq3AlqF"))
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /root/asterinas/.agents/skills/aster-code-review/benchmark
+model: gpt-5.5
+provider: OpenAI
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR] (network access enabled)
+reasoning effort: high
+reasoning summaries: none
+session id: 019fd739-59d1-7992-9b21-036c9bdf2f78
+--------
+user
+You are grading a code review for recall.
+Each expected defect gives a defect description for context and a MATCH IF criterion for grading.
+For each expected defect, decide whether ANY produced review comment semantically satisfies its MATCH IF criterion at the stated code location.
+Wording, grounding label, persona, and severity may differ; judge the underlying defect.
+Respond with ONLY two space-separated integers: caught total. The total must equal the number of expected defects below.
+
+===== EXPECTED DEFECTS =====
+# Expected defects
+
+1. location: <commit_message> (persona: maintainability, grounding: imperative-subject, severity: minor)
+   defect: The commit subject "made some changes to getcwd" is past-tense and vague: it does not summarize *what* the change does in the imperative mood, as Asterinas requires. (The code change itself — a clarifying comment — is fine; the message is the defect.)
+   MATCH IF: A reviewer should flag the non-imperative, non-descriptive subject and ask for a specific imperative summary.
+
+===== PRODUCED REVIEW =====
+---
+date: 2026-08-06
+mode: diff
+base: 546e32e23
+head: d4508b8f5
+branch: HEAD
+title: "Asterinas getcwd review"
+---
+
+# Summary
+
+This change adds a single explanatory comment to `sys_getcwd`. The code behavior is unchanged, and the correctness, security, and documentation passes did not find runtime or API-surface defects.
+
+The main issues are maintainability concerns: the commit subject should be rewritten to follow Asterinas commit-message conventions, and the new inline comment should be removed unless it can document non-obvious behavior instead of restating the function name.
+
+## Maintainability
+
+### `commit d4508b8f5 message`
+
+> ```diff
+> made some changes to getcwd
+> 
+> tweaked the getcwd syscall.
+> ```
+
+`imperative-subject` (minor): The subject `made some changes to getcwd` is vague, not imperative, and does not wrap the identifier `getcwd` in backticks.
+
+**Fix.** Use an imperative, descriptive subject such as: Document `sys_getcwd`.
+
+### `kernel/src/syscall/getcwd.rs` line 8
+
+> ```diff
+> +// Writes the current working directory path to the user buffer.
+>  pub fn sys_getcwd(buf: Vaddr, len: usize, ctx: {prompt}Context) -> Result<SyscallReturn> {
+> ```
+
+`explain-why` (nit): The new comment `Writes the current working directory path to the user buffer.` only restates what `sys_getcwd` does, so it adds maintenance noise without explaining any non-obvious intent.
+
+**Fix.** Remove the comment, or replace it with a `///` doc comment only if there is API behavior worth documenting beyond the function name.
+warning: Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.
+codex
+1 1
+tokens used
+3,962
+0008-noncompliant-commit-message   recall 1/1 [fan-out]
+----
+reviews kept for inspection in: /tmp/tmp.pGdlBdbfg6  (per problem: review.md + expected-defects.txt)
+recall: 1/1 (100%, gate >=100%) across 1 problems; per-persona-context: 0 combined, 1 fan-out; precision: 0/0 clean; harness errors: 0
