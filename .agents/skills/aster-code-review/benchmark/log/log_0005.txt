@@ -1,0 +1,1998 @@
+OK: 13 problems (10 diff, 3 files), 24 defects (0 negative), problem_ids unique (numeric ids too)
+WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp" (codex_home: AbsolutePathBuf("/tmp/tmp.CuQaWTx4qg"))
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /tmp/tmp.MkHYPXYeSV/wt1
+model: gpt-5.5
+provider: OpenAI
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR] (network access enabled)
+reasoning effort: high
+reasoning summaries: none
+session id: 019fda4d-7a50-7072-b89d-c8d15e3e982d
+--------
+user
+Use the aster-code-review skill with these arguments: diff 197d53c0ab1edbf8545d2ab827a930d66a1ab528 --per-persona-context=yes /tmp/tmp.MkHYPXYeSV/wt1.on.md --overwrite. Review this working tree.
+warning: Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.
+codex
+I’ll use the `aster-code-review` skill and read its instructions first, then run the requested diff review against the current working tree.
+exec
+/bin/bash -lc "sed -n '1,240p' .agents/skills/aster-code-review/SKILL.md" in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+---
+name: aster-code-review
+description: Review code against Asterinas's persona-keyed coding guidelines and write a Markdown review file. Use when asked to review a Git change (diff mode) or a set of target files (files mode) for defects, or inside a write-test-review loop.
+---
+
+# aster-code-review
+
+Review code against Asterinas's coding guidelines
+— the persona-keyed pages under `book/src/to-contribute/coding-guidelines/`
+— and write one Markdown review file.
+The review is **recall-first**: miss as few real defects as possible.
+It makes both objective calls (undeniable bugs) and subjective calls (guideline violations, each grounded in a cited rule).
+
+There are two review modes, both **anchored at the current checkout (HEAD)**:
+
+- **`diff <base>`** — a Git change:
+  the **commit series** the branch adds over its merge-base with `<base>`
+  — each commit's message *and* its diff,
+  so the review covers per-commit intent and commit hygiene, not just the net change.
+  (Commit first; uncommitted edits are not reviewed in diff mode.)
+- **`files <path[:lines] ...>`**
+  — target code: the working-tree contents of the named files,
+  optionally narrowed to line ranges.
+
+To review at a specific commit, check it out first (it becomes HEAD).
+
+This skill is agent-agnostic (Claude Code and Codex).
+Only step 3's spawn primitive differs between agents;
+everything else is identical.
+
+## Interface
+
+However the skill is triggered,
+it receives ONE raw argument string that begins with a mode word:
+
+```
+diff   <base>              <output> [--overwrite] [--per-persona-context=auto|yes|no]
+files  <path[:lines] ...>  <output> [--overwrite] [--per-persona-context=auto|yes|no]
+```
+
+- `<base>` (diff) — **required**,
+  any ref or SHA;
+  reviews the commit series `merge-base(<base>, HEAD)..HEAD` (each commit's message + diff).
+- `<path[:lines] ...>` (files) — **required**, one or more targets in the working tree.
+  A target is a path, optionally `path:N-M` or `path:N-M,K-L` (1-based, inclusive);
+  repeat a path to add ranges.
+  Wrap a path in double quotes to allow spaces or colons (`"a: b.rs":10-20`).
+- `<output>` — **required, last positional** (`cp src... dest` style);
+  refuse to overwrite unless `--overwrite`.
+- `--overwrite` — replace the output file if it already exists.
+- `--per-persona-context` — `yes`: fan out one isolated agent per persona (best recall).
+  `no`: one combined agent reviews all personas (cheaper, lower recall).
+  `auto` (default) currently resolves to `yes`;
+  it will become a benchmark-driven heuristic.
+  Controls step 3 only.
+
+**Do not pre-split the argument string yourself.**
+Pass it verbatim, as a single quoted argument,
+to `resolve_target.sh` (step 1)
+— the script self-tokenizes (whitespace-split except inside double quotes),
+which keeps the parse deterministic and identical across agents.
+
+## Pipeline
+
+Run these steps in order.
+Steps 1 and 5 are deterministic scripts;
+steps 6–8 use the model.
+
+The helper scripts live in the skill's own `scripts/` directory,
+at `.agents/skills/aster-code-review/scripts/` inside the repository under review.
+**Invoke every script by its absolute path**
+— the working directory is the code under review (the repo root), *not* the skill directory,
+so a bare `scripts/…` is not found (notably on Codex, which runs commands from the repo root; do not `cd` into the skill dir either — `resolve_target.sh` needs the repo as its cwd).
+Shells do not persist between commands,
+so **set `SKILL` at the start of each command that uses it** (or inline the `$(git rev-parse …)`):
+
+```sh
+SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/resolve_target.sh" '<raw args>'
+```
+
+The steps below write `$SKILL/scripts/…` as shorthand for that absolute path.
+
+1. **Resolve the target.**
+   `"$SKILL/scripts/resolve_target.sh" '<raw args>'` prints the canonical review input
+   — the commit series (each commit's message + diff) in `diff` mode,
+   annotated file excerpts in `files` mode;
+   save it to a temp file.
+   Run it again with `--meta` first (`"$SKILL/scripts/resolve_target.sh" --meta '<raw args>'`) to get
+   `mode=`, `base=`/`files=`, `head=`, `branch=`, `output=`, `overwrite=`, `per_persona_context=`;
+   add `date=` (today) and an optional `title=` to make the meta file.
+   Pass the raw argument string as a single quoted argument
+   so the script's tokenizer sees it intact.
+2. **Activate personas.**
+   Pick which of the five personas run,
+   from the reviewed paths — changed paths in `diff` mode,
+   named paths in `files` mode (see *Activation*).
+3. **Fan out.**
+   Spawn the persona passes (see *Spawning*).
+   With `per_persona_context` = `yes` or `auto` (the default),
+   run **one isolated PASS per activated persona** — best recall.
+   With `no`, run **one combined PASS** over all activated personas in a single context
+   — cheaper, lower recall.
+   Build each pass's prompt deterministically with `"$SKILL/scripts/build_pass_prompt.sh" <input-file> <persona>...`
+   — one persona for fan-out, all activated personas for combined
+   — and spawn the sub-agent with **that exact text**.
+   Each pass returns a JSON array of comments;
+   file each under its persona's `<fragdir>/<persona>.json` (the comment's `persona` field says which),
+   so step 5 is unchanged.
+4. **Collect** the per-persona JSON fragments.
+5. **Assemble.**
+   `"$SKILL/scripts/assemble_review.sh" [--overwrite] <meta> <fragdir> <output>` performs the deterministic merge (group by persona in fixed order, sort by file→line, drop exact duplicates *within a persona*, write frontmatter, leave a `<!-- SUMMARY -->` placeholder).
+   Pass `--overwrite` only if the user gave it;
+   otherwise the script refuses to clobber an existing `<output>`.
+6. **Verify** (see *Verification*).
+7. **Consolidate** (see *Consolidation*).
+8. **Summary.**
+   Replace `<!-- SUMMARY -->` with a constructive summary over the final comments:
+   what the code does well, the top issues ranked by severity,
+   any structural recommendations.
+
+## Activation
+
+A persona runs unless the reviewed paths *provably* contain nothing in its remit (reviewed paths = changed paths in `diff` mode, named paths in `files` mode):
+
+- **maintainability, development, security** — any reviewed code.
+- **hardware** — a reviewed path is assembly (`*.S`, `*.asm`),
+  an architecture directory (`.../arch/...`), or contains `asm!` / `global_asm!`.
+- **documentation** — a reviewed path is `book/`, any `*.md`,
+  syscall-coverage files (`*.scml`), or a user-facing API surface (a syscall or kernel parameter).
+
+Activation is path-based and deterministic;
+do not use a model to triage (a wrongly-skipped persona is a silent recall hole).
+
+## Pass contract
+
+The shared reviewer contract
+— the review methodology and the JSON comment schema every pass must follow
+— lives in [`scripts/pass_contract.md`](scripts/pass_contract.md),
+inlined as the **stable head** of every pass prompt by `build_pass_prompt.sh` (step 3).
+Do not paraphrase it into the prompt yourself:
+retyping it breaks the byte-identical prefix the prompt cache relies on (see [`execution_model.md`](spec/execution_model.md)).
+A pass reads only the persona block(s) it is given (selective exposure),
+reviews the **REVIEW INPUT** at the foot of the prompt,
+and returns a JSON array of comments per that schema.
+
+## Spawning a pass
+
+Build every pass prompt with `"$SKILL/scripts/build_pass_prompt.sh" <input-file> <persona>...`
+and spawn the sub-agent with its **exact** output
+— only a script keeps the prompt's stable head (contract + guideline) byte-identical across passes and reviews,
+which is what lets the prompt cache reuse it (see [`execution_model.md`](spec/execution_model.md)).
+
+**Default (`per_persona_context` = `yes`/`auto`)**
+— one pass per activated persona,
+each in a CLEAN context with only its own persona block (selective exposure):
+
+- **Claude Code** — spawn a Task sub-agent per persona.
+- **Codex** — run `codex exec "<build_pass_prompt.sh output>"` per persona
+  (pass the built PROMPT TEXT as the argument).
+
+**Never spawn a pass by re-running `aster_code_review.sh` / `run_agent.sh`,
+nor by re-issuing the skill's own arguments** (e.g. `codex exec … diff <base> <out>`).
+A pass is a *reviewer* invocation whose input is the `build_pass_prompt.sh` text
+— not another run of this skill.
+Re-entering the launcher spawns another orchestrator that spawns another … , an infinite fork bomb;
+the launcher now refuses it (`ACR_AGENT_RUNNING`).
+
+Passes are independent;
+order does not matter.
+Collect each pass's JSON.
+
+**Combined (`per_persona_context` = `no`)**
+— build ONE prompt with all activated personas (`"$SKILL/scripts/build_pass_prompt.sh" <input> <p1> <p2> ...`)
+and run a single pass;
+it reviews through every lens at once and tags each comment with its `persona`.
+The input and spawn overhead are paid once,
+so it is cheaper
+— but a larger shared context dilutes focus,
+so it finds fewer defects.
+The default stays fan-out:
+recall comes first,
+and `no` is an explicit, opt-in concession.
+
+## Verification (step 6)
+
+For each comment, isolate the key premise it rests on
+— especially an external-system fact (Linux/POSIX behaviour, the System V ABI, Rust semantics).
+Try to **refute** it:
+re-read the cited code and consult an authoritative source.
+Assign a verdict:
+
+- **confirmed** — keep the comment unchanged.
+- **uncertain** — keep it, but prefix `problem` with `(unverified) `.
+- **refuted** — remove the comment,
+  and append it to a `## Retracted by verification` list at the foot of the file with a one-line reason.
+
+Remove **only** on confident refutation;
+an unsure check is `uncertain`, not `refuted`.
+This is the only step that may remove a comment, and only false positives.
+
+## Consolidation (step 7)
+
+Find clusters of comments that share one root cause or one fix
+(e.g. several manual lock/unlock pairs that all want RAII).
+For each cluster, write a single unified fix
+and repoint each member's `**Fix.**` at it ("Shared with the other `raii` comments: …").
+**Never remove a comment**
+— every symptom stays at its own location.
+
+## Output format
+
+The assembled file is:
+frontmatter (`date`, `mode`, `base` or `files`, `head`, `branch`, optional `title`),
+a `# Summary`,
+then a `## <section>` per persona in the order **Maintainability, Correctness, Security, Hardware, Documentation** (Correctness is the Development persona's section).
+Each comment is a `### \`file\` line N` subsection:
+a quoted ` ```diff ` snippet,
+then a prose line `` `<grounding>` (<severity>): <problem> ``,
+then a `**Fix.**` paragraph.
+Do not restructure what the script emits;
+only fill the summary and apply the verify/consolidate edits.
+
+  → Resolve review metadata and input
+  • Determine active personas
+  • Run persona review passes
+  • Assemble, verify, consolidate, summarize review file
+codex
+I’m resolving the requested target exactly as the skill defines it. That gives the commit series over the merge base, plus metadata for the review file.
+exec
+/bin/bash -lc 'SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/resolve_target.sh" --meta '"'diff 197d53c0ab1edbf8545d2ab827a930d66a1ab528 --per-persona-context=yes /tmp/tmp.MkHYPXYeSV/wt1.on.md --overwrite'" in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+mode=diff
+base=197d53c0a
+head=32572e22d
+branch=HEAD
+output=/tmp/tmp.MkHYPXYeSV/wt1.on.md
+overwrite=1
+per_persona_context=yes
+
+codex
+The review target resolves to diff mode from base `197d53c0a` to head `32572e22d`, with per-persona fan-out enabled and overwrite allowed. Next I’m generating the canonical review input and checking which files/personas are in scope.
+exec
+/bin/bash -lc 'SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/resolve_target.sh" '"'diff 197d53c0ab1edbf8545d2ab827a930d66a1ab528 --per-persona-context=yes /tmp/tmp.MkHYPXYeSV/wt1.on.md --overwrite' > /tmp/tmp.MkHYPXYeSV/wt1.acr.input && wc -l /tmp/tmp.MkHYPXYeSV/wt1.acr.input" in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+105 /tmp/tmp.MkHYPXYeSV/wt1.acr.input
+
+codex
+The canonical input is small, so I’m reading it directly to understand the changed surface and activate the required guideline personas.
+exec
+/bin/bash -lc "sed -n '1,220p' /tmp/tmp.MkHYPXYeSV/wt1.acr.input" in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+
+===== commit 32572e22d =====
+
+[commit message]
+Implement flush for virtio-blk
+
+[changes]
+
+
+diff --git a/kernel/comps/block/src/impl_block_device.rs b/kernel/comps/block/src/impl_block_device.rs
+index 64d6bd299..c8e7bf56a 100644
+--- a/kernel/comps/block/src/impl_block_device.rs
++++ b/kernel/comps/block/src/impl_block_device.rs
+@@ -83,6 +83,18 @@ impl dyn BlockDevice {
+         let bio = create_bio_from_frame(BioType::Write, bid, frame);
+         bio.submit(self)
+     }
++
++    /// Issues a sync request
++    pub fn sync(&self) -> Result<BioStatus, BioEnqueueError> {
++        let bio = Bio::new(
++            BioType::Flush,
++            Sid::from(Bid::from_offset(0)),
++            vec![],
++            Some(general_complete_fn),
++        );
++        let status = bio.submit_and_wait(self)?;
++        Ok(status)
++    }
+ }
+ 
+ impl VmIo for dyn BlockDevice {
+diff --git a/kernel/comps/virtio/src/device/block/device.rs b/kernel/comps/virtio/src/device/block/device.rs
+index fefd2d4a0..b0116a6cf 100644
+--- a/kernel/comps/virtio/src/device/block/device.rs
++++ b/kernel/comps/virtio/src/device/block/device.rs
+@@ -63,7 +63,8 @@ impl BlockDevice {
+         match request.type_() {
+             BioType::Read => self.device.read(request),
+             BioType::Write => self.device.write(request),
+-            BioType::Flush | BioType::Discard => todo!(),
++            BioType::Flush => self.device.flush(request),
++            BioType::Discard => todo!(),
+         }
+     }
+ 
+@@ -406,6 +407,58 @@ impl DeviceInner {
+         }
+     }
+ 
++    /// Flushes any cached data from the guest to the persistent storage on the host.
++    /// This will be ignored if the device doesn't support the `VIRTIO_BLK_F_FLUSH` feature.
++    fn flush(&self, bio_request: BioRequest) {
++        if self.transport.lock().device_features() & BlockFeatures::FLUSH.bits() == 0 {
++            bio_request.bios().for_each(|bio| {
++                bio.complete(BioStatus::Complete);
++            });
++            return;
++        }
++
++        let id = self.id_allocator.disable_irq().lock().alloc().unwrap();
++        let req_slice = {
++            let req_slice = DmaStreamSlice::new(&self.block_requests, id * REQ_SIZE, REQ_SIZE);
++            let req = BlockReq {
++                type_: ReqType::Flush as _,
++                reserved: 0,
++                sector: bio_request.sid_range().start.to_raw(),
++            };
++            req_slice.write_val(0, &req).unwrap();
++            req_slice.sync().unwrap();
++            req_slice
++        };
++
++        let resp_slice = {
++            let resp_slice = DmaStreamSlice::new(&self.block_responses, id * RESP_SIZE, RESP_SIZE);
++            resp_slice.write_val(0, &BlockResp::default()).unwrap();
++            resp_slice
++        };
++
++        let num_used_descs = 1;
++        loop {
++            let mut queue = self.queue.disable_irq().lock();
++            if num_used_descs > queue.available_desc() {
++                continue;
++            }
++            let token = queue
++                .add_dma_buf(&[&req_slice], &[&resp_slice])
++                .expect("add queue failed");
++            if queue.should_notify() {
++                queue.notify();
++            }
++
++            // Records the submitted request
++            let submitted_request = SubmittedRequest::new(id as u16, bio_request, Vec::new());
++            self.submitted_requests
++                .disable_irq()
++                .lock()
++                .insert(token, submitted_request);
++            return;
++        }
++    }
++
+     /// Performs DMA mapping for the segments in bio request.
+     fn dma_stream_map(bio_request: &BioRequest) -> Vec<(DmaStream, usize, usize)> {
+         let dma_direction = match bio_request.type_() {
+
+codex
+The changed paths are Rust kernel/block code, so the deterministic activation rules include maintainability, correctness/development, and security. There are no reviewed architecture/assembly paths and no docs/syscall/kernel-parameter files in this diff.
+  ✓ Resolve review metadata and input
+  ✓ Determine active personas
+  → Run persona review passes
+  • Assemble, verify, consolidate, summarize review file
+codex
+I’m building the reviewer prompts through the skill script and will run one isolated pass per active persona, as requested by `--per-persona-context=yes`.
+exec
+/bin/bash -lc 'SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/build_pass_prompt.sh" /tmp/tmp.MkHYPXYeSV/wt1.acr.input maintainability > /tmp/tmp.MkHYPXYeSV/wt1.acr.maintainability.prompt && wc -l /tmp/tmp.MkHYPXYeSV/wt1.acr.maintainability.prompt' in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+1690 /tmp/tmp.MkHYPXYeSV/wt1.acr.maintainability.prompt
+
+codex
+The first pass prompt is generated. I’m checking the available execution path for spawned Codex reviewer passes before launching all of them.
+exec
+/bin/bash -lc 'command -v codex && codex --version' in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+/root/.local/bin/codex
+WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp" (codex_home: AbsolutePathBuf("/tmp/tmp.CuQaWTx4qg"))
+codex-cli 0.142.5
+
+codex
+`codex exec` is available in this workspace, so I can use the skill’s intended Codex spawning path. I’m checking its invocation shape so the pass prompt is passed as prompt text, not as another skill invocation.
+exec
+/bin/bash -lc "codex exec --help | sed -n '1,180p'" in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp" (codex_home: AbsolutePathBuf("/tmp/tmp.CuQaWTx4qg"))
+Run Codex non-interactively
+
+Usage: codex exec [OPTIONS] [PROMPT]
+       codex exec [OPTIONS] <COMMAND> [ARGS]
+
+Commands:
+  resume  Resume a previous session by id or pick the most recent with --last
+  review  Run a code review against the current repository
+  help    Print this message or the help of the given subcommand(s)
+
+Arguments:
+  [PROMPT]
+          Initial instructions for the agent. If not provided as an argument (or if `-` is used),
+          instructions are read from stdin. If stdin is piped and a prompt is also provided, stdin
+          is appended as a `<stdin>` block
+
+Options:
+  -c, --config <key=value>
+          Override a configuration value that would otherwise be loaded from `~/.codex/config.toml`.
+          Use a dotted path (`foo.bar.baz`) to override nested values. The `value` portion is parsed
+          as TOML. If it fails to parse as TOML, the raw string is used as a literal.
+          
+          Examples: - `-c model="o3"` - `-c 'sandbox_permissions=["disk-full-read-access"]'` - `-c
+          shell_environment_policy.inherit=all`
+
+      --enable <FEATURE>
+          Enable a feature (repeatable). Equivalent to `-c features.<name>=true`
+
+      --disable <FEATURE>
+          Disable a feature (repeatable). Equivalent to `-c features.<name>=false`
+
+      --strict-config
+          Error out when config.toml contains fields that are not recognized by this version of
+          Codex
+
+  -i, --image <FILE>...
+          Optional image(s) to attach to the initial prompt
+
+  -m, --model <MODEL>
+          Model the agent should use
+
+      --oss
+          Use open-source provider
+
+      --local-provider <OSS_PROVIDER>
+          Specify which local provider to use (lmstudio or ollama). If not specified with --oss,
+          will use config default or show selection
+
+  -p, --profile <CONFIG_PROFILE_V2>
+          Layer $CODEX_HOME/<name>.config.toml on top of the base user config
+
+  -s, --sandbox <SANDBOX_MODE>
+          Select the sandbox policy to use when executing model-generated shell commands
+          
+          [possible values: read-only, workspace-write, danger-full-access]
+
+      --dangerously-bypass-approvals-and-sandbox
+          Skip all confirmation prompts and execute commands without sandboxing. EXTREMELY
+          DANGEROUS. Intended solely for running in environments that are externally sandboxed
+
+      --dangerously-bypass-hook-trust
+          Run enabled hooks without requiring persisted hook trust for this invocation. DANGEROUS.
+          Intended only for automation that already vets hook sources
+
+  -C, --cd <DIR>
+          Tell the agent to use the specified directory as its working root
+
+      --add-dir <DIR>
+          Additional directories that should be writable alongside the primary workspace
+
+      --skip-git-repo-check
+          Allow running Codex outside a Git repository
+
+      --ephemeral
+          Run without persisting session files to disk
+
+      --ignore-user-config
+          Do not load `$CODEX_HOME/config.toml`; auth still uses `CODEX_HOME`
+
+      --ignore-rules
+          Do not load user or project execpolicy `.rules` files
+
+      --output-schema <FILE>
+          Path to a JSON Schema file describing the model's final response shape
+
+      --color <COLOR>
+          Specifies color settings for use in the output
+          
+          [default: auto]
+          [possible values: always, never, auto]
+
+      --json
+          Print events to stdout as JSONL
+
+  -o, --output-last-message <FILE>
+          Specifies file where the last message from the agent should be written
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+codex
+I’m creating the remaining two prompts now. After that, each reviewer pass will write only its final JSON array to a fragment file for deterministic assembly.
+exec
+/bin/bash -lc 'SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/build_pass_prompt.sh" /tmp/tmp.MkHYPXYeSV/wt1.acr.input development > /tmp/tmp.MkHYPXYeSV/wt1.acr.development.prompt && wc -l /tmp/tmp.MkHYPXYeSV/wt1.acr.development.prompt' in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+871 /tmp/tmp.MkHYPXYeSV/wt1.acr.development.prompt
+
+exec
+/bin/bash -lc 'SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/build_pass_prompt.sh" /tmp/tmp.MkHYPXYeSV/wt1.acr.input security > /tmp/tmp.MkHYPXYeSV/wt1.acr.security.prompt && wc -l /tmp/tmp.MkHYPXYeSV/wt1.acr.security.prompt' in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+406 /tmp/tmp.MkHYPXYeSV/wt1.acr.security.prompt
+
+codex
+The three pass prompts are ready. I’m launching the isolated Codex reviewer passes in read-only mode and capturing each final response separately for normalization into JSON fragments.
+exec
+/bin/bash -lc 'mkdir -p /tmp/tmp.MkHYPXYeSV/wt1.acr.frags; codex exec -C /tmp/tmp.MkHYPXYeSV/wt1 -s read-only --ephemeral --output-last-message /tmp/tmp.MkHYPXYeSV/wt1.acr.frags/maintainability.raw - < /tmp/tmp.MkHYPXYeSV/wt1.acr.maintainability.prompt > /tmp/tmp.MkHYPXYeSV/wt1.acr.frags/maintainability.log 2>&1' in /tmp/tmp.MkHYPXYeSV/wt1
+exec
+/bin/bash -lc 'codex exec -C /tmp/tmp.MkHYPXYeSV/wt1 -s read-only --ephemeral --output-last-message /tmp/tmp.MkHYPXYeSV/wt1.acr.frags/development.raw - < /tmp/tmp.MkHYPXYeSV/wt1.acr.development.prompt > /tmp/tmp.MkHYPXYeSV/wt1.acr.frags/development.log 2>&1' in /tmp/tmp.MkHYPXYeSV/wt1
+codex
+Maintainability and correctness/development passes are running. I’m starting the security pass as well so the fan-out completes in parallel.
+exec
+/bin/bash -lc 'codex exec -C /tmp/tmp.MkHYPXYeSV/wt1 -s read-only --ephemeral --output-last-message /tmp/tmp.MkHYPXYeSV/wt1.acr.frags/security.raw - < /tmp/tmp.MkHYPXYeSV/wt1.acr.security.prompt > /tmp/tmp.MkHYPXYeSV/wt1.acr.frags/security.log 2>&1' in /tmp/tmp.MkHYPXYeSV/wt1
+codex
+All three reviewer passes are now running. I’ll poll them until they finish, then inspect the raw outputs before assembling the final review.
+codex
+The maintainability pass is still running after the first poll. I’m checking the other passes while it continues.
+ succeeded in 113078ms:
+codex
+The reviewer passes are still active. Since these are independent model runs, I’m waiting for completion rather than interrupting and risking partial fragments.
+codex
+The maintainability pass has finished. I’m waiting on the correctness and security passes now.
+ succeeded in 129576ms:
+codex
+The correctness/development pass is still running; security may already be close behind, so I’m polling it next.
+codex
+Security is complete. I’m giving the correctness/development pass one more poll and then I’ll normalize the returned fragments.
+ succeeded in 201721ms:
+codex
+All reviewer passes have finished. I’m reading the final messages now to verify they are valid JSON arrays and to see what findings need confirmation.
+exec
+/bin/bash -lc "sed -n '1,240p' /tmp/tmp.MkHYPXYeSV/wt1.acr.frags/maintainability.raw" in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+[
+  {
+    "file": "kernel/comps/virtio/src/device/block/device.rs",
+    "line": 420,
+    "persona": "maintainability",
+    "grounding": "dry",
+    "severity": "minor",
+    "problem": "`flush()` adds a third copy of the same request-allocation, response-buffer setup, virtqueue wait/submit/notify, and `submitted_requests` insertion flow already present in `read()` and `write()`. Any later change to the submission protocol now has to be made in three places.",
+    "fix": "Extract the shared submission mechanics into a helper that takes the request type and input/output DMA slices, then have `read()`, `write()`, and `flush()` call that helper.",
+    "diff": "        let id = self.id_allocator.disable_irq().lock().alloc().unwrap();\n        let req_slice = {\n            let req_slice = DmaStreamSlice::new(&self.block_requests, id * REQ_SIZE, REQ_SIZE);\n            let req = BlockReq {\n                type_: ReqType::Flush as _,\n                reserved: 0,\n                sector: bio_request.sid_range().start.to_raw(),\n            };\n...\n        loop {\n            let mut queue = self.queue.disable_irq().lock();\n            if num_used_descs > queue.available_desc() {\n                continue;\n            }\n            let token = queue\n                .add_dma_buf(&[&req_slice], &[&resp_slice])\n                .expect(\"add queue failed\");"
+  },
+  {
+    "file": "kernel/comps/block/src/impl_block_device.rs",
+    "line": 87,
+    "persona": "maintainability",
+    "grounding": "comment-punctuation",
+    "severity": "nit",
+    "problem": "The doc comment `Issues a sync request` is a complete sentence but lacks terminal punctuation.",
+    "fix": "End the doc sentence with punctuation, for example: `/// Issues a sync request.`",
+    "diff": "+    /// Issues a sync request\n+    pub fn sync(&self) -> Result<BioStatus, BioEnqueueError> {"
+  },
+  {
+    "file": "kernel/comps/virtio/src/device/block/device.rs",
+    "line": 452,
+    "persona": "maintainability",
+    "grounding": "comment-punctuation",
+    "severity": "nit",
+    "problem": "The comment `Records the submitted request` is a complete sentence but lacks terminal punctuation.",
+    "fix": "End the sentence with punctuation, or drop the comment if the following `SubmittedRequest::new(...)` and `insert(...)` calls are clear enough without it.",
+    "diff": "+            // Records the submitted request\n+            let submitted_request = SubmittedRequest::new(id as u16, bio_request, Vec::new());"
+  }
+]
+codex
+Maintainability found one duplication concern and two punctuation nits. I’m checking correctness and security next, then I’ll verify the substantive claims against the surrounding code.
+exec
+/bin/bash -lc "sed -n '1,260p' /tmp/tmp.MkHYPXYeSV/wt1.acr.frags/development.raw" in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+[
+  {
+    "file": "kernel/comps/virtio/src/device/block/device.rs",
+    "line": 413,
+    "persona": "development",
+    "grounding": "no-io-under-spinlock",
+    "severity": "major",
+    "problem": "`self.transport.lock().device_features()` holds the `transport` spinlock while `device_features()` performs transport register I/O; the MMIO and PCI implementations write the feature selector and read feature registers under this guard.",
+    "fix": "Cache the negotiated block features, or at least `supports_flush`, during `DeviceInner::init()` before `transport` is stored behind `SpinLock`, then check that cached value in `flush()` instead of doing transport I/O under the spinlock.",
+    "diff": "fn flush(&self, bio_request: BioRequest) {\n    if self.transport.lock().device_features() & BlockFeatures::FLUSH.bits() == 0 {\n        bio_request.bios().for_each(|bio| {"
+  },
+  {
+    "file": "kernel/comps/virtio/src/device/block/device.rs",
+    "line": 415,
+    "persona": "development",
+    "grounding": "Incorrect status",
+    "severity": "major",
+    "problem": "When `VIRTIO_BLK_F_FLUSH` is absent, `flush()` completes the `Bio` with `BioStatus::Complete`, so `BlockDevice::sync()` reports success even though no cache flush was issued. The block layer already has `BioStatus::NotSupported` for this case.",
+    "fix": "Complete unsupported flush requests with `BioStatus::NotSupported` so synchronous callers receive that status and higher layers can convert it to an error.",
+    "diff": "if self.transport.lock().device_features() & BlockFeatures::FLUSH.bits() == 0 {\n    bio_request.bios().for_each(|bio| {\n        bio.complete(BioStatus::Complete);\n    });\n    return;\n}"
+  },
+  {
+    "file": "kernel/comps/virtio/src/device/block/device.rs",
+    "line": 439,
+    "persona": "development",
+    "grounding": "Miscounted resources",
+    "severity": "major",
+    "problem": "`flush()` checks for only `1` available descriptor, but `add_dma_buf(&[&req_slice], &[&resp_slice])` needs two descriptors. If exactly one descriptor is free, the pre-check passes and `add_dma_buf()` returns `QueueError::BufferTooSmall`, making `.expect(\"add queue failed\")` panic on normal queue pressure.",
+    "fix": "Count both the request and response descriptors before entering the queue path, for example `let num_used_descs = 2;`, matching the actual `add_dma_buf()` inputs and outputs.",
+    "diff": "let num_used_descs = 1;\nloop {\n    let mut queue = self.queue.disable_irq().lock();\n    if num_used_descs > queue.available_desc() {\n        continue;\n    }\n    let token = queue\n        .add_dma_buf(&[&req_slice], &[&resp_slice])\n        .expect(\"add queue failed\");"
+  }
+]
+exec
+/bin/bash -lc "sed -n '1,240p' /tmp/tmp.MkHYPXYeSV/wt1.acr.frags/security.raw" in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+[{"file":"kernel/comps/virtio/src/device/block/device.rs","line":413,"persona":"security","grounding":"validate-at-boundaries","severity":"major","problem":"`flush()` re-reads raw `device_features()` from the virtio device after feature negotiation and treats a missing `BlockFeatures::FLUSH` bit as successful completion. A hostile or faulty device can advertise `VIRTIO_BLK_F_FLUSH` during negotiation, clear that bit for this later MMIO/config read, and make `sync()`/`fsync()` return `BioStatus::Complete` without any `ReqType::Flush` being submitted.","fix":"Store the negotiated block features in trusted driver state during initialization and use that cached value in `flush()`. If `FLUSH` was not negotiated, propagate `BioStatus::NotSupported` or an I/O error instead of reporting `BioStatus::Complete` for a persistence request.","diff":"+    fn flush(&self, bio_request: BioRequest) {\n+        if self.transport.lock().device_features() & BlockFeatures::FLUSH.bits() == 0 {\n+            bio_request.bios().for_each(|bio| {\n+                bio.complete(BioStatus::Complete);\n+            });\n+            return;\n+        }"}]
+codex
+The substantive findings are about feature reads, unsupported status, and descriptor accounting. I’m verifying those against the local driver, queue, and BIO status definitions before assembling the final file.
+exec
+/bin/bash -lc 'rg -n "fn (read|write|flush)|num_used_descs|add_dma_buf|device_features|BlockFeatures|SubmittedRequest::new" kernel/comps/virtio/src/device/block/device.rs' in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+22:use super::{BlockFeatures, VirtioBlockConfig};
+73:        let feature = BlockFeatures::from_bits(features).unwrap();
+74:        let support_features = BlockFeatures::from_bits(features).unwrap();
+255:            .add_dma_buf(&[&req_slice], outputs.as_slice())
+288:    fn read(&self, bio_request: BioRequest) {
+321:        let num_used_descs = outputs.len() + 1;
+323:        if num_used_descs > Self::QUEUE_SIZE as usize {
+329:            if num_used_descs > queue.available_desc() {
+333:                .add_dma_buf(&[&req_slice], outputs.as_slice())
+340:            let submitted_request = SubmittedRequest::new(id as u16, bio_request, dma_streams);
+350:    fn write(&self, bio_request: BioRequest) {
+383:        let num_used_descs = inputs.len() + 1;
+385:        if num_used_descs > Self::QUEUE_SIZE as usize {
+390:            if num_used_descs > queue.available_desc() {
+394:                .add_dma_buf(inputs.as_slice(), &[&resp_slice])
+401:            let submitted_request = SubmittedRequest::new(id as u16, bio_request, dma_streams);
+412:    fn flush(&self, bio_request: BioRequest) {
+413:        if self.transport.lock().device_features() & BlockFeatures::FLUSH.bits() == 0 {
+439:        let num_used_descs = 1;
+442:            if num_used_descs > queue.available_desc() {
+446:                .add_dma_buf(&[&req_slice], &[&resp_slice])
+453:            let submitted_request = SubmittedRequest::new(id as u16, bio_request, Vec::new());
+
+exec
+/bin/bash -lc "sed -n '40,95p' kernel/comps/virtio/src/device/block/device.rs && sed -n '288,460p' kernel/comps/virtio/src/device/block/device.rs" in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+    /// Creates a new VirtIO-Block driver and registers it.
+    pub(crate) fn init(transport: Box<dyn VirtioTransport>) -> Result<(), VirtioDeviceError> {
+        let device = DeviceInner::init(transport)?;
+        let device_id = device.request_device_id();
+
+        let block_device = Arc::new(Self {
+            device,
+            // Each bio request includes an additional 1 request and 1 response descriptor,
+            // therefore this upper bound is set to (QUEUE_SIZE - 2).
+            queue: BioRequestSingleQueue::with_max_nr_segments_per_bio(
+                (DeviceInner::QUEUE_SIZE - 2) as usize,
+            ),
+        });
+
+        aster_block::register_device(device_id, block_device);
+        Ok(())
+    }
+
+    /// Dequeues a `BioRequest` from the software staging queue and
+    /// processes the request.
+    pub fn handle_requests(&self) {
+        let request = self.queue.dequeue();
+        info!("Handle Request: {:?}", request);
+        match request.type_() {
+            BioType::Read => self.device.read(request),
+            BioType::Write => self.device.write(request),
+            BioType::Flush => self.device.flush(request),
+            BioType::Discard => todo!(),
+        }
+    }
+
+    /// Negotiate features for the device specified bits 0~23
+    pub(crate) fn negotiate_features(features: u64) -> u64 {
+        let feature = BlockFeatures::from_bits(features).unwrap();
+        let support_features = BlockFeatures::from_bits(features).unwrap();
+        (feature & support_features).bits
+    }
+}
+
+impl aster_block::BlockDevice for BlockDevice {
+    fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+        self.queue.enqueue(bio)
+    }
+
+    fn metadata(&self) -> BlockDeviceMeta {
+        BlockDeviceMeta {
+            max_nr_segments_per_bio: self.queue.max_nr_segments_per_bio(),
+            nr_sectors: VirtioBlockConfig::read_capacity_sectors(&self.device.config).unwrap(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DeviceInner {
+    config: SafePtr<VirtioBlockConfig, IoMem>,
+    queue: SpinLock<VirtQueue>,
+    fn read(&self, bio_request: BioRequest) {
+        let dma_streams = Self::dma_stream_map(&bio_request);
+
+        let id = self.id_allocator.disable_irq().lock().alloc().unwrap();
+        let req_slice = {
+            let req_slice = DmaStreamSlice::new(&self.block_requests, id * REQ_SIZE, REQ_SIZE);
+            let req = BlockReq {
+                type_: ReqType::In as _,
+                reserved: 0,
+                sector: bio_request.sid_range().start.to_raw(),
+            };
+            req_slice.write_val(0, &req).unwrap();
+            req_slice.sync().unwrap();
+            req_slice
+        };
+
+        let resp_slice = {
+            let resp_slice = DmaStreamSlice::new(&self.block_responses, id * RESP_SIZE, RESP_SIZE);
+            resp_slice.write_val(0, &BlockResp::default()).unwrap();
+            resp_slice
+        };
+
+        let dma_slices: Vec<DmaStreamSlice> = dma_streams
+            .iter()
+            .map(|(stream, offset, len)| DmaStreamSlice::new(stream, *offset, *len))
+            .collect();
+        let outputs = {
+            let mut outputs: Vec<&DmaStreamSlice> = Vec::with_capacity(dma_streams.len() + 1);
+            outputs.extend(dma_slices.iter());
+            outputs.push(&resp_slice);
+            outputs
+        };
+
+        let num_used_descs = outputs.len() + 1;
+        // FIXME: Split the request if it is too big
+        if num_used_descs > Self::QUEUE_SIZE as usize {
+            panic!("The request size surpasses the queue size");
+        }
+
+        loop {
+            let mut queue = self.queue.disable_irq().lock();
+            if num_used_descs > queue.available_desc() {
+                continue;
+            }
+            let token = queue
+                .add_dma_buf(&[&req_slice], outputs.as_slice())
+                .expect("add queue failed");
+            if queue.should_notify() {
+                queue.notify();
+            }
+
+            // Records the submitted request
+            let submitted_request = SubmittedRequest::new(id as u16, bio_request, dma_streams);
+            self.submitted_requests
+                .disable_irq()
+                .lock()
+                .insert(token, submitted_request);
+            return;
+        }
+    }
+
+    /// Writes data to the device, this function is non-blocking.
+    fn write(&self, bio_request: BioRequest) {
+        let dma_streams = Self::dma_stream_map(&bio_request);
+
+        let id = self.id_allocator.disable_irq().lock().alloc().unwrap();
+        let req_slice = {
+            let req_slice = DmaStreamSlice::new(&self.block_requests, id * REQ_SIZE, REQ_SIZE);
+            let req = BlockReq {
+                type_: ReqType::Out as _,
+                reserved: 0,
+                sector: bio_request.sid_range().start.to_raw(),
+            };
+            req_slice.write_val(0, &req).unwrap();
+            req_slice.sync().unwrap();
+            req_slice
+        };
+
+        let resp_slice = {
+            let resp_slice = DmaStreamSlice::new(&self.block_responses, id * RESP_SIZE, RESP_SIZE);
+            resp_slice.write_val(0, &BlockResp::default()).unwrap();
+            resp_slice
+        };
+
+        let dma_slices: Vec<DmaStreamSlice> = dma_streams
+            .iter()
+            .map(|(stream, offset, len)| DmaStreamSlice::new(stream, *offset, *len))
+            .collect();
+        let inputs = {
+            let mut inputs: Vec<&DmaStreamSlice> = Vec::with_capacity(dma_streams.len() + 1);
+            inputs.push(&req_slice);
+            inputs.extend(dma_slices.iter());
+            inputs
+        };
+
+        let num_used_descs = inputs.len() + 1;
+        // FIXME: Split the request if it is too big
+        if num_used_descs > Self::QUEUE_SIZE as usize {
+            panic!("The request size surpasses the queue size");
+        }
+        loop {
+            let mut queue = self.queue.disable_irq().lock();
+            if num_used_descs > queue.available_desc() {
+                continue;
+            }
+            let token = queue
+                .add_dma_buf(inputs.as_slice(), &[&resp_slice])
+                .expect("add queue failed");
+            if queue.should_notify() {
+                queue.notify();
+            }
+
+            // Records the submitted request
+            let submitted_request = SubmittedRequest::new(id as u16, bio_request, dma_streams);
+            self.submitted_requests
+                .disable_irq()
+                .lock()
+                .insert(token, submitted_request);
+            return;
+        }
+    }
+
+    /// Flushes any cached data from the guest to the persistent storage on the host.
+    /// This will be ignored if the device doesn't support the `VIRTIO_BLK_F_FLUSH` feature.
+    fn flush(&self, bio_request: BioRequest) {
+        if self.transport.lock().device_features() & BlockFeatures::FLUSH.bits() == 0 {
+            bio_request.bios().for_each(|bio| {
+                bio.complete(BioStatus::Complete);
+            });
+            return;
+        }
+
+        let id = self.id_allocator.disable_irq().lock().alloc().unwrap();
+        let req_slice = {
+            let req_slice = DmaStreamSlice::new(&self.block_requests, id * REQ_SIZE, REQ_SIZE);
+            let req = BlockReq {
+                type_: ReqType::Flush as _,
+                reserved: 0,
+                sector: bio_request.sid_range().start.to_raw(),
+            };
+            req_slice.write_val(0, &req).unwrap();
+            req_slice.sync().unwrap();
+            req_slice
+        };
+
+        let resp_slice = {
+            let resp_slice = DmaStreamSlice::new(&self.block_responses, id * RESP_SIZE, RESP_SIZE);
+            resp_slice.write_val(0, &BlockResp::default()).unwrap();
+            resp_slice
+        };
+
+        let num_used_descs = 1;
+        loop {
+            let mut queue = self.queue.disable_irq().lock();
+            if num_used_descs > queue.available_desc() {
+                continue;
+            }
+            let token = queue
+                .add_dma_buf(&[&req_slice], &[&resp_slice])
+                .expect("add queue failed");
+            if queue.should_notify() {
+                queue.notify();
+            }
+
+            // Records the submitted request
+            let submitted_request = SubmittedRequest::new(id as u16, bio_request, Vec::new());
+            self.submitted_requests
+                .disable_irq()
+                .lock()
+                .insert(token, submitted_request);
+            return;
+        }
+    }
+
+exec
+/bin/bash -lc "sed -n '90,180p' kernel/comps/virtio/src/device/block/device.rs" in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+}
+
+#[derive(Debug)]
+struct DeviceInner {
+    config: SafePtr<VirtioBlockConfig, IoMem>,
+    queue: SpinLock<VirtQueue>,
+    transport: SpinLock<Box<dyn VirtioTransport>>,
+    block_requests: DmaStream,
+    block_responses: DmaStream,
+    id_allocator: SpinLock<IdAlloc>,
+    submitted_requests: SpinLock<BTreeMap<u16, SubmittedRequest>>,
+}
+
+impl DeviceInner {
+    const QUEUE_SIZE: u16 = 64;
+
+    /// Creates and inits the device.
+    pub fn init(mut transport: Box<dyn VirtioTransport>) -> Result<Arc<Self>, VirtioDeviceError> {
+        let config = VirtioBlockConfig::new(transport.as_mut());
+        assert_eq!(
+            VirtioBlockConfig::read_block_size(&config).unwrap(),
+            VirtioBlockConfig::sector_size(),
+            "currently not support customized device logical block size"
+        );
+        let num_queues = transport.num_queues();
+        if num_queues != 1 {
+            // FIXME: support Multi-Queue Block IO Queueing Mechanism
+            // (`BlkFeatures::MQ`) to accelerate multi-processor requests for
+            // block devices. When SMP is enabled on x86, the feature is on.
+            // We should also consider negotiating the feature in the future.
+            // return Err(VirtioDeviceError::QueuesAmountDoNotMatch(num_queues, 1));
+            log::warn!(
+                "Not supporting Multi-Queue Block IO Queueing Mechanism, only using the first queue"
+            );
+        }
+        let queue = VirtQueue::new(0, Self::QUEUE_SIZE, transport.as_mut())
+            .expect("create virtqueue failed");
+        let block_requests = {
+            let vm_segment = FrameAllocOptions::new(1).alloc_contiguous().unwrap();
+            DmaStream::map(vm_segment, DmaDirection::Bidirectional, false).unwrap()
+        };
+        assert!(Self::QUEUE_SIZE as usize * REQ_SIZE <= block_requests.nbytes());
+        let block_responses = {
+            let vm_segment = FrameAllocOptions::new(1).alloc_contiguous().unwrap();
+            DmaStream::map(vm_segment, DmaDirection::Bidirectional, false).unwrap()
+        };
+        assert!(Self::QUEUE_SIZE as usize * RESP_SIZE <= block_responses.nbytes());
+
+        let device = Arc::new(Self {
+            config,
+            queue: SpinLock::new(queue),
+            transport: SpinLock::new(transport),
+            block_requests,
+            block_responses,
+            id_allocator: SpinLock::new(IdAlloc::with_capacity(Self::QUEUE_SIZE as usize)),
+            submitted_requests: SpinLock::new(BTreeMap::new()),
+        });
+
+        let cloned_device = device.clone();
+        let handle_irq = move |_: &TrapFrame| {
+            cloned_device.handle_irq();
+        };
+
+        let cloned_device = device.clone();
+        let handle_config_change = move |_: &TrapFrame| {
+            cloned_device.handle_config_change();
+        };
+
+        {
+            let mut transport = device.transport.lock();
+            transport
+                .register_cfg_callback(Box::new(handle_config_change))
+                .unwrap();
+            transport
+                .register_queue_callback(0, Box::new(handle_irq), false)
+                .unwrap();
+            transport.finish_init();
+        }
+
+        Ok(device)
+    }
+
+    /// Handles the irq issued from the device
+    fn handle_irq(&self) {
+        info!("Virtio block device handle irq");
+        // When we enter the IRQs handling function,
+        // IRQs have already been disabled,
+        // so there is no need to call `disable_irq`.
+        loop {
+            // Pops the complete request
+            let complete_request = {
+
+codex
+The local code confirms the new `flush()` path mirrors the read/write submit path and hard-codes `num_used_descs = 1` despite passing one input and one output DMA buffer. I’m checking queue and BIO definitions now so verification is grounded in the actual APIs.
+exec
+/bin/bash -lc "rg -n \"pub enum BioStatus|enum BioStatus|struct Bio|submit_and_wait|fn add_dma_buf|available_desc|BufferTooSmall|device_features\\(\" kernel -S" in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+kernel/comps/block/src/request_queue.rs:19:pub struct BioRequestSingleQueue {
+kernel/comps/block/src/request_queue.rs:139:pub struct BioRequest {
+kernel/comps/block/src/bio.rs:22:pub struct Bio(Arc<BioInner>);
+kernel/comps/block/src/bio.rs:114:    pub fn submit_and_wait(
+kernel/comps/block/src/bio.rs:156:pub struct BioWaiter {
+kernel/comps/block/src/bio.rs:287:struct BioInner {
+kernel/comps/block/src/bio.rs:349:pub enum BioStatus {
+kernel/comps/block/src/bio.rs:368:pub struct BioSegment {
+kernel/comps/block/src/impl_block_device.rs:26:        let status = bio.submit_and_wait(self)?;
+kernel/comps/block/src/impl_block_device.rs:43:        let status = bio.submit_and_wait(self)?;
+kernel/comps/block/src/impl_block_device.rs:60:        let status = bio.submit_and_wait(self)?;
+kernel/comps/block/src/impl_block_device.rs:77:        let status = bio.submit_and_wait(self)?;
+kernel/comps/block/src/impl_block_device.rs:95:        let status = bio.submit_and_wait(self)?;
+kernel/comps/block/src/impl_block_device.rs:134:        let status = bio.submit_and_wait(self)?;
+kernel/comps/block/src/impl_block_device.rs:181:        let status = bio.submit_and_wait(self)?;
+kernel/comps/virtio/src/device/block/device.rs:329:            if num_used_descs > queue.available_desc() {
+kernel/comps/virtio/src/device/block/device.rs:390:            if num_used_descs > queue.available_desc() {
+kernel/comps/virtio/src/device/block/device.rs:413:        if self.transport.lock().device_features() & BlockFeatures::FLUSH.bits() == 0 {
+kernel/comps/virtio/src/device/block/device.rs:442:            if num_used_descs > queue.available_desc() {
+kernel/comps/virtio/src/device/network/device.rs:54:            transport.device_features(),
+kernel/comps/virtio/src/device/network/device.rs:210:        QueueError::BufferTooSmall => VirtioNetError::Busy,
+kernel/comps/virtio/src/device/network/device.rs:268:        self.send_queue.available_desc() >= 1
+kernel/comps/virtio/src/lib.rs:90:    let features = transport.device_features();
+kernel/comps/virtio/src/transport/mod.rs:30:    fn device_features(&self) -> u64;
+kernel/comps/virtio/src/transport/pci/device.rs:135:    fn device_features(&self) -> u64 {
+kernel/comps/virtio/src/queue.rs:26:    BufferTooSmall,
+kernel/comps/virtio/src/queue.rs:166:    pub fn add_dma_buf<T: DmaBuf>(
+kernel/comps/virtio/src/queue.rs:175:            return Err(QueueError::BufferTooSmall);
+kernel/comps/virtio/src/queue.rs:244:    pub fn available_desc(&self) -> usize {
+kernel/comps/virtio/src/transport/mmio/device.rs:204:    fn device_features(&self) -> u64 {
+
+exec
+/bin/bash -lc "sed -n '100,135p' kernel/comps/block/src/bio.rs && sed -n '349,365p' kernel/comps/block/src/bio.rs && sed -n '160,180p' kernel/comps/virtio/src/queue.rs && sed -n '240,248p' kernel/comps/virtio/src/queue.rs" in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+        }
+
+        Ok(BioWaiter {
+            bios: vec![self.0.clone()],
+        })
+    }
+
+    /// Submits self to the `block_device` and waits for the result synchronously.
+    ///
+    /// Returns the result status of the `Bio`.
+    ///
+    /// # Panics
+    ///
+    /// The caller must not submit a `Bio` more than once. Otherwise, a panic shall be triggered.
+    pub fn submit_and_wait(
+        &self,
+        block_device: &dyn BlockDevice,
+    ) -> Result<BioStatus, BioEnqueueError> {
+        let waiter = self.submit(block_device)?;
+        match waiter.wait() {
+            Some(status) => {
+                assert!(status == BioStatus::Complete);
+                Ok(status)
+            }
+            None => {
+                let status = self.status();
+                assert!(status != BioStatus::Complete);
+                Ok(status)
+            }
+        }
+    }
+}
+
+/// The error type returned when enqueueing the `Bio`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BioEnqueueError {
+pub enum BioStatus {
+    /// The initial status for a newly created `Bio`.
+    Init = 0,
+    /// After a `Bio` is submitted, its status will be changed to "Submit".
+    Submit = 1,
+    /// The I/O operation has been successfully completed.
+    Complete = 2,
+    /// The I/O operation is not supported.
+    NotSupported = 3,
+    /// Insufficient space is available to perform the I/O operation.
+    NoSpace = 4,
+    /// An error occurred while doing I/O.
+    IoError = 5,
+}
+
+/// `BioSegment` is a smallest memory unit in block I/O.
+///
+        })
+    }
+
+    /// Add dma buffers to the virtqueue, return a token.
+    ///
+    /// Ref: linux virtio_ring.c virtqueue_add
+    pub fn add_dma_buf<T: DmaBuf>(
+        &mut self,
+        inputs: &[&T],
+        outputs: &[&T],
+    ) -> Result<u16, QueueError> {
+        if inputs.is_empty() && outputs.is_empty() {
+            return Err(QueueError::InvalidArgs);
+        }
+        if inputs.len() + outputs.len() + self.num_used as usize > self.queue_size as usize {
+            return Err(QueueError::BufferTooSmall);
+        }
+
+        // allocate descriptors from free list
+        let head = self.free_head;
+        let mut last = self.free_head;
+        self.last_used_idx != field_ptr!(&self.used, UsedRing, idx).read_once().unwrap()
+    }
+
+    /// The number of free descriptors.
+    pub fn available_desc(&self) -> usize {
+        (self.queue_size - self.num_used) as usize
+    }
+
+    /// Recycle descriptors in the list specified by head.
+
+codex
+`BioStatus::NotSupported` and `submit_and_wait()` behavior are present locally, and `add_dma_buf()` counts `inputs.len() + outputs.len()` against the free descriptors. I’m verifying the transport feature read claim next.
+exec
+/bin/bash -lc "sed -n '24,36p' kernel/comps/virtio/src/transport/mod.rs && sed -n '128,145p' kernel/comps/virtio/src/transport/pci/device.rs && sed -n '198,212p' kernel/comps/virtio/src/transport/mmio/device.rs" in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+pub trait VirtioTransport: Sync + Send + Debug {
+    // ====================Device related APIs=======================
+
+    fn device_type(&self) -> VirtioDeviceType;
+
+    /// Get device features.
+    fn device_features(&self) -> u64;
+
+    /// Set driver features.
+    fn set_driver_features(&mut self, features: u64) -> Result<(), VirtioTransportError>;
+
+    /// Get device status.
+    fn device_status(&self) -> DeviceStatus;
+        let memory = self.device_cfg.memory_bar().as_ref().unwrap().io_mem();
+
+        let offset = self.device_cfg.offset() as usize;
+        let length = self.device_cfg.length() as usize;
+        memory.slice(offset..offset + length)
+    }
+
+    fn device_features(&self) -> u64 {
+        // select low
+        field_ptr!(&self.common_cfg, VirtioPciCommonCfg, device_feature_select)
+            .write_once(&0u32)
+            .unwrap();
+        let device_feature_low = field_ptr!(&self.common_cfg, VirtioPciCommonCfg, device_features)
+            .read_once()
+            .unwrap();
+        // select high
+        field_ptr!(&self.common_cfg, VirtioPciCommonCfg, device_feature_select)
+            .write_once(&1u32)
+
+    fn device_config_memory(&self) -> IoMem {
+        // offset: 0x100~0x200
+        self.common_device.io_mem().slice(0x100..0x200)
+    }
+
+    fn device_features(&self) -> u64 {
+        // select low
+        field_ptr!(&self.layout, VirtioMmioLayout, device_features_select)
+            .write_once(&0u32)
+            .unwrap();
+        let device_feature_low = field_ptr!(&self.layout, VirtioMmioLayout, device_features)
+            .read_once()
+            .unwrap();
+        // select high
+
+exec
+/bin/bash -lc "sed -n '145,165p' kernel/comps/virtio/src/transport/pci/device.rs && sed -n '212,232p' kernel/comps/virtio/src/transport/mmio/device.rs" in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+            .write_once(&1u32)
+            .unwrap();
+        let device_feature_high = field_ptr!(&self.common_cfg, VirtioPciCommonCfg, device_features)
+            .read_once()
+            .unwrap() as u64;
+        device_feature_high << 32 | device_feature_low as u64
+    }
+
+    fn set_driver_features(&mut self, features: u64) -> Result<(), VirtioTransportError> {
+        let low = features as u32;
+        let high = (features >> 32) as u32;
+        field_ptr!(&self.common_cfg, VirtioPciCommonCfg, driver_feature_select)
+            .write_once(&0u32)
+            .unwrap();
+        field_ptr!(&self.common_cfg, VirtioPciCommonCfg, driver_features)
+            .write_once(&low)
+            .unwrap();
+        field_ptr!(&self.common_cfg, VirtioPciCommonCfg, driver_feature_select)
+            .write_once(&1u32)
+            .unwrap();
+        field_ptr!(&self.common_cfg, VirtioPciCommonCfg, driver_features)
+        // select high
+        field_ptr!(&self.layout, VirtioMmioLayout, device_features_select)
+            .write_once(&1u32)
+            .unwrap();
+        let device_feature_high = field_ptr!(&self.layout, VirtioMmioLayout, device_features)
+            .read_once()
+            .unwrap() as u64;
+        device_feature_high << 32 | device_feature_low as u64
+    }
+
+    fn set_driver_features(&mut self, features: u64) -> Result<(), VirtioTransportError> {
+        let low = features as u32;
+        let high = (features >> 32) as u32;
+        field_ptr!(&self.layout, VirtioMmioLayout, driver_features_select)
+            .write_once(&0u32)
+            .unwrap();
+        field_ptr!(&self.layout, VirtioMmioLayout, driver_features)
+            .write_once(&low)
+            .unwrap();
+        field_ptr!(&self.layout, VirtioMmioLayout, driver_features_select)
+            .write_once(&1u32)
+
+codex
+The transport implementations do perform feature-select writes and feature-register reads inside `device_features()`, so the feature-read-under-spinlock finding is confirmed. I’m now preparing the JSON fragments and metadata for the assembler.
+exec
+/bin/bash -lc 'cp /tmp/tmp.MkHYPXYeSV/wt1.acr.frags/maintainability.raw /tmp/tmp.MkHYPXYeSV/wt1.acr.frags/maintainability.json
+cp /tmp/tmp.MkHYPXYeSV/wt1.acr.frags/development.raw /tmp/tmp.MkHYPXYeSV/wt1.acr.frags/development.json
+cp /tmp/tmp.MkHYPXYeSV/wt1.acr.frags/security.raw /tmp/tmp.MkHYPXYeSV/wt1.acr.frags/security.json
+python3 -m json.tool /tmp/tmp.MkHYPXYeSV/wt1.acr.frags/maintainability.json >/dev/null
+python3 -m json.tool /tmp/tmp.MkHYPXYeSV/wt1.acr.frags/development.json >/dev/null
+python3 -m json.tool /tmp/tmp.MkHYPXYeSV/wt1.acr.frags/security.json >/dev/null' in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+codex
+The fragment files are valid JSON. I’m writing the review metadata now and then using the skill assembler to generate the Markdown report at the requested path.
+exec
+/bin/bash -lc "printf '%s
+' 'date=2026-08-07' 'mode=diff' 'base=197d53c0a' 'head=32572e22d' 'branch=HEAD' 'output=/tmp/tmp.MkHYPXYeSV/wt1.on.md' 'overwrite=1' 'per_persona_context=yes' > /tmp/tmp.MkHYPXYeSV/wt1.acr.meta" in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+codex
+The metadata is ready. I’m assembling the review file and will then apply verification/consolidation edits plus the final summary placeholder replacement.
+exec
+/bin/bash -lc 'SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/assemble_review.sh" --overwrite /tmp/tmp.MkHYPXYeSV/wt1.acr.meta /tmp/tmp.MkHYPXYeSV/wt1.acr.frags /tmp/tmp.MkHYPXYeSV/wt1.on.md' in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+assemble: maintainability=3, development=3, security=1, hardware=0, documentation=0
+
+codex
+The assembler produced seven comments across the active personas. I’m reading the Markdown now to make the required post-assembly verification and consolidation edits.
+exec
+/bin/bash -lc "sed -n '1,260p' /tmp/tmp.MkHYPXYeSV/wt1.on.md" in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+---
+date: 2026-08-07
+mode: diff
+base: 197d53c0a
+head: 32572e22d
+branch: HEAD
+---
+
+# Summary
+
+<!-- SUMMARY -->
+
+## Maintainability
+
+### `kernel/comps/block/src/impl_block_device.rs` line 87
+
+> ```diff
+> +    /// Issues a sync request
+> +    pub fn sync(&self) -> Result<BioStatus, BioEnqueueError> {
+> ```
+
+`comment-punctuation` (nit): The doc comment `Issues a sync request` is a complete sentence but lacks terminal punctuation.
+
+**Fix.** End the doc sentence with punctuation, for example: `/// Issues a sync request.`
+
+### `kernel/comps/virtio/src/device/block/device.rs` line 420
+
+> ```diff
+>         let id = self.id_allocator.disable_irq().lock().alloc().unwrap();
+>         let req_slice = {
+>             let req_slice = DmaStreamSlice::new(&self.block_requests, id * REQ_SIZE, REQ_SIZE);
+>             let req = BlockReq {
+>                 type_: ReqType::Flush as _,
+>                 reserved: 0,
+>                 sector: bio_request.sid_range().start.to_raw(),
+>             };
+> ...
+>         loop {
+>             let mut queue = self.queue.disable_irq().lock();
+>             if num_used_descs > queue.available_desc() {
+>                 continue;
+>             }
+>             let token = queue
+>                 .add_dma_buf(&[&req_slice], &[&resp_slice])
+>                 .expect("add queue failed");
+> ```
+
+`dry` (minor): `flush()` adds a third copy of the same request-allocation, response-buffer setup, virtqueue wait/submit/notify, and `submitted_requests` insertion flow already present in `read()` and `write()`. Any later change to the submission protocol now has to be made in three places.
+
+**Fix.** Extract the shared submission mechanics into a helper that takes the request type and input/output DMA slices, then have `read()`, `write()`, and `flush()` call that helper.
+
+### `kernel/comps/virtio/src/device/block/device.rs` line 452
+
+> ```diff
+> +            // Records the submitted request
+> +            let submitted_request = SubmittedRequest::new(id as u16, bio_request, Vec::new());
+> ```
+
+`comment-punctuation` (nit): The comment `Records the submitted request` is a complete sentence but lacks terminal punctuation.
+
+**Fix.** End the sentence with punctuation, or drop the comment if the following `SubmittedRequest::new(...)` and `insert(...)` calls are clear enough without it.
+
+## Correctness
+
+### `kernel/comps/virtio/src/device/block/device.rs` line 413
+
+> ```diff
+> fn flush(&self, bio_request: BioRequest) {
+>     if self.transport.lock().device_features() & BlockFeatures::FLUSH.bits() == 0 {
+>         bio_request.bios().for_each(|bio| {
+> ```
+
+`no-io-under-spinlock` (major): `self.transport.lock().device_features()` holds the `transport` spinlock while `device_features()` performs transport register I/O; the MMIO and PCI implementations write the feature selector and read feature registers under this guard.
+
+**Fix.** Cache the negotiated block features, or at least `supports_flush`, during `DeviceInner::init()` before `transport` is stored behind `SpinLock`, then check that cached value in `flush()` instead of doing transport I/O under the spinlock.
+
+### `kernel/comps/virtio/src/device/block/device.rs` line 415
+
+> ```diff
+> if self.transport.lock().device_features() & BlockFeatures::FLUSH.bits() == 0 {
+>     bio_request.bios().for_each(|bio| {
+>         bio.complete(BioStatus::Complete);
+>     });
+>     return;
+> }
+> ```
+
+Incorrect status (major): When `VIRTIO_BLK_F_FLUSH` is absent, `flush()` completes the `Bio` with `BioStatus::Complete`, so `BlockDevice::sync()` reports success even though no cache flush was issued. The block layer already has `BioStatus::NotSupported` for this case.
+
+**Fix.** Complete unsupported flush requests with `BioStatus::NotSupported` so synchronous callers receive that status and higher layers can convert it to an error.
+
+### `kernel/comps/virtio/src/device/block/device.rs` line 439
+
+> ```diff
+> let num_used_descs = 1;
+> loop {
+>     let mut queue = self.queue.disable_irq().lock();
+>     if num_used_descs > queue.available_desc() {
+>         continue;
+>     }
+>     let token = queue
+>         .add_dma_buf(&[&req_slice], &[&resp_slice])
+>         .expect("add queue failed");
+> ```
+
+Miscounted resources (major): `flush()` checks for only `1` available descriptor, but `add_dma_buf(&[&req_slice], &[&resp_slice])` needs two descriptors. If exactly one descriptor is free, the pre-check passes and `add_dma_buf()` returns `QueueError::BufferTooSmall`, making `.expect("add queue failed")` panic on normal queue pressure.
+
+**Fix.** Count both the request and response descriptors before entering the queue path, for example `let num_used_descs = 2;`, matching the actual `add_dma_buf()` inputs and outputs.
+
+## Security
+
+### `kernel/comps/virtio/src/device/block/device.rs` line 413
+
+> ```diff
+> +    fn flush(&self, bio_request: BioRequest) {
+> +        if self.transport.lock().device_features() & BlockFeatures::FLUSH.bits() == 0 {
+> +            bio_request.bios().for_each(|bio| {
+> +                bio.complete(BioStatus::Complete);
+> +            });
+> +            return;
+> +        }
+> ```
+
+`validate-at-boundaries` (major): `flush()` re-reads raw `device_features()` from the virtio device after feature negotiation and treats a missing `BlockFeatures::FLUSH` bit as successful completion. A hostile or faulty device can advertise `VIRTIO_BLK_F_FLUSH` during negotiation, clear that bit for this later MMIO/config read, and make `sync()`/`fsync()` return `BioStatus::Complete` without any `ReqType::Flush` being submitted.
+
+**Fix.** Store the negotiated block features in trusted driver state during initialization and use that cached value in `flush()`. If `FLUSH` was not negotiated, propagate `BioStatus::NotSupported` or an I/O error instead of reporting `BioStatus::Complete` for a persistence request.
+
+codex
+The assembler output matches the fragments. I’m doing one more local cross-check for existing flush/status conventions so I don’t leave a false positive in the final review.
+exec
+/bin/bash -lc "rg -n \"BioType::Flush|ReqType::Flush|BioStatus::NotSupported|sync\\(&self\\)\" kernel -S" in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+kernel/comps/block/src/impl_block_device.rs:88:    pub fn sync(&self) -> Result<BioStatus, BioEnqueueError> {
+kernel/comps/block/src/impl_block_device.rs:90:            BioType::Flush,
+kernel/comps/network/src/buffer.rs:62:    fn sync(&self) {
+kernel/src/error.rs:233:            aster_block::bio::BioStatus::NotSupported => {
+kernel/comps/virtio/src/device/block/device.rs:66:            BioType::Flush => self.device.flush(request),
+kernel/comps/virtio/src/device/block/device.rs:424:                type_: ReqType::Flush as _,
+kernel/src/fs/devpts/mod.rs:90:    fn sync(&self) -> Result<()> {
+kernel/src/fs/path/mount.rs:224:    pub fn sync(&self) -> Result<()> {
+kernel/src/fs/utils/fs.rs:47:    fn sync(&self) -> Result<()>;
+kernel/libs/aster-util/src/safe_ptr.rs:364:    pub fn sync(&self) -> Result<()> {
+kernel/libs/aster-util/src/safe_ptr.rs:372:    pub fn sync(&self) -> Result<()>;
+kernel/src/fs/procfs/mod.rs:62:    fn sync(&self) -> Result<()> {
+kernel/src/fs/ext2/impl_for_vfs/fs.rs:14:    fn sync(&self) -> Result<()> {
+kernel/src/fs/exfat/fs.rs:393:    fn sync(&self) -> Result<()> {
+kernel/src/fs/exfat/inode.rs:215:    fn is_sync(&self) -> bool {
+kernel/src/fs/ramfs/fs.rs:73:    fn sync(&self) -> Result<()> {
+
+codex
+There are no other local flush implementations to contradict the status finding, and the error mapping already treats `BioStatus::NotSupported` as a distinct path. I’m checking that mapping before finalizing the verified report.
+exec
+/bin/bash -lc "sed -n '220,240p' kernel/src/error.rs && sed -n '80,100p' kernel/comps/block/src/impl_block_device.rs" in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+            aster_block::bio::BioEnqueueError::Refused => {
+                Error::with_message(Errno::EBUSY, "Refuse to enqueue the bio")
+            }
+            aster_block::bio::BioEnqueueError::TooBig => {
+                Error::with_message(Errno::EINVAL, "Bio is too big")
+            }
+        }
+    }
+}
+
+impl From<aster_block::bio::BioStatus> for Error {
+    fn from(err_status: aster_block::bio::BioStatus) -> Self {
+        match err_status {
+            aster_block::bio::BioStatus::NotSupported => {
+                Error::with_message(Errno::EIO, "I/O operation is not supported")
+            }
+            aster_block::bio::BioStatus::NoSpace => {
+                Error::with_message(Errno::ENOSPC, "Insufficient space on device")
+            }
+            aster_block::bio::BioStatus::IoError => {
+                Error::with_message(Errno::EIO, "I/O operation fails")
+
+    /// Asynchronously writes one block indicated by the `bid`.
+    pub fn write_block_async(&self, bid: Bid, frame: &Frame) -> Result<BioWaiter, BioEnqueueError> {
+        let bio = create_bio_from_frame(BioType::Write, bid, frame);
+        bio.submit(self)
+    }
+
+    /// Issues a sync request
+    pub fn sync(&self) -> Result<BioStatus, BioEnqueueError> {
+        let bio = Bio::new(
+            BioType::Flush,
+            Sid::from(Bid::from_offset(0)),
+            vec![],
+            Some(general_complete_fn),
+        );
+        let status = bio.submit_and_wait(self)?;
+        Ok(status)
+    }
+}
+
+impl VmIo for dyn BlockDevice {
+
+codex
+All seven comments are confirmed; nothing needs retraction or an uncertainty prefix. I’m making the summary and a small consolidation pass so the overlapping feature-cache/status findings point at the same underlying fix.
+apply patch
+patch: completed
+/tmp/tmp.MkHYPXYeSV/wt1.on.md
+diff --git a//tmp/tmp.MkHYPXYeSV/wt1.on.md b//tmp/tmp.MkHYPXYeSV/wt1.on.md
+index 89c520db1a357548944283df26e2e7ed944d789d..dac986f3acbd196473c3dbb87b633aa37c45e837
+--- a//tmp/tmp.MkHYPXYeSV/wt1.on.md
++++ b//tmp/tmp.MkHYPXYeSV/wt1.on.md
+@@ -8,8 +8,10 @@
+ 
+ # Summary
+ 
+-<!-- SUMMARY -->
++The patch adds block-device sync support and wires virtio-blk flush requests through the device queue. The main correctness risk is in the new virtio flush path: it re-reads device feature bits from transport state during request handling, reports unsupported flush as success, and undercounts the descriptors needed for the request/response pair. Those issues can turn persistence requests into silent success or a panic under queue pressure.
+ 
++The structural recommendation is to store negotiated block features in `DeviceInner` during initialization and route `flush()` through a shared virtqueue submission helper. That would address the feature trust/locking problem and reduce the duplicated read/write/flush queueing logic where the descriptor accounting bug was introduced.
++
+ ## Maintainability
+ 
+ ### `kernel/comps/block/src/impl_block_device.rs` line 87
+@@ -72,7 +74,7 @@
+ 
+ `no-io-under-spinlock` (major): `self.transport.lock().device_features()` holds the `transport` spinlock while `device_features()` performs transport register I/O; the MMIO and PCI implementations write the feature selector and read feature registers under this guard.
+ 
+-**Fix.** Cache the negotiated block features, or at least `supports_flush`, during `DeviceInner::init()` before `transport` is stored behind `SpinLock`, then check that cached value in `flush()` instead of doing transport I/O under the spinlock.
++**Fix.** Shared with the security feature-validation comment: cache the negotiated block features, or at least `supports_flush`, during `DeviceInner::init()` before `transport` is stored behind `SpinLock`, then check that cached value in `flush()` instead of doing transport I/O under the spinlock.
+ 
+ ### `kernel/comps/virtio/src/device/block/device.rs` line 415
+ 
+@@ -87,7 +89,7 @@
+ 
+ Incorrect status (major): When `VIRTIO_BLK_F_FLUSH` is absent, `flush()` completes the `Bio` with `BioStatus::Complete`, so `BlockDevice::sync()` reports success even though no cache flush was issued. The block layer already has `BioStatus::NotSupported` for this case.
+ 
+-**Fix.** Complete unsupported flush requests with `BioStatus::NotSupported` so synchronous callers receive that status and higher layers can convert it to an error.
++**Fix.** Shared with the feature-cache comments: after checking trusted negotiated feature state, complete unsupported flush requests with `BioStatus::NotSupported` so synchronous callers receive that status and higher layers can convert it to an error.
+ 
+ ### `kernel/comps/virtio/src/device/block/device.rs` line 439
+ 
+@@ -123,4 +125,4 @@
+ 
+ `validate-at-boundaries` (major): `flush()` re-reads raw `device_features()` from the virtio device after feature negotiation and treats a missing `BlockFeatures::FLUSH` bit as successful completion. A hostile or faulty device can advertise `VIRTIO_BLK_F_FLUSH` during negotiation, clear that bit for this later MMIO/config read, and make `sync()`/`fsync()` return `BioStatus::Complete` without any `ReqType::Flush` being submitted.
+ 
+-**Fix.** Store the negotiated block features in trusted driver state during initialization and use that cached value in `flush()`. If `FLUSH` was not negotiated, propagate `BioStatus::NotSupported` or an I/O error instead of reporting `BioStatus::Complete` for a persistence request.
++**Fix.** Shared with the correctness feature-cache comment: store the negotiated block features in trusted driver state during initialization and use that cached value in `flush()`. If `FLUSH` was not negotiated, propagate `BioStatus::NotSupported` or an I/O error instead of reporting `BioStatus::Complete` for a persistence request.
+
+diff --git a//tmp/tmp.MkHYPXYeSV/wt1.on.md b//tmp/tmp.MkHYPXYeSV/wt1.on.md
+index 89c520db1a357548944283df26e2e7ed944d789d..dac986f3acbd196473c3dbb87b633aa37c45e837
+--- a//tmp/tmp.MkHYPXYeSV/wt1.on.md
++++ b//tmp/tmp.MkHYPXYeSV/wt1.on.md
+@@ -8,8 +8,10 @@
+ 
+ # Summary
+ 
+-<!-- SUMMARY -->
++The patch adds block-device sync support and wires virtio-blk flush requests through the device queue. The main correctness risk is in the new virtio flush path: it re-reads device feature bits from transport state during request handling, reports unsupported flush as success, and undercounts the descriptors needed for the request/response pair. Those issues can turn persistence requests into silent success or a panic under queue pressure.
+ 
++The structural recommendation is to store negotiated block features in `DeviceInner` during initialization and route `flush()` through a shared virtqueue submission helper. That would address the feature trust/locking problem and reduce the duplicated read/write/flush queueing logic where the descriptor accounting bug was introduced.
++
+ ## Maintainability
+ 
+ ### `kernel/comps/block/src/impl_block_device.rs` line 87
+@@ -72,7 +74,7 @@
+ 
+ `no-io-under-spinlock` (major): `self.transport.lock().device_features()` holds the `transport` spinlock while `device_features()` performs transport register I/O; the MMIO and PCI implementations write the feature selector and read feature registers under this guard.
+ 
+-**Fix.** Cache the negotiated block features, or at least `supports_flush`, during `DeviceInner::init()` before `transport` is stored behind `SpinLock`, then check that cached value in `flush()` instead of doing transport I/O under the spinlock.
++**Fix.** Shared with the security feature-validation comment: cache the negotiated block features, or at least `supports_flush`, during `DeviceInner::init()` before `transport` is stored behind `SpinLock`, then check that cached value in `flush()` instead of doing transport I/O under the spinlock.
+ 
+ ### `kernel/comps/virtio/src/device/block/device.rs` line 415
+ 
+@@ -87,7 +89,7 @@
+ 
+ Incorrect status (major): When `VIRTIO_BLK_F_FLUSH` is absent, `flush()` completes the `Bio` with `BioStatus::Complete`, so `BlockDevice::sync()` reports success even though no cache flush was issued. The block layer already has `BioStatus::NotSupported` for this case.
+ 
+-**Fix.** Complete unsupported flush requests with `BioStatus::NotSupported` so synchronous callers receive that status and higher layers can convert it to an error.
++**Fix.** Shared with the feature-cache comments: after checking trusted negotiated feature state, complete unsupported flush requests with `BioStatus::NotSupported` so synchronous callers receive that status and higher layers can convert it to an error.
+ 
+ ### `kernel/comps/virtio/src/device/block/device.rs` line 439
+ 
+@@ -123,4 +125,4 @@
+ 
+ `validate-at-boundaries` (major): `flush()` re-reads raw `device_features()` from the virtio device after feature negotiation and treats a missing `BlockFeatures::FLUSH` bit as successful completion. A hostile or faulty device can advertise `VIRTIO_BLK_F_FLUSH` during negotiation, clear that bit for this later MMIO/config read, and make `sync()`/`fsync()` return `BioStatus::Complete` without any `ReqType::Flush` being submitted.
+ 
+-**Fix.** Store the negotiated block features in trusted driver state during initialization and use that cached value in `flush()`. If `FLUSH` was not negotiated, propagate `BioStatus::NotSupported` or an I/O error instead of reporting `BioStatus::Complete` for a persistence request.
++**Fix.** Shared with the correctness feature-cache comment: store the negotiated block features in trusted driver state during initialization and use that cached value in `flush()`. If `FLUSH` was not negotiated, propagate `BioStatus::NotSupported` or an I/O error instead of reporting `BioStatus::Complete` for a persistence request.
+
+codex
+The summary and consolidated fixes are in place. I’m doing a final read-through of the report and checking the workspace state so I can tell you exactly what was produced.
+exec
+/bin/bash -lc "sed -n '1,280p' /tmp/tmp.MkHYPXYeSV/wt1.on.md" in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+---
+date: 2026-08-07
+mode: diff
+base: 197d53c0a
+head: 32572e22d
+branch: HEAD
+---
+
+# Summary
+
+The patch adds block-device sync support and wires virtio-blk flush requests through the device queue. The main correctness risk is in the new virtio flush path: it re-reads device feature bits from transport state during request handling, reports unsupported flush as success, and undercounts the descriptors needed for the request/response pair. Those issues can turn persistence requests into silent success or a panic under queue pressure.
+
+The structural recommendation is to store negotiated block features in `DeviceInner` during initialization and route `flush()` through a shared virtqueue submission helper. That would address the feature trust/locking problem and reduce the duplicated read/write/flush queueing logic where the descriptor accounting bug was introduced.
+
+## Maintainability
+
+### `kernel/comps/block/src/impl_block_device.rs` line 87
+
+> ```diff
+> +    /// Issues a sync request
+> +    pub fn sync(&self) -> Result<BioStatus, BioEnqueueError> {
+> ```
+
+`comment-punctuation` (nit): The doc comment `Issues a sync request` is a complete sentence but lacks terminal punctuation.
+
+**Fix.** End the doc sentence with punctuation, for example: `/// Issues a sync request.`
+
+### `kernel/comps/virtio/src/device/block/device.rs` line 420
+
+> ```diff
+>         let id = self.id_allocator.disable_irq().lock().alloc().unwrap();
+>         let req_slice = {
+>             let req_slice = DmaStreamSlice::new(&self.block_requests, id * REQ_SIZE, REQ_SIZE);
+>             let req = BlockReq {
+>                 type_: ReqType::Flush as _,
+>                 reserved: 0,
+>                 sector: bio_request.sid_range().start.to_raw(),
+>             };
+> ...
+>         loop {
+>             let mut queue = self.queue.disable_irq().lock();
+>             if num_used_descs > queue.available_desc() {
+>                 continue;
+>             }
+>             let token = queue
+>                 .add_dma_buf(&[&req_slice], &[&resp_slice])
+>                 .expect("add queue failed");
+> ```
+
+`dry` (minor): `flush()` adds a third copy of the same request-allocation, response-buffer setup, virtqueue wait/submit/notify, and `submitted_requests` insertion flow already present in `read()` and `write()`. Any later change to the submission protocol now has to be made in three places.
+
+**Fix.** Extract the shared submission mechanics into a helper that takes the request type and input/output DMA slices, then have `read()`, `write()`, and `flush()` call that helper.
+
+### `kernel/comps/virtio/src/device/block/device.rs` line 452
+
+> ```diff
+> +            // Records the submitted request
+> +            let submitted_request = SubmittedRequest::new(id as u16, bio_request, Vec::new());
+> ```
+
+`comment-punctuation` (nit): The comment `Records the submitted request` is a complete sentence but lacks terminal punctuation.
+
+**Fix.** End the sentence with punctuation, or drop the comment if the following `SubmittedRequest::new(...)` and `insert(...)` calls are clear enough without it.
+
+## Correctness
+
+### `kernel/comps/virtio/src/device/block/device.rs` line 413
+
+> ```diff
+> fn flush(&self, bio_request: BioRequest) {
+>     if self.transport.lock().device_features() & BlockFeatures::FLUSH.bits() == 0 {
+>         bio_request.bios().for_each(|bio| {
+> ```
+
+`no-io-under-spinlock` (major): `self.transport.lock().device_features()` holds the `transport` spinlock while `device_features()` performs transport register I/O; the MMIO and PCI implementations write the feature selector and read feature registers under this guard.
+
+**Fix.** Shared with the security feature-validation comment: cache the negotiated block features, or at least `supports_flush`, during `DeviceInner::init()` before `transport` is stored behind `SpinLock`, then check that cached value in `flush()` instead of doing transport I/O under the spinlock.
+
+### `kernel/comps/virtio/src/device/block/device.rs` line 415
+
+> ```diff
+> if self.transport.lock().device_features() & BlockFeatures::FLUSH.bits() == 0 {
+>     bio_request.bios().for_each(|bio| {
+>         bio.complete(BioStatus::Complete);
+>     });
+>     return;
+> }
+> ```
+
+Incorrect status (major): When `VIRTIO_BLK_F_FLUSH` is absent, `flush()` completes the `Bio` with `BioStatus::Complete`, so `BlockDevice::sync()` reports success even though no cache flush was issued. The block layer already has `BioStatus::NotSupported` for this case.
+
+**Fix.** Shared with the feature-cache comments: after checking trusted negotiated feature state, complete unsupported flush requests with `BioStatus::NotSupported` so synchronous callers receive that status and higher layers can convert it to an error.
+
+### `kernel/comps/virtio/src/device/block/device.rs` line 439
+
+> ```diff
+> let num_used_descs = 1;
+> loop {
+>     let mut queue = self.queue.disable_irq().lock();
+>     if num_used_descs > queue.available_desc() {
+>         continue;
+>     }
+>     let token = queue
+>         .add_dma_buf(&[&req_slice], &[&resp_slice])
+>         .expect("add queue failed");
+> ```
+
+Miscounted resources (major): `flush()` checks for only `1` available descriptor, but `add_dma_buf(&[&req_slice], &[&resp_slice])` needs two descriptors. If exactly one descriptor is free, the pre-check passes and `add_dma_buf()` returns `QueueError::BufferTooSmall`, making `.expect("add queue failed")` panic on normal queue pressure.
+
+**Fix.** Count both the request and response descriptors before entering the queue path, for example `let num_used_descs = 2;`, matching the actual `add_dma_buf()` inputs and outputs.
+
+## Security
+
+### `kernel/comps/virtio/src/device/block/device.rs` line 413
+
+> ```diff
+> +    fn flush(&self, bio_request: BioRequest) {
+> +        if self.transport.lock().device_features() & BlockFeatures::FLUSH.bits() == 0 {
+> +            bio_request.bios().for_each(|bio| {
+> +                bio.complete(BioStatus::Complete);
+> +            });
+> +            return;
+> +        }
+> ```
+
+`validate-at-boundaries` (major): `flush()` re-reads raw `device_features()` from the virtio device after feature negotiation and treats a missing `BlockFeatures::FLUSH` bit as successful completion. A hostile or faulty device can advertise `VIRTIO_BLK_F_FLUSH` during negotiation, clear that bit for this later MMIO/config read, and make `sync()`/`fsync()` return `BioStatus::Complete` without any `ReqType::Flush` being submitted.
+
+**Fix.** Shared with the correctness feature-cache comment: store the negotiated block features in trusted driver state during initialization and use that cached value in `flush()`. If `FLUSH` was not negotiated, propagate `BioStatus::NotSupported` or an I/O error instead of reporting `BioStatus::Complete` for a persistence request.
+
+diff --git a//tmp/tmp.MkHYPXYeSV/wt1.on.md b//tmp/tmp.MkHYPXYeSV/wt1.on.md
+index 89c520db1a357548944283df26e2e7ed944d789d..dac986f3acbd196473c3dbb87b633aa37c45e837
+--- a//tmp/tmp.MkHYPXYeSV/wt1.on.md
++++ b//tmp/tmp.MkHYPXYeSV/wt1.on.md
+@@ -8,8 +8,10 @@
+ 
+ # Summary
+ 
+-<!-- SUMMARY -->
++The patch adds block-device sync support and wires virtio-blk flush requests through the device queue. The main correctness risk is in the new virtio flush path: it re-reads device feature bits from transport state during request handling, reports unsupported flush as success, and undercounts the descriptors needed for the request/response pair. Those issues can turn persistence requests into silent success or a panic under queue pressure.
+ 
++The structural recommendation is to store negotiated block features in `DeviceInner` during initialization and route `flush()` through a shared virtqueue submission helper. That would address the feature trust/locking problem and reduce the duplicated read/write/flush queueing logic where the descriptor accounting bug was introduced.
++
+ ## Maintainability
+ 
+ ### `kernel/comps/block/src/impl_block_device.rs` line 87
+@@ -72,7 +74,7 @@
+ 
+ `no-io-under-spinlock` (major): `self.transport.lock().device_features()` holds the `transport` spinlock while `device_features()` performs transport register I/O; the MMIO and PCI implementations write the feature selector and read feature registers under this guard.
+ 
+-**Fix.** Cache the negotiated block features, or at least `supports_flush`, during `DeviceInner::init()` before `transport` is stored behind `SpinLock`, then check that cached value in `flush()` instead of doing transport I/O under the spinlock.
++**Fix.** Shared with the security feature-validation comment: cache the negotiated block features, or at least `supports_flush`, during `DeviceInner::init()` before `transport` is stored behind `SpinLock`, then check that cached value in `flush()` instead of doing transport I/O under the spinlock.
+ 
+ ### `kernel/comps/virtio/src/device/block/device.rs` line 415
+ 
+@@ -87,7 +89,7 @@
+ 
+ Incorrect status (major): When `VIRTIO_BLK_F_FLUSH` is absent, `flush()` completes the `Bio` with `BioStatus::Complete`, so `BlockDevice::sync()` reports success even though no cache flush was issued. The block layer already has `BioStatus::NotSupported` for this case.
+ 
+-**Fix.** Complete unsupported flush requests with `BioStatus::NotSupported` so synchronous callers receive that status and higher layers can convert it to an error.
++**Fix.** Shared with the feature-cache comments: after checking trusted negotiated feature state, complete unsupported flush requests with `BioStatus::NotSupported` so synchronous callers receive that status and higher layers can convert it to an error.
+ 
+ ### `kernel/comps/virtio/src/device/block/device.rs` line 439
+ 
+@@ -123,4 +125,4 @@
+ 
+ `validate-at-boundaries` (major): `flush()` re-reads raw `device_features()` from the virtio device after feature negotiation and treats a missing `BlockFeatures::FLUSH` bit as successful completion. A hostile or faulty device can advertise `VIRTIO_BLK_F_FLUSH` during negotiation, clear that bit for this later MMIO/config read, and make `sync()`/`fsync()` return `BioStatus::Complete` without any `ReqType::Flush` being submitted.
+ 
+-**Fix.** Store the negotiated block features in trusted driver state during initialization and use that cached value in `flush()`. If `FLUSH` was not negotiated, propagate `BioStatus::NotSupported` or an I/O error instead of reporting `BioStatus::Complete` for a persistence request.
++**Fix.** Shared with the correctness feature-cache comment: store the negotiated block features in trusted driver state during initialization and use that cached value in `flush()`. If `FLUSH` was not negotiated, propagate `BioStatus::NotSupported` or an I/O error instead of reporting `BioStatus::Complete` for a persistence request.
+
+codex
+The final Markdown report is complete and has the expected sections. I’m checking git status only to distinguish the generated review file from repo changes.
+exec
+/bin/bash -lc 'git status --short' in /tmp/tmp.MkHYPXYeSV/wt1
+ succeeded in 0ms:
+?? .agents/
+?? .claude/
+
+diff --git a//tmp/tmp.MkHYPXYeSV/wt1.on.md b//tmp/tmp.MkHYPXYeSV/wt1.on.md
+index 89c520db1a357548944283df26e2e7ed944d789d..dac986f3acbd196473c3dbb87b633aa37c45e837
+--- a//tmp/tmp.MkHYPXYeSV/wt1.on.md
++++ b//tmp/tmp.MkHYPXYeSV/wt1.on.md
+@@ -8,8 +8,10 @@
+ 
+ # Summary
+ 
+-<!-- SUMMARY -->
++The patch adds block-device sync support and wires virtio-blk flush requests through the device queue. The main correctness risk is in the new virtio flush path: it re-reads device feature bits from transport state during request handling, reports unsupported flush as success, and undercounts the descriptors needed for the request/response pair. Those issues can turn persistence requests into silent success or a panic under queue pressure.
+ 
++The structural recommendation is to store negotiated block features in `DeviceInner` during initialization and route `flush()` through a shared virtqueue submission helper. That would address the feature trust/locking problem and reduce the duplicated read/write/flush queueing logic where the descriptor accounting bug was introduced.
++
+ ## Maintainability
+ 
+ ### `kernel/comps/block/src/impl_block_device.rs` line 87
+@@ -72,7 +74,7 @@
+ 
+ `no-io-under-spinlock` (major): `self.transport.lock().device_features()` holds the `transport` spinlock while `device_features()` performs transport register I/O; the MMIO and PCI implementations write the feature selector and read feature registers under this guard.
+ 
+-**Fix.** Cache the negotiated block features, or at least `supports_flush`, during `DeviceInner::init()` before `transport` is stored behind `SpinLock`, then check that cached value in `flush()` instead of doing transport I/O under the spinlock.
++**Fix.** Shared with the security feature-validation comment: cache the negotiated block features, or at least `supports_flush`, during `DeviceInner::init()` before `transport` is stored behind `SpinLock`, then check that cached value in `flush()` instead of doing transport I/O under the spinlock.
+ 
+ ### `kernel/comps/virtio/src/device/block/device.rs` line 415
+ 
+@@ -87,7 +89,7 @@
+ 
+ Incorrect status (major): When `VIRTIO_BLK_F_FLUSH` is absent, `flush()` completes the `Bio` with `BioStatus::Complete`, so `BlockDevice::sync()` reports success even though no cache flush was issued. The block layer already has `BioStatus::NotSupported` for this case.
+ 
+-**Fix.** Complete unsupported flush requests with `BioStatus::NotSupported` so synchronous callers receive that status and higher layers can convert it to an error.
++**Fix.** Shared with the feature-cache comments: after checking trusted negotiated feature state, complete unsupported flush requests with `BioStatus::NotSupported` so synchronous callers receive that status and higher layers can convert it to an error.
+ 
+ ### `kernel/comps/virtio/src/device/block/device.rs` line 439
+ 
+@@ -123,4 +125,4 @@
+ 
+ `validate-at-boundaries` (major): `flush()` re-reads raw `device_features()` from the virtio device after feature negotiation and treats a missing `BlockFeatures::FLUSH` bit as successful completion. A hostile or faulty device can advertise `VIRTIO_BLK_F_FLUSH` during negotiation, clear that bit for this later MMIO/config read, and make `sync()`/`fsync()` return `BioStatus::Complete` without any `ReqType::Flush` being submitted.
+ 
+-**Fix.** Store the negotiated block features in trusted driver state during initialization and use that cached value in `flush()`. If `FLUSH` was not negotiated, propagate `BioStatus::NotSupported` or an I/O error instead of reporting `BioStatus::Complete` for a persistence request.
++**Fix.** Shared with the correctness feature-cache comment: store the negotiated block features in trusted driver state during initialization and use that cached value in `flush()`. If `FLUSH` was not negotiated, propagate `BioStatus::NotSupported` or an I/O error instead of reporting `BioStatus::Complete` for a persistence request.
+
+  ✓ Resolve review metadata and input
+  ✓ Determine active personas
+  ✓ Run persona review passes
+  ✓ Assemble, verify, consolidate, summarize review file
+diff --git a//tmp/tmp.MkHYPXYeSV/wt1.on.md b//tmp/tmp.MkHYPXYeSV/wt1.on.md
+index 89c520db1a357548944283df26e2e7ed944d789d..dac986f3acbd196473c3dbb87b633aa37c45e837
+--- a//tmp/tmp.MkHYPXYeSV/wt1.on.md
++++ b//tmp/tmp.MkHYPXYeSV/wt1.on.md
+@@ -8,8 +8,10 @@
+ 
+ # Summary
+ 
+-<!-- SUMMARY -->
++The patch adds block-device sync support and wires virtio-blk flush requests through the device queue. The main correctness risk is in the new virtio flush path: it re-reads device feature bits from transport state during request handling, reports unsupported flush as success, and undercounts the descriptors needed for the request/response pair. Those issues can turn persistence requests into silent success or a panic under queue pressure.
+ 
++The structural recommendation is to store negotiated block features in `DeviceInner` during initialization and route `flush()` through a shared virtqueue submission helper. That would address the feature trust/locking problem and reduce the duplicated read/write/flush queueing logic where the descriptor accounting bug was introduced.
++
+ ## Maintainability
+ 
+ ### `kernel/comps/block/src/impl_block_device.rs` line 87
+@@ -72,7 +74,7 @@
+ 
+ `no-io-under-spinlock` (major): `self.transport.lock().device_features()` holds the `transport` spinlock while `device_features()` performs transport register I/O; the MMIO and PCI implementations write the feature selector and read feature registers under this guard.
+ 
+-**Fix.** Cache the negotiated block features, or at least `supports_flush`, during `DeviceInner::init()` before `transport` is stored behind `SpinLock`, then check that cached value in `flush()` instead of doing transport I/O under the spinlock.
++**Fix.** Shared with the security feature-validation comment: cache the negotiated block features, or at least `supports_flush`, during `DeviceInner::init()` before `transport` is stored behind `SpinLock`, then check that cached value in `flush()` instead of doing transport I/O under the spinlock.
+ 
+ ### `kernel/comps/virtio/src/device/block/device.rs` line 415
+ 
+@@ -87,7 +89,7 @@
+ 
+ Incorrect status (major): When `VIRTIO_BLK_F_FLUSH` is absent, `flush()` completes the `Bio` with `BioStatus::Complete`, so `BlockDevice::sync()` reports success even though no cache flush was issued. The block layer already has `BioStatus::NotSupported` for this case.
+ 
+-**Fix.** Complete unsupported flush requests with `BioStatus::NotSupported` so synchronous callers receive that status and higher layers can convert it to an error.
++**Fix.** Shared with the feature-cache comments: after checking trusted negotiated feature state, complete unsupported flush requests with `BioStatus::NotSupported` so synchronous callers receive that status and higher layers can convert it to an error.
+ 
+ ### `kernel/comps/virtio/src/device/block/device.rs` line 439
+ 
+@@ -123,4 +125,4 @@
+ 
+ `validate-at-boundaries` (major): `flush()` re-reads raw `device_features()` from the virtio device after feature negotiation and treats a missing `BlockFeatures::FLUSH` bit as successful completion. A hostile or faulty device can advertise `VIRTIO_BLK_F_FLUSH` during negotiation, clear that bit for this later MMIO/config read, and make `sync()`/`fsync()` return `BioStatus::Complete` without any `ReqType::Flush` being submitted.
+ 
+-**Fix.** Store the negotiated block features in trusted driver state during initialization and use that cached value in `flush()`. If `FLUSH` was not negotiated, propagate `BioStatus::NotSupported` or an I/O error instead of reporting `BioStatus::Complete` for a persistence request.
++**Fix.** Shared with the correctness feature-cache comment: store the negotiated block features in trusted driver state during initialization and use that cached value in `flush()`. If `FLUSH` was not negotiated, propagate `BioStatus::NotSupported` or an I/O error instead of reporting `BioStatus::Complete` for a persistence request.
+
+codex
+Done. I wrote the Aster code review to [/tmp/tmp.MkHYPXYeSV/wt1.on.md](/tmp/tmp.MkHYPXYeSV/wt1.on.md).
+
+It covers diff `197d53c0a..32572e22d` with per-persona review for maintainability, correctness, and security. The final report has 7 confirmed findings, including 3 major correctness issues and 1 major security issue around virtio-blk flush handling. No findings were retracted during verification.
+diff --git a//tmp/tmp.MkHYPXYeSV/wt1.on.md b//tmp/tmp.MkHYPXYeSV/wt1.on.md
+index 89c520db1a357548944283df26e2e7ed944d789d..dac986f3acbd196473c3dbb87b633aa37c45e837
+--- a//tmp/tmp.MkHYPXYeSV/wt1.on.md
++++ b//tmp/tmp.MkHYPXYeSV/wt1.on.md
+@@ -8,8 +8,10 @@
+ 
+ # Summary
+ 
+-<!-- SUMMARY -->
++The patch adds block-device sync support and wires virtio-blk flush requests through the device queue. The main correctness risk is in the new virtio flush path: it re-reads device feature bits from transport state during request handling, reports unsupported flush as success, and undercounts the descriptors needed for the request/response pair. Those issues can turn persistence requests into silent success or a panic under queue pressure.
+ 
++The structural recommendation is to store negotiated block features in `DeviceInner` during initialization and route `flush()` through a shared virtqueue submission helper. That would address the feature trust/locking problem and reduce the duplicated read/write/flush queueing logic where the descriptor accounting bug was introduced.
++
+ ## Maintainability
+ 
+ ### `kernel/comps/block/src/impl_block_device.rs` line 87
+@@ -72,7 +74,7 @@
+ 
+ `no-io-under-spinlock` (major): `self.transport.lock().device_features()` holds the `transport` spinlock while `device_features()` performs transport register I/O; the MMIO and PCI implementations write the feature selector and read feature registers under this guard.
+ 
+-**Fix.** Cache the negotiated block features, or at least `supports_flush`, during `DeviceInner::init()` before `transport` is stored behind `SpinLock`, then check that cached value in `flush()` instead of doing transport I/O under the spinlock.
++**Fix.** Shared with the security feature-validation comment: cache the negotiated block features, or at least `supports_flush`, during `DeviceInner::init()` before `transport` is stored behind `SpinLock`, then check that cached value in `flush()` instead of doing transport I/O under the spinlock.
+ 
+ ### `kernel/comps/virtio/src/device/block/device.rs` line 415
+ 
+@@ -87,7 +89,7 @@
+ 
+ Incorrect status (major): When `VIRTIO_BLK_F_FLUSH` is absent, `flush()` completes the `Bio` with `BioStatus::Complete`, so `BlockDevice::sync()` reports success even though no cache flush was issued. The block layer already has `BioStatus::NotSupported` for this case.
+ 
+-**Fix.** Complete unsupported flush requests with `BioStatus::NotSupported` so synchronous callers receive that status and higher layers can convert it to an error.
++**Fix.** Shared with the feature-cache comments: after checking trusted negotiated feature state, complete unsupported flush requests with `BioStatus::NotSupported` so synchronous callers receive that status and higher layers can convert it to an error.
+ 
+ ### `kernel/comps/virtio/src/device/block/device.rs` line 439
+ 
+@@ -123,4 +125,4 @@
+ 
+ `validate-at-boundaries` (major): `flush()` re-reads raw `device_features()` from the virtio device after feature negotiation and treats a missing `BlockFeatures::FLUSH` bit as successful completion. A hostile or faulty device can advertise `VIRTIO_BLK_F_FLUSH` during negotiation, clear that bit for this later MMIO/config read, and make `sync()`/`fsync()` return `BioStatus::Complete` without any `ReqType::Flush` being submitted.
+ 
+-**Fix.** Store the negotiated block features in trusted driver state during initialization and use that cached value in `flush()`. If `FLUSH` was not negotiated, propagate `BioStatus::NotSupported` or an I/O error instead of reporting `BioStatus::Complete` for a persistence request.
++**Fix.** Shared with the correctness feature-cache comment: store the negotiated block features in trusted driver state during initialization and use that cached value in `flush()`. If `FLUSH` was not negotiated, propagate `BioStatus::NotSupported` or an I/O error instead of reporting `BioStatus::Complete` for a persistence request.
+
+tokens used
+147,387
+Done. I wrote the Aster code review to [/tmp/tmp.MkHYPXYeSV/wt1.on.md](/tmp/tmp.MkHYPXYeSV/wt1.on.md).
+
+It covers diff `197d53c0a..32572e22d` with per-persona review for maintainability, correctness, and security. The final report has 7 confirmed findings, including 3 major correctness issues and 1 major security issue around virtio-blk flush handling. No findings were retracted during verification.
+WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp" (codex_home: AbsolutePathBuf("/tmp/tmp.3Zw81fB9Dl"))
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /root/asterinas/.agents/skills/aster-code-review/benchmark
+model: gpt-5.5
+provider: OpenAI
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR] (network access enabled)
+reasoning effort: high
+reasoning summaries: none
+session id: 019fda55-d5b8-74f1-b775-fbc0c8d7516e
+--------
+user
+You are grading a code review for recall.
+Each expected defect gives a defect description for context and a MATCH IF criterion for grading.
+For each expected defect, decide whether ANY produced review comment semantically satisfies its MATCH IF criterion at the stated code location.
+Wording, grounding label, persona, and severity may differ; judge the underlying defect.
+Respond with ONLY two space-separated integers: caught total. The total must equal the number of expected defects below.
+
+===== EXPECTED DEFECTS =====
+# Expected defects
+
+1. location: kernel/comps/virtio/src/device/block/device.rs (persona: development, grounding: Off by one, severity: major)
+   defect: `flush` submits two descriptors (a `req_slice` input and a `resp_slice` output) but hardcodes `let num_used_descs = 1;`, so the `num_used_descs > queue.available_desc()` guard can pass with only one free slot, exhausting the virtqueue.
+   MATCH IF: A reviewer should flag that the descriptor count does not match the number of buffers enqueued.
+
+===== PRODUCED REVIEW =====
+---
+date: 2026-08-07
+mode: diff
+base: 197d53c0a
+head: 32572e22d
+branch: HEAD
+---
+
+# Summary
+
+The patch adds block-device sync support and wires virtio-blk flush requests through the device queue. The main correctness risk is in the new virtio flush path: it re-reads device feature bits from transport state during request handling, reports unsupported flush as success, and undercounts the descriptors needed for the request/response pair. Those issues can turn persistence requests into silent success or a panic under queue pressure.
+
+The structural recommendation is to store negotiated block features in `DeviceInner` during initialization and route `flush()` through a shared virtqueue submission helper. That would address the feature trust/locking problem and reduce the duplicated read/write/flush queueing logic where the descriptor accounting bug was introduced.
+
+## Maintainability
+
+### `kernel/comps/block/src/impl_block_device.rs` line 87
+
+> ```diff
+> +    /// Issues a sync request
+> +    pub fn sync({prompt}self) -> Result<BioStatus, BioEnqueueError> {
+> ```
+
+`comment-punctuation` (nit): The doc comment `Issues a sync request` is a complete sentence but lacks terminal punctuation.
+
+**Fix.** End the doc sentence with punctuation, for example: `/// Issues a sync request.`
+
+### `kernel/comps/virtio/src/device/block/device.rs` line 420
+
+> ```diff
+>         let id = self.id_allocator.disable_irq().lock().alloc().unwrap();
+>         let req_slice = {
+>             let req_slice = DmaStreamSlice::new({prompt}self.block_requests, id * REQ_SIZE, REQ_SIZE);
+>             let req = BlockReq {
+>                 type_: ReqType::Flush as _,
+>                 reserved: 0,
+>                 sector: bio_request.sid_range().start.to_raw(),
+>             };
+> ...
+>         loop {
+>             let mut queue = self.queue.disable_irq().lock();
+>             if num_used_descs > queue.available_desc() {
+>                 continue;
+>             }
+>             let token = queue
+>                 .add_dma_buf({prompt}[{prompt}req_slice], {prompt}[{prompt}resp_slice])
+>                 .expect("add queue failed");
+> ```
+
+`dry` (minor): `flush()` adds a third copy of the same request-allocation, response-buffer setup, virtqueue wait/submit/notify, and `submitted_requests` insertion flow already present in `read()` and `write()`. Any later change to the submission protocol now has to be made in three places.
+
+**Fix.** Extract the shared submission mechanics into a helper that takes the request type and input/output DMA slices, then have `read()`, `write()`, and `flush()` call that helper.
+
+### `kernel/comps/virtio/src/device/block/device.rs` line 452
+
+> ```diff
+> +            // Records the submitted request
+> +            let submitted_request = SubmittedRequest::new(id as u16, bio_request, Vec::new());
+> ```
+
+`comment-punctuation` (nit): The comment `Records the submitted request` is a complete sentence but lacks terminal punctuation.
+
+**Fix.** End the sentence with punctuation, or drop the comment if the following `SubmittedRequest::new(...)` and `insert(...)` calls are clear enough without it.
+
+## Correctness
+
+### `kernel/comps/virtio/src/device/block/device.rs` line 413
+
+> ```diff
+> fn flush({prompt}self, bio_request: BioRequest) {
+>     if self.transport.lock().device_features() {prompt} BlockFeatures::FLUSH.bits() == 0 {
+>         bio_request.bios().for_each(|bio| {
+> ```
+
+`no-io-under-spinlock` (major): `self.transport.lock().device_features()` holds the `transport` spinlock while `device_features()` performs transport register I/O; the MMIO and PCI implementations write the feature selector and read feature registers under this guard.
+
+**Fix.** Shared with the security feature-validation comment: cache the negotiated block features, or at least `supports_flush`, during `DeviceInner::init()` before `transport` is stored behind `SpinLock`, then check that cached value in `flush()` instead of doing transport I/O under the spinlock.
+
+### `kernel/comps/virtio/src/device/block/device.rs` line 415
+
+> ```diff
+> if self.transport.lock().device_features() {prompt} BlockFeatures::FLUSH.bits() == 0 {
+>     bio_request.bios().for_each(|bio| {
+>         bio.complete(BioStatus::Complete);
+>     });
+>     return;
+> }
+> ```
+
+Incorrect status (major): When `VIRTIO_BLK_F_FLUSH` is absent, `flush()` completes the `Bio` with `BioStatus::Complete`, so `BlockDevice::sync()` reports success even though no cache flush was issued. The block layer already has `BioStatus::NotSupported` for this case.
+
+**Fix.** Shared with the feature-cache comments: after checking trusted negotiated feature state, complete unsupported flush requests with `BioStatus::NotSupported` so synchronous callers receive that status and higher layers can convert it to an error.
+
+### `kernel/comps/virtio/src/device/block/device.rs` line 439
+
+> ```diff
+> let num_used_descs = 1;
+> loop {
+>     let mut queue = self.queue.disable_irq().lock();
+>     if num_used_descs > queue.available_desc() {
+>         continue;
+>     }
+>     let token = queue
+>         .add_dma_buf({prompt}[{prompt}req_slice], {prompt}[{prompt}resp_slice])
+>         .expect("add queue failed");
+> ```
+
+Miscounted resources (major): `flush()` checks for only `1` available descriptor, but `add_dma_buf({prompt}[{prompt}req_slice], {prompt}[{prompt}resp_slice])` needs two descriptors. If exactly one descriptor is free, the pre-check passes and `add_dma_buf()` returns `QueueError::BufferTooSmall`, making `.expect("add queue failed")` panic on normal queue pressure.
+
+**Fix.** Count both the request and response descriptors before entering the queue path, for example `let num_used_descs = 2;`, matching the actual `add_dma_buf()` inputs and outputs.
+
+## Security
+
+### `kernel/comps/virtio/src/device/block/device.rs` line 413
+
+> ```diff
+> +    fn flush({prompt}self, bio_request: BioRequest) {
+> +        if self.transport.lock().device_features() {prompt} BlockFeatures::FLUSH.bits() == 0 {
+> +            bio_request.bios().for_each(|bio| {
+> +                bio.complete(BioStatus::Complete);
+> +            });
+> +            return;
+> +        }
+> ```
+
+`validate-at-boundaries` (major): `flush()` re-reads raw `device_features()` from the virtio device after feature negotiation and treats a missing `BlockFeatures::FLUSH` bit as successful completion. A hostile or faulty device can advertise `VIRTIO_BLK_F_FLUSH` during negotiation, clear that bit for this later MMIO/config read, and make `sync()`/`fsync()` return `BioStatus::Complete` without any `ReqType::Flush` being submitted.
+
+**Fix.** Shared with the correctness feature-cache comment: store the negotiated block features in trusted driver state during initialization and use that cached value in `flush()`. If `FLUSH` was not negotiated, propagate `BioStatus::NotSupported` or an I/O error instead of reporting `BioStatus::Complete` for a persistence request.
+warning: Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.
+codex
+1 1
+tokens used
+1,938
+0005-virtio-blk-flush-desc-count   recall 1/1 [fan-out]
+----
+reviews kept for inspection in: /tmp/tmp.TH05EleY6u  (per problem: review.md + expected-defects.txt)
+recall: 1/1 (100%, gate >=100%) across 1 problems; per-persona-context: 0 combined, 1 fan-out; precision: 0/0 clean; harness errors: 0

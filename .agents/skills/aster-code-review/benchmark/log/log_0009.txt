@@ -1,0 +1,3919 @@
+OK: 13 problems (10 diff, 3 files), 24 defects (0 negative), problem_ids unique (numeric ids too)
+WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp" (codex_home: AbsolutePathBuf("/tmp/tmp.2G38yO4wGl"))
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /tmp/tmp.sRk6BQPy6c/wt1
+model: gpt-5.5
+provider: OpenAI
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR] (network access enabled)
+reasoning effort: high
+reasoning summaries: none
+session id: 019fda91-14e3-77a1-b9f6-af80238ccf8b
+--------
+user
+Use the aster-code-review skill with these arguments: diff ba2f4aa92e8f83452d10f24d8795743609964053 --per-persona-context=yes /tmp/tmp.sRk6BQPy6c/wt1.on.md --overwrite. Review this working tree.
+warning: Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.
+codex
+I’m loading the review instructions and the target diff, then I’ll inspect the changed files for correctness and regressions.
+exec
+/bin/bash -lc "sed -n '1,220p' /tmp/tmp.sRk6BQPy6c/wt1/.agents/skills/aster-code-review/SKILL.md" in /tmp/tmp.sRk6BQPy6c/wt1
+ succeeded in 0ms:
+---
+name: aster-code-review
+description: Review code against Asterinas's persona-keyed coding guidelines and write a Markdown review file. Use when asked to review a Git change (diff mode) or a set of target files (files mode) for defects, or inside a write-test-review loop.
+---
+
+# aster-code-review
+
+Review code against Asterinas's coding guidelines
+— the persona-keyed pages under `book/src/to-contribute/coding-guidelines/`
+— and write one Markdown review file.
+The review is **recall-first**: miss as few real defects as possible.
+It makes both objective calls (undeniable bugs) and subjective calls (guideline violations, each grounded in a cited rule).
+
+There are two review modes, both **anchored at the current checkout (HEAD)**:
+
+- **`diff <base>`** — a Git change:
+  the **commit series** the branch adds over its merge-base with `<base>`
+  — each commit's message *and* its diff,
+  so the review covers per-commit intent and commit hygiene, not just the net change.
+  (Commit first; uncommitted edits are not reviewed in diff mode.)
+- **`files <path[:lines] ...>`**
+  — target code: the working-tree contents of the named files,
+  optionally narrowed to line ranges.
+
+To review at a specific commit, check it out first (it becomes HEAD).
+
+This skill is agent-agnostic (Claude Code and Codex).
+Only step 3's spawn primitive differs between agents;
+everything else is identical.
+
+## Interface
+
+However the skill is triggered,
+it receives ONE raw argument string that begins with a mode word:
+
+```
+diff   <base>              <output> [--overwrite] [--per-persona-context=auto|yes|no]
+files  <path[:lines] ...>  <output> [--overwrite] [--per-persona-context=auto|yes|no]
+```
+
+- `<base>` (diff) — **required**,
+  any ref or SHA;
+  reviews the commit series `merge-base(<base>, HEAD)..HEAD` (each commit's message + diff).
+- `<path[:lines] ...>` (files) — **required**, one or more targets in the working tree.
+  A target is a path, optionally `path:N-M` or `path:N-M,K-L` (1-based, inclusive);
+  repeat a path to add ranges.
+  Wrap a path in double quotes to allow spaces or colons (`"a: b.rs":10-20`).
+- `<output>` — **required, last positional** (`cp src... dest` style);
+  refuse to overwrite unless `--overwrite`.
+- `--overwrite` — replace the output file if it already exists.
+- `--per-persona-context` — `yes`: fan out one isolated agent per persona (best recall).
+  `no`: one combined agent reviews all personas (cheaper, lower recall).
+  `auto` (default) currently resolves to `yes`;
+  it will become a benchmark-driven heuristic.
+  Controls step 3 only.
+
+**Do not pre-split the argument string yourself.**
+Pass it verbatim, as a single quoted argument,
+to `resolve_target.sh` (step 1)
+— the script self-tokenizes (whitespace-split except inside double quotes),
+which keeps the parse deterministic and identical across agents.
+
+## Pipeline
+
+Run these steps in order.
+Steps 1 and 5 are deterministic scripts;
+steps 6–8 use the model.
+
+The helper scripts live in the skill's own `scripts/` directory,
+at `.agents/skills/aster-code-review/scripts/` inside the repository under review.
+**Invoke every script by its absolute path**
+— the working directory is the code under review (the repo root), *not* the skill directory,
+so a bare `scripts/…` is not found (notably on Codex, which runs commands from the repo root; do not `cd` into the skill dir either — `resolve_target.sh` needs the repo as its cwd).
+Shells do not persist between commands,
+so **set `SKILL` at the start of each command that uses it** (or inline the `$(git rev-parse …)`):
+
+```sh
+SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/resolve_target.sh" '<raw args>'
+```
+
+The steps below write `$SKILL/scripts/…` as shorthand for that absolute path.
+
+1. **Resolve the target.**
+   `"$SKILL/scripts/resolve_target.sh" '<raw args>'` prints the canonical review input
+   — the commit series (each commit's message + diff) in `diff` mode,
+   annotated file excerpts in `files` mode;
+   save it to a temp file.
+   Run it again with `--meta` first (`"$SKILL/scripts/resolve_target.sh" --meta '<raw args>'`) to get
+   `mode=`, `base=`/`files=`, `head=`, `branch=`, `output=`, `overwrite=`, `per_persona_context=`;
+   add `date=` (today) and an optional `title=` to make the meta file.
+   Pass the raw argument string as a single quoted argument
+   so the script's tokenizer sees it intact.
+2. **Activate personas.**
+   Pick which of the five personas run,
+   from the reviewed paths — changed paths in `diff` mode,
+   named paths in `files` mode (see *Activation*).
+3. **Fan out.**
+   Spawn the persona passes (see *Spawning*).
+   With `per_persona_context` = `yes` or `auto` (the default),
+   run **one isolated PASS per activated persona** — best recall.
+   With `no`, run **one combined PASS** over all activated personas in a single context
+   — cheaper, lower recall.
+   Build each pass's prompt deterministically with `"$SKILL/scripts/build_pass_prompt.sh" <input-file> <persona>...`
+   — one persona for fan-out, all activated personas for combined
+   — and spawn the sub-agent with **that exact text**.
+   Each pass returns a JSON array of comments;
+   file each under its persona's `<fragdir>/<persona>.json` (the comment's `persona` field says which),
+   so step 5 is unchanged.
+4. **Collect** the per-persona JSON fragments.
+5. **Assemble.**
+   `"$SKILL/scripts/assemble_review.sh" [--overwrite] <meta> <fragdir> <output>` performs the deterministic merge (group by persona in fixed order, sort by file→line, drop exact duplicates *within a persona*, write frontmatter, leave a `<!-- SUMMARY -->` placeholder).
+   Pass `--overwrite` only if the user gave it;
+   otherwise the script refuses to clobber an existing `<output>`.
+6. **Verify** (see *Verification*).
+7. **Consolidate** (see *Consolidation*).
+8. **Summary.**
+   Replace `<!-- SUMMARY -->` with a constructive summary over the final comments:
+   what the code does well, the top issues ranked by severity,
+   any structural recommendations.
+
+## Activation
+
+A persona runs unless the reviewed paths *provably* contain nothing in its remit (reviewed paths = changed paths in `diff` mode, named paths in `files` mode):
+
+- **maintainability, development, security** — any reviewed code.
+- **hardware** — a reviewed path is assembly (`*.S`, `*.asm`),
+  an architecture directory (`.../arch/...`), or contains `asm!` / `global_asm!`.
+- **documentation** — a reviewed path is `book/`, any `*.md`,
+  syscall-coverage files (`*.scml`), or a user-facing API surface (a syscall or kernel parameter).
+
+Activation is path-based and deterministic;
+do not use a model to triage (a wrongly-skipped persona is a silent recall hole).
+
+## Pass contract
+
+The shared reviewer contract
+— the review methodology and the JSON comment schema every pass must follow
+— lives in [`scripts/pass_contract.md`](scripts/pass_contract.md),
+inlined as the **stable head** of every pass prompt by `build_pass_prompt.sh` (step 3).
+Do not paraphrase it into the prompt yourself:
+retyping it breaks the byte-identical prefix the prompt cache relies on (see [`execution_model.md`](spec/execution_model.md)).
+A pass reads only the persona block(s) it is given (selective exposure),
+reviews the **REVIEW INPUT** at the foot of the prompt,
+and returns a JSON array of comments per that schema.
+
+## Spawning a pass
+
+Build every pass prompt with `"$SKILL/scripts/build_pass_prompt.sh" <input-file> <persona>...`
+and spawn the sub-agent with its **exact** output
+— only a script keeps the prompt's stable head (contract + guideline) byte-identical across passes and reviews,
+which is what lets the prompt cache reuse it (see [`execution_model.md`](spec/execution_model.md)).
+
+**Default (`per_persona_context` = `yes`/`auto`)**
+— one pass per activated persona,
+each in a CLEAN context with only its own persona block (selective exposure):
+
+- **Claude Code** — spawn a Task sub-agent per persona.
+- **Codex** — run `codex exec "<build_pass_prompt.sh output>"` per persona
+  (pass the built PROMPT TEXT as the argument).
+
+**Never spawn a pass by re-running `aster_code_review.sh` / `run_agent.sh`,
+nor by re-issuing the skill's own arguments** (e.g. `codex exec … diff <base> <out>`).
+A pass is a *reviewer* invocation whose input is the `build_pass_prompt.sh` text
+— not another run of this skill.
+Re-entering the launcher spawns another orchestrator that spawns another … , an infinite fork bomb;
+the launcher now refuses it (`ACR_AGENT_RUNNING`).
+
+Passes are independent;
+order does not matter.
+Collect each pass's JSON.
+
+**Combined (`per_persona_context` = `no`)**
+— build ONE prompt with all activated personas (`"$SKILL/scripts/build_pass_prompt.sh" <input> <p1> <p2> ...`)
+and run a single pass;
+it reviews through every lens at once and tags each comment with its `persona`.
+The input and spawn overhead are paid once,
+so it is cheaper
+— but a larger shared context dilutes focus,
+so it finds fewer defects.
+The default stays fan-out:
+recall comes first,
+and `no` is an explicit, opt-in concession.
+
+## Verification (step 6)
+
+For each comment, isolate the key premise it rests on
+— especially an external-system fact (Linux/POSIX behaviour, the System V ABI, Rust semantics).
+Try to **refute** it:
+re-read the cited code and consult an authoritative source.
+Assign a verdict:
+
+- **confirmed** — keep the comment unchanged.
+- **uncertain** — keep it, but prefix `problem` with `(unverified) `.
+- **refuted** — remove the comment,
+  and append it to a `## Retracted by verification` list at the foot of the file with a one-line reason.
+
+Remove **only** on confident refutation;
+an unsure check is `uncertain`, not `refuted`.
+This is the only step that may remove a comment, and only false positives.
+
+## Consolidation (step 7)
+
+Find clusters of comments that share one root cause or one fix
+(e.g. several manual lock/unlock pairs that all want RAII).
+For each cluster, write a single unified fix
+and repoint each member's `**Fix.**` at it ("Shared with the other `raii` comments: …").
+**Never remove a comment**
+— every symptom stays at its own location.
+
+## Output format
+
+The assembled file is:
+frontmatter (`date`, `mode`, `base` or `files`, `head`, `branch`, optional `title`),
+a `# Summary`,
+then a `## <section>` per persona in the order **Maintainability, Correctness, Security, Hardware, Documentation** (Correctness is the Development persona's section).
+Each comment is a `### \`file\` line N` subsection:
+a quoted ` ```diff ` snippet,
+then a prose line `` `<grounding>` (<severity>): <problem> ``,
+then a `**Fix.**` paragraph.
+Do not restructure what the script emits;
+
+codex
+I have the review contract. Next I’m resolving the target commit range and reading the changed files so I can validate the actual defects instead of guessing from the summary.
+exec
+/bin/bash -lc 'SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/resolve_target.sh" --meta '"'diff ba2f4aa92e8f83452d10f24d8795743609964053 /tmp/tmp.sRk6BQPy6c/wt1.on.md --overwrite'" in /tmp/tmp.sRk6BQPy6c/wt1
+ succeeded in 0ms:
+mode=diff
+base=ba2f4aa92
+head=3749ab332
+branch=HEAD
+output=/tmp/tmp.sRk6BQPy6c/wt1.on.md
+overwrite=1
+per_persona_context=auto
+
+exec
+/bin/bash -lc 'SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/resolve_target.sh" '"'diff ba2f4aa92e8f83452d10f24d8795743609964053 /tmp/tmp.sRk6BQPy6c/wt1.on.md --overwrite'" in /tmp/tmp.sRk6BQPy6c/wt1
+ succeeded in 0ms:
+
+===== commit 3749ab332 =====
+
+[commit message]
+Make tmpfs visible to statfs-based filesystem probes
+
+[changes]
+
+
+diff --git a/kernel/src/fs/fs_impls/tmpfs/fs.rs b/kernel/src/fs/fs_impls/tmpfs/fs.rs
+index f6547a8b5..baa4deb39 100644
+--- a/kernel/src/fs/fs_impls/tmpfs/fs.rs
++++ b/kernel/src/fs/fs_impls/tmpfs/fs.rs
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use super::TMPFS_MAGIC;
+ use crate::{
+     fs::{
+         ramfs::RamFs,
+@@ -44,7 +45,20 @@ impl FileSystem for TmpFs {
+     }
+ 
+     fn sb(&self) -> SuperBlock {
+-        self.inner.sb()
++        // TODO: Tmpfs currently wraps RamFs, whose inodes still point to the
++        // inner RamFs. Override statfs-visible fields here as a workaround
++        // rather than changing the semantics of ordinary RamFs instances.
++        let mut sb = self.inner.sb();
++        let max_blocks = default_max_blocks();
++        let max_inodes = default_max_inodes();
++
++        sb.magic = TMPFS_MAGIC;
++        sb.blocks = max_blocks;
++        sb.bfree = max_blocks;
++        sb.bavail = max_blocks;
++        sb.files = max_inodes;
++        sb.ffree = max_inodes;
++        sb
+     }
+ 
+     fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
+@@ -52,6 +66,14 @@ impl FileSystem for TmpFs {
+     }
+ }
+ 
++fn default_max_blocks() -> usize {
++    crate::vm::mem_total() / PAGE_SIZE / 2
++}
++
++fn default_max_inodes() -> usize {
++    crate::vm::mem_total() / PAGE_SIZE / 2
++}
++
+ pub(super) struct TmpFsType;
+ 
+ impl FsType for TmpFsType {
+diff --git a/kernel/src/fs/fs_impls/tmpfs/mod.rs b/kernel/src/fs/fs_impls/tmpfs/mod.rs
+index dc5b7a3b0..fa41d029e 100644
+--- a/kernel/src/fs/fs_impls/tmpfs/mod.rs
++++ b/kernel/src/fs/fs_impls/tmpfs/mod.rs
+@@ -7,7 +7,6 @@ use fs::TmpFsType;
+ 
+ mod fs;
+ 
+-#[expect(dead_code)]
+ const TMPFS_MAGIC: u64 = 0x0102_1994;
+ 
+ pub(super) fn init() {
+diff --git a/kernel/src/fs/vfs/path/mod.rs b/kernel/src/fs/vfs/path/mod.rs
+index 0aeb3a000..5bc0be5e7 100644
+--- a/kernel/src/fs/vfs/path/mod.rs
++++ b/kernel/src/fs/vfs/path/mod.rs
+@@ -100,6 +100,11 @@ impl Path {
+         &self.dentry
+     }
+ 
++    // Gets the file system of current `Path`.
++    pub fn fs(&self) -> &Arc<dyn FileSystem> {
++        self.mount.fs()
++    }
++
+     /// Returns true if the current `Path` is the root of its mount.
+     pub fn is_mount_root(&self) -> bool {
+         Arc::ptr_eq(&self.dentry, self.mount.root_dentry())
+@@ -537,7 +542,6 @@ impl Path {
+ // Methods inherited from `Inode`.
+ #[inherit_methods(from = "self.inode()")]
+ impl Path {
+-    pub fn fs(&self) -> Arc<dyn FileSystem>;
+     pub fn sync_all(&self) -> Result<()>;
+     pub fn sync_data(&self) -> Result<()>;
+     pub fn metadata(&self) -> Metadata;
+diff --git a/kernel/src/syscall/statfs.rs b/kernel/src/syscall/statfs.rs
+index d5d140921..dc3544a75 100644
+--- a/kernel/src/syscall/statfs.rs
++++ b/kernel/src/syscall/statfs.rs
+@@ -20,7 +20,7 @@ pub fn sys_statfs(path_ptr: Vaddr, statfs_buf_ptr: Vaddr, ctx: &Context) -> Resu
+         path_name, statfs_buf_ptr,
+     );
+ 
+-    let fs = {
++    let sb = {
+         let path_name = path_name.to_string_lossy();
+         let fs_path = FsPath::try_from(path_name.as_ref())?;
+         let path = ctx
+@@ -29,10 +29,10 @@ pub fn sys_statfs(path_ptr: Vaddr, statfs_buf_ptr: Vaddr, ctx: &Context) -> Resu
+             .resolver()
+             .read()
+             .lookup(&fs_path)?;
+-        path.fs()
++        path.fs().sb()
+     };
+ 
+-    let statfs = Statfs::from(fs.sb());
++    let statfs = Statfs::from(sb);
+     user_space.write_val(statfs_buf_ptr, &statfs)?;
+     Ok(SyscallReturn::Return(0))
+ }
+@@ -47,13 +47,13 @@ pub fn sys_fstatfs(
+         raw_fd, statfs_buf_ptr
+     );
+ 
+-    let fs = {
++    let sb = {
+         let mut file_table = ctx.thread_local.borrow_file_table_mut();
+         let file = get_file_fast!(&mut file_table, raw_fd.try_into()?);
+-        file.path().fs()
++        file.path().fs().sb()
+     };
+ 
+-    let statfs = Statfs::from(fs.sb());
++    let statfs = Statfs::from(sb);
+     ctx.user_space().write_val(statfs_buf_ptr, &statfs)?;
+     Ok(SyscallReturn::Return(0))
+ }
+
+codex
+I’ve got the patch. I’m checking how `Path::fs()` is used and whether the new tmpfs statfs values line up with the existing VFS and filesystem contracts.
+exec
+/bin/bash -lc "rg -n \"\\.fs\\(\\)\" kernel/src | head -n 200" in /tmp/tmp.sRk6BQPy6c/wt1
+ succeeded in 0ms:
+kernel/src/fs/vfs/path/mount_namespace.rs:128:            let fs_ptr = Arc::as_ptr(current_mount.fs());
+kernel/src/fs/vfs/path/dentry.rs:464:                .fs()
+kernel/src/fs/vfs/path/dentry.rs:496:                .fs()
+kernel/src/fs/vfs/path/mod.rs:105:        self.mount.fs()
+kernel/src/fs/vfs/notify/inotify.rs:81:                inode.fs().fs_event_subscriber_stats().remove_subscriber();
+kernel/src/fs/vfs/notify/inotify.rs:182:        inode.fs().fs_event_subscriber_stats().add_subscriber();
+kernel/src/fs/vfs/notify/inotify.rs:214:            inode.fs().fs_event_subscriber_stats().remove_subscriber();
+kernel/src/fs/vfs/notify/inotify.rs:400:                    let sdev = inode.fs().sb().fsid;
+kernel/src/fs/vfs/notify/mod.rs:282:    if !path.fs().fs_event_subscriber_stats().has_any_subscribers() {
+kernel/src/fs/vfs/notify/mod.rs:293:    if !path.fs().fs_event_subscriber_stats().has_any_subscribers() {
+kernel/src/fs/vfs/notify/mod.rs:301:    if !path.fs().fs_event_subscriber_stats().has_any_subscribers() {
+kernel/src/fs/vfs/notify/mod.rs:314:        .fs()
+kernel/src/fs/vfs/notify/mod.rs:329:    if !inode.fs().fs_event_subscriber_stats().has_any_subscribers() {
+kernel/src/fs/vfs/notify/mod.rs:337:    if !inode.fs().fs_event_subscriber_stats().has_any_subscribers() {
+kernel/src/fs/vfs/notify/mod.rs:346:        .fs()
+kernel/src/fs/vfs/notify/mod.rs:359:        .fs()
+kernel/src/fs/vfs/notify/mod.rs:371:        .fs()
+kernel/src/fs/vfs/notify/mod.rs:385:    if !path.fs().fs_event_subscriber_stats().has_any_subscribers() {
+kernel/src/fs/vfs/notify/mod.rs:396:    if !path.fs().fs_event_subscriber_stats().has_any_subscribers() {
+kernel/src/fs/vfs/notify/mod.rs:408:    if !path.fs().fs_event_subscriber_stats().has_any_subscribers() {
+kernel/src/fs/vfs/fs_apis/inode.rs:624:            .field("fs", &self.fs())
+kernel/src/fs/fs_impls/devpts/mod.rs:340:            "." | ".." => self.fs().root_inode(),
+kernel/src/fs/fs_impls/ext2/block_group.rs:134:        let fs = self.fs();
+kernel/src/fs/fs_impls/ext2/block_group.rs:219:        let offset = (inode_idx as usize) * self.fs().inode_size();
+kernel/src/fs/fs_impls/ext2/block_group.rs:233:        let fs = self.fs();
+kernel/src/fs/fs_impls/ext2/block_group.rs:236:        self.fs().sync_group_descriptor(self.idx, &raw_descriptor)?;
+kernel/src/fs/fs_impls/ext2/xattr.rs:112:        let fs = self.fs();
+kernel/src/fs/fs_impls/ext2/xattr.rs:331:            self.fs().block_device().write_blocks(
+kernel/src/fs/fs_impls/ext2/xattr.rs:346:        self.fs().free_blocks(bid..bid)?;
+kernel/src/fs/fs_impls/ext2/inode.rs:174:            .fs()
+kernel/src/fs/fs_impls/ext2/inode.rs:178:            self.fs().free_inode(inode.ino, is_dir).unwrap();
+kernel/src/fs/fs_impls/ext2/inode.rs:184:            self.fs().free_inode(inode.ino, is_dir).unwrap();
+kernel/src/fs/fs_impls/ext2/inode.rs:225:        self.fs().lookup_inode(ino)
+kernel/src/fs/fs_impls/ext2/inode.rs:282:        let potential_new_file = self.fs().lookup_inode(file.ino)?;
+kernel/src/fs/fs_impls/ext2/inode.rs:327:        let potential_new_dir = self.fs().lookup_inode(dir_inode.ino)?;
+kernel/src/fs/fs_impls/ext2/inode.rs:359:        let fs = self.fs();
+kernel/src/fs/fs_impls/ext2/inode.rs:474:        let fs = self.fs();
+kernel/src/fs/fs_impls/ext2/inode.rs:1251:        self.inode().fs()
+kernel/src/fs/fs_impls/ext2/inode.rs:1375:                    .fs()
+kernel/src/fs/fs_impls/ext2/inode.rs:1385:        inode.fs().sync_inode(inode.ino(), &self.desc)?;
+kernel/src/fs/fs_impls/ext2/inode.rs:1413:            if new_blocks - old_blocks > self.fs().super_block().free_blocks_count() {
+kernel/src/fs/fs_impls/ext2/inode.rs:1473:                ((id + 1) / self.fs().blocks_per_group()) as usize
+kernel/src/fs/fs_impls/ext2/inode.rs:1479:                .fs()
+kernel/src/fs/fs_impls/ext2/inode.rs:1483:                self.fs().free_blocks(device_range).unwrap();
+kernel/src/fs/fs_impls/ext2/inode.rs:1499:                let Some(mut range) = self.fs().alloc_blocks(block_group_idx, total_cnt) else {
+kernel/src/fs/fs_impls/ext2/inode.rs:1501:                        self.fs()
+kernel/src/fs/fs_impls/ext2/inode.rs:1529:            self.fs().free_blocks(device_range).unwrap();
+kernel/src/fs/fs_impls/ext2/inode.rs:1724:        let fs = self.fs();
+kernel/src/fs/fs_impls/ext2/inode.rs:1760:                self.fs()
+kernel/src/fs/fs_impls/ext2/inode.rs:1770:                let fs = self.fs();
+kernel/src/fs/fs_impls/ext2/inode.rs:1794:                let fs = self.fs();
+kernel/src/fs/fs_impls/ext2/inode.rs:1868:            let waiter = self.fs().read_blocks_async(start_bid, bio_segment)?;
+kernel/src/fs/fs_impls/ext2/inode.rs:1905:            let waiter = self.fs().read_blocks_async(start_bid, bio_segment)?;
+kernel/src/fs/fs_impls/ext2/inode.rs:1929:            let waiter = self.fs().write_blocks_async(start_bid, bio_segment)?;
+kernel/src/fs/fs_impls/ext2/inode.rs:1954:            let waiter = self.fs().write_blocks_async(start_bid, bio_segment)?;
+kernel/src/fs/fs_impls/ext2/impl_for_vfs/inode.rs:227:        self.fs().block_device().sync()?;
+kernel/src/fs/fs_impls/ext2/impl_for_vfs/inode.rs:233:        self.fs().block_device().sync()?;
+kernel/src/fs/fs_impls/ext2/impl_for_vfs/inode.rs:238:        self.fs()
+kernel/src/fs/fs_impls/ext2/indirect_block_cache.rs:43:        let fs = self.fs();
+kernel/src/fs/fs_impls/ext2/indirect_block_cache.rs:64:        let fs = self.fs();
+kernel/src/fs/fs_impls/ext2/indirect_block_cache.rs:120:                bio_waiter.concat(self.fs().write_blocks_async(bid, bio_segment)?);
+kernel/src/fs/utils/systree_inode.rs:168:        let sb = self.fs().sb();
+kernel/src/fs/utils/systree_inode.rs:255:        let sb = self.fs().sb();
+kernel/src/fs/utils/systree_inode.rs:446:        let sb = self.fs().sb();
+kernel/src/fs/fs_impls/overlayfs/fs.rs:173:        let fs = self.fs();
+kernel/src/fs/fs_impls/ramfs/fs.rs:894:        if !Arc::ptr_eq(&self.fs(), &old.fs()) {
+kernel/src/fs/fs_impls/ramfs/fs.rs:1021:        if !Arc::ptr_eq(&self.fs(), &target.fs()) {
+kernel/src/fs/fs_impls/procfs/template/file.rs:30:            let fs = parent.upgrade().unwrap().fs();
+kernel/src/fs/fs_impls/procfs/template/sym.rs:30:            let fs = parent.upgrade().unwrap().fs();
+kernel/src/fs/fs_impls/procfs/template/dir.rs:62:            let fs = parent.upgrade().unwrap().fs();
+kernel/src/fs/fs_impls/procfs/pid/task/mountstats.rs:70:            let fs_type = mount.fs().name();
+kernel/src/fs/fs_impls/procfs/pid/task/mountinfo.rs:126:            let fs_type = mount.fs().name();
+kernel/src/fs/fs_impls/procfs/pid/task/mountinfo.rs:128:            let fs_flags = mount.fs().flags();
+kernel/src/fs/fs_impls/procfs/pid/task/mounts.rs:86:            let fs_type = mount.fs().name();
+kernel/src/fs/fs_impls/exfat/fat.rs:98:        self.fs().cluster_size()
+kernel/src/fs/fs_impls/exfat/fat.rs:128:            + self.fs().super_block().data_start_sector as usize
+kernel/src/fs/fs_impls/exfat/fat.rs:129:                * self.fs().super_block().sector_size as usize
+kernel/src/fs/fs_impls/exfat/fat.rs:134:        let cluster_size = self.fs().cluster_size();
+kernel/src/fs/fs_impls/exfat/fat.rs:142:        self.fs().is_valid_cluster(self.current)
+kernel/src/fs/fs_impls/exfat/fat.rs:156:                let fat = self.fs().read_next_fat(cluster)?;
+kernel/src/fs/fs_impls/exfat/fat.rs:181:                let fat = self.fs().read_next_fat(result_cluster)?;
+kernel/src/fs/fs_impls/exfat/fat.rs:231:        let fs = self.fs();
+kernel/src/fs/fs_impls/exfat/fat.rs:258:        let fs = self.fs();
+kernel/src/fs/fs_impls/exfat/fat.rs:293:        let fs = self.fs();
+kernel/src/fs/fs_impls/exfat/fat.rs:351:        let fs = self.fs();
+kernel/src/fs/fs_impls/exfat/fat.rs:369:                self.fs()
+kernel/src/fs/fs_impls/exfat/inode.rs:145:        let sector_id = inner.get_sector_id(idx * PAGE_SIZE / inner.fs().sector_size())?;
+kernel/src/fs/fs_impls/exfat/inode.rs:150:        let waiter = inner.fs().block_device().read_blocks_async(
+kernel/src/fs/fs_impls/exfat/inode.rs:151:            BlockId::from_offset(sector_id * inner.fs().sector_size()),
+kernel/src/fs/fs_impls/exfat/inode.rs:159:        let sector_size = inner.fs().sector_size();
+kernel/src/fs/fs_impls/exfat/inode.rs:161:        let sector_id = inner.get_sector_id(idx * PAGE_SIZE / inner.fs().sector_size())?;
+kernel/src/fs/fs_impls/exfat/inode.rs:169:        let waiter = inner.fs().block_device().write_blocks_async(
+kernel/src/fs/fs_impls/exfat/inode.rs:170:            BlockId::from_offset(sector_id * inner.fs().sector_size()),
+kernel/src/fs/fs_impls/exfat/inode.rs:197:        self.fs().find_opened_inode(self.parent_hash)
+kernel/src/fs/fs_impls/exfat/inode.rs:204:            .walk_to_cluster_at_offset(sector_id * self.fs().sector_size())?;
+kernel/src/fs/fs_impls/exfat/inode.rs:206:        let sect_per_cluster = self.fs().super_block().sect_per_cluster as usize;
+kernel/src/fs/fs_impls/exfat/inode.rs:210:        let sec_offset = sector_id % (self.fs().super_block().sect_per_cluster as usize);
+kernel/src/fs/fs_impls/exfat/inode.rs:211:        Ok(self.fs().cluster_to_off(cluster) / self.fs().sector_size() + sec_offset)
+kernel/src/fs/fs_impls/exfat/inode.rs:227:            .checked_mul(self.fs().cluster_size() / SECTOR_SIZE)
+kernel/src/fs/fs_impls/exfat/inode.rs:249:            .make_mode(self.fs().mount_option(), InodeMode::all())
+kernel/src/fs/fs_impls/exfat/inode.rs:275:        let fs = self.fs();
+kernel/src/fs/fs_impls/exfat/inode.rs:383:        let fs = self.fs();
+kernel/src/fs/fs_impls/exfat/inode.rs:431:        let fs = self.fs();
+kernel/src/fs/fs_impls/exfat/inode.rs:492:        let fs = self.fs();
+kernel/src/fs/fs_impls/exfat/inode.rs:546:        let fs = self.fs();
+kernel/src/fs/fs_impls/exfat/inode.rs:587:        self.fs().bitmap().lock().sync()?;
+kernel/src/fs/fs_impls/exfat/inode.rs:653:        let sector_size = inner.fs().sector_size();
+kernel/src/fs/fs_impls/exfat/inode.rs:671:        let cluster_size = inner.fs().cluster_size();
+kernel/src/fs/fs_impls/exfat/inode.rs:678:                .fs()
+kernel/src/fs/fs_impls/exfat/inode.rs:706:            let fs = inner.fs();
+kernel/src/fs/fs_impls/exfat/inode.rs:733:            let fs = inner.fs();
+kernel/src/fs/fs_impls/exfat/inode.rs:762:                let fs = inner.fs();
+kernel/src/fs/fs_impls/exfat/inode.rs:776:        let cluster_size = inner.fs().cluster_size();
+kernel/src/fs/fs_impls/exfat/inode.rs:783:            let fs = inner.fs();
+kernel/src/fs/fs_impls/exfat/inode.rs:803:            let fs = inner.fs();
+kernel/src/fs/fs_impls/exfat/inode.rs:814:        let fs = inner.fs();
+kernel/src/fs/fs_impls/exfat/inode.rs:875:        let fs = inner.fs();
+kernel/src/fs/fs_impls/exfat/inode.rs:1049:        let fs = inner.fs();
+kernel/src/fs/fs_impls/exfat/inode.rs:1090:        let fs = self.inner.read().fs();
+kernel/src/fs/fs_impls/exfat/inode.rs:1144:        let fs = self.inner.read().fs();
+kernel/src/fs/fs_impls/exfat/inode.rs:1226:            let child_inode = inner.fs().find_opened_inode(child_hash).unwrap();
+kernel/src/fs/fs_impls/exfat/inode.rs:1252:        self.inner.read().fs().remove_inode(inode.hash_index());
+kernel/src/fs/fs_impls/exfat/inode.rs:1337:        let fs = inner.fs();
+kernel/src/fs/fs_impls/exfat/inode.rs:1361:        let blk_size = inner.fs().sector_size();
+kernel/src/fs/fs_impls/exfat/inode.rs:1380:            uid: Uid::new(inner.fs().mount_option().fs_uid as u32),
+kernel/src/fs/fs_impls/exfat/inode.rs:1381:            gid: Gid::new(inner.fs().mount_option().fs_gid as u32),
+kernel/src/fs/fs_impls/exfat/inode.rs:1382:            container_dev_id: inner.fs().container_device_id(),
+kernel/src/fs/fs_impls/exfat/inode.rs:1426:            self.inner.read().fs().mount_option().fs_uid as u32,
+kernel/src/fs/fs_impls/exfat/inode.rs:1437:            self.inner.read().fs().mount_option().fs_gid as u32,
+kernel/src/fs/fs_impls/exfat/inode.rs:1447:        self.inner.read().fs()
+kernel/src/fs/fs_impls/exfat/inode.rs:1455:        let fs = self.inner.read().fs();
+kernel/src/fs/fs_impls/exfat/inode.rs:1499:            let fs = inner.fs();
+kernel/src/fs/fs_impls/exfat/inode.rs:1560:        let fs = self.inner.read().fs();
+kernel/src/fs/fs_impls/exfat/inode.rs:1594:        let fs = self.inner.read().fs();
+kernel/src/fs/fs_impls/exfat/inode.rs:1629:            let fs = inner.fs();
+kernel/src/fs/fs_impls/exfat/inode.rs:1655:        let fs = self.inner.read().fs();
+kernel/src/fs/fs_impls/exfat/inode.rs:1717:        let fs = inner.fs();
+kernel/src/fs/fs_impls/exfat/inode.rs:1728:        let fs = inner.fs();
+kernel/src/syscall/statfs.rs:32:        path.fs().sb()
+kernel/src/syscall/statfs.rs:53:        file.path().fs().sb()
+kernel/src/fs/fs_impls/exfat/bitmap.rs:118:        if !self.fs().is_cluster_range_valid(clusters.clone()) {
+kernel/src/fs/fs_impls/exfat/bitmap.rs:143:            .fs()
+kernel/src/fs/fs_impls/exfat/bitmap.rs:150:        let end_index = self.fs().super_block().num_clusters - EXFAT_RESERVED_CLUSTERS;
+kernel/src/fs/fs_impls/exfat/bitmap.rs:256:            .fs()
+kernel/src/fs/fs_impls/exfat/bitmap.rs:267:        let total_cluster_num = self.fs().super_block().num_clusters - EXFAT_RESERVED_CLUSTERS;
+kernel/src/fs/fs_impls/exfat/bitmap.rs:334:        if !self.fs().is_cluster_range_valid(clusters.clone()) {
+kernel/src/fs/fs_impls/exfat/bitmap.rs:367:        self.fs().write_meta_at(phys_offset, byte_chunk)?;
+kernel/src/fs/fs_impls/exfat/bitmap.rs:372:            self.fs().sync_meta_at(byte_range.clone())?;
+kernel/src/fs/fs_impls/exfat/bitmap.rs:382:            self.fs().sync_meta_at(range)?;
+kernel/src/syscall/sync.rs:21:    file.path().fs().sync()?;
+
+exec
+/bin/bash -lc "sed -n '1,180p' kernel/src/fs/vfs/path/mod.rs && printf '\\n---\\n' && sed -n '1,220p' kernel/src/fs/vfs/path/mount_namespace.rs && printf '\\n---\\n' && sed -n '1,140p' kernel/src/fs/fs_impls/tmpfs/fs.rs && printf '\\n---\\n' && sed -n '1,180p' kernel/src/syscall/statfs.rs" in /tmp/tmp.sRk6BQPy6c/wt1
+ succeeded in 0ms:
+// SPDX-License-Identifier: MPL-2.0
+
+//! Form file paths within and across FSes with dentries and mount points.
+
+use core::time::Duration;
+
+pub(in crate::fs) use dentry::Dentry;
+use dentry::DirDentry;
+use inherit_methods_macro::inherit_methods;
+use mount::MountNsFileCopying;
+pub use mount::{Mount, MountPropType, PerMountFlags};
+pub use mount_namespace::MountNamespace;
+pub use resolver::{
+    AT_FDCWD, AbsPathResult, EmptyPathStr, FsPath, LookupResult, PathResolver, SplitPath,
+};
+
+use crate::{
+    fs::{
+        file::{
+            CreationFlags, InodeHandle, InodeMode, InodeType, OpenArgs, Permission, StatusFlags,
+        },
+        pseudofs::NsInode,
+        vfs::{
+            file_system::{FileSystem, FsFlags},
+            inode::{Inode, Metadata, MknodType},
+            xattr::{XattrName, XattrNamespace, XattrSetFlags},
+        },
+    },
+    prelude::*,
+    process::{Gid, Uid},
+};
+
+mod dentry;
+mod mount;
+mod mount_namespace;
+mod resolver;
+
+/// A `Path` is used to represent an exact location in the VFS tree.
+///
+/// Each `Path` corresponds to a node in the VFS tree, and a single node
+/// may have multiple `Path` instances referencing it due to mount operations.
+#[derive(Clone, Debug)]
+pub struct Path {
+    mount: Arc<Mount>,
+    dentry: Arc<Dentry>,
+}
+
+impl PartialEq for Path {
+    fn eq(&self, other: &Self) -> bool {
+        self.mount.id() == other.mount.id() && Arc::ptr_eq(&self.dentry, &other.dentry)
+    }
+}
+
+impl Eq for Path {}
+
+impl Path {
+    /// Creates a new `Path` to represent the root directory of a file system.
+    pub fn new_fs_root(mount: Arc<Mount>) -> Self {
+        let inner = mount.root_dentry().clone();
+        Self::new(mount, inner)
+    }
+
+    /// Creates a new `Path` to represent the child directory of a file system.
+    pub fn new_fs_child(&self, name: &str, type_: InodeType, mode: InodeMode) -> Result<Self> {
+        if self
+            .inode()
+            .check_permission(Permission::MAY_WRITE)
+            .is_err()
+        {
+            return_errno!(Errno::EACCES);
+        }
+        let new_child_dentry = self
+            .dentry
+            .as_dir_dentry_or_err()?
+            .create(name, type_, mode)?;
+        Ok(Self::new(self.mount.clone(), new_child_dentry))
+    }
+
+    /// Creates a new pseudo `Path`.
+    pub(in crate::fs) fn new_pseudo(
+        mount: Arc<Mount>,
+        inode: Arc<dyn Inode>,
+        name_fn: fn(&dyn Inode) -> String,
+    ) -> Self {
+        let dentry = Dentry::new_pseudo(inode, name_fn);
+        Self::new(mount, dentry)
+    }
+
+    pub(in crate::fs) fn new(mount: Arc<Mount>, dentry: Arc<Dentry>) -> Self {
+        Self { mount, dentry }
+    }
+
+    /// Gets the mount node of current `Path`.
+    pub fn mount_node(&self) -> &Arc<Mount> {
+        &self.mount
+    }
+
+    /// Gets the dentry of current `Path`.
+    pub(in crate::fs) fn dentry(&self) -> &Arc<Dentry> {
+        &self.dentry
+    }
+
+    // Gets the file system of current `Path`.
+    pub fn fs(&self) -> &Arc<dyn FileSystem> {
+        self.mount.fs()
+    }
+
+    /// Returns true if the current `Path` is the root of its mount.
+    pub fn is_mount_root(&self) -> bool {
+        Arc::ptr_eq(&self.dentry, self.mount.root_dentry())
+    }
+
+    /// Opens the `Path` with the given `OpenArgs`.
+    ///
+    /// Returns an `InodeHandle` on success.
+    pub fn open(&self, open_args: OpenArgs) -> Result<InodeHandle> {
+        let inode = self.inode().as_ref();
+        let inode_type = inode.type_();
+        let creation_flags = &open_args.creation_flags;
+        let status_flags = &open_args.status_flags;
+
+        if creation_flags.contains(CreationFlags::O_CREAT)
+            && creation_flags.contains(CreationFlags::O_EXCL)
+        {
+            return_errno_with_message!(Errno::EEXIST, "the file already exists");
+        }
+        if creation_flags.contains(CreationFlags::O_CREAT) && inode_type == InodeType::Dir {
+            return_errno_with_message!(
+                Errno::EISDIR,
+                "O_CREAT is specified but the file is a directory"
+            );
+        }
+
+        if inode_type == InodeType::SymLink
+            && creation_flags.contains(CreationFlags::O_NOFOLLOW)
+            && !status_flags.contains(StatusFlags::O_PATH)
+        {
+            return_errno_with_message!(Errno::ELOOP, "the file is a symlink");
+        }
+        if creation_flags.contains(CreationFlags::O_DIRECTORY) && inode_type != InodeType::Dir {
+            return_errno_with_message!(
+                Errno::ENOTDIR,
+                "O_DIRECTORY is specified but the file is not a directory"
+            );
+        }
+
+        if inode_type.is_regular_file()
+            && creation_flags.contains(CreationFlags::O_TRUNC)
+            && !status_flags.contains(StatusFlags::O_PATH)
+        {
+            self.resize(0)?;
+        }
+
+        InodeHandle::new(self.clone(), open_args.access_mode, *status_flags)
+    }
+
+    /// Gets the real name of the `Path` from its dentry.
+    pub fn name(&self) -> String {
+        self.dentry.name()
+    }
+
+    /// Gets the parent `Path` within the same mount.
+    ///
+    /// This method returns the parent path within the same filesystem/mount.
+    /// It does NOT cross mount boundaries. If the current path is the root of a mount,
+    /// it will return `None`.
+    ///
+    /// For cross-filesystem parent lookup, use `effective_parent()` instead.
+    pub(super) fn parent_within_mount(&self) -> Option<Self> {
+        let parent = self.dentry.parent()?;
+        Some(Self::new(self.mount.clone(), parent))
+    }
+
+    /// Gets the top `Path` of the current.
+    ///
+    /// Used when different file systems are mounted on the same mount point.
+    ///
+    /// For example, first `mount /dev/sda1 /mnt` and then `mount /dev/sda2 /mnt`.
+    /// After the second mount is completed, the content of the first mount will be overridden.
+    /// We need to recursively obtain the top `Path`.
+
+---
+// SPDX-License-Identifier: MPL-2.0
+
+use spin::Once;
+
+use super::{mount::MountNsFileCopying, try_get_mnt_ns_inode};
+use crate::{
+    fs::{
+        fs_impls::ramfs::RamFs,
+        pseudofs::{NsCommonOps, NsType, StashedDentry},
+        vfs::path::{Dentry, Mount, Path, PathResolver},
+    },
+    prelude::*,
+    process::{UserNamespace, credentials::capabilities::CapSet, posix_thread::PosixThread},
+};
+
+/// Represents a mount namespace, which encapsulates a mount tree and provides
+/// isolation for filesystem views between different threads.
+///
+/// A `MountNamespace` only allows operations on [`Mount`]s that belong to that `MountNamespace`.
+/// If the operation target includes [`Mount`]s from other `MountNamespace`s, it will be directly
+/// rejected and return an `Err`.
+pub struct MountNamespace {
+    /// The root mount of this namespace.
+    root: Arc<Mount>,
+    /// The user namespace that owns this mount namespace.
+    owner: Arc<UserNamespace>,
+    /// The stashed dentry in nsfs.
+    stashed_dentry: StashedDentry,
+}
+
+impl PartialEq for MountNamespace {
+    fn eq(&self, other: &Self) -> bool {
+        self.stashed_dentry == other.stashed_dentry
+    }
+}
+
+impl Eq for MountNamespace {}
+
+impl PartialOrd for MountNamespace {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MountNamespace {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.stashed_dentry.cmp(&other.stashed_dentry)
+    }
+}
+
+impl MountNamespace {
+    /// Returns a reference to the singleton initial mount namespace.
+    #[doc(hidden)]
+    pub fn get_init_singleton() -> &'static Arc<MountNamespace> {
+        static INIT: Once<Arc<MountNamespace>> = Once::new();
+
+        INIT.call_once(|| {
+            let owner = UserNamespace::get_init_singleton().clone();
+            let rootfs = RamFs::new_rootfs();
+
+            Arc::new_cyclic(|weak_self| {
+                let root = Mount::new_root(rootfs, weak_self.clone());
+                let stashed_dentry = StashedDentry::new();
+                MountNamespace {
+                    root,
+                    owner,
+                    stashed_dentry,
+                }
+            })
+        })
+    }
+
+    /// Gets the root mount of this namespace.
+    pub fn root(&self) -> &Arc<Mount> {
+        &self.root
+    }
+
+    /// Creates a new filesystem resolver for this namespace.
+    ///
+    /// The resolver is initialized with the root and current working directory
+    /// both set to the **effective root** of this mount namespace.
+    ///
+    /// The "effective root" refers to the currently visible root directory, which
+    /// may differ from the original root filesystem if overlay mounts exist.
+    pub fn new_path_resolver(&self) -> PathResolver {
+        let root = Path::new_fs_root(self.root.clone()).get_top_path();
+        let cwd = Path::new_fs_root(self.root.clone()).get_top_path();
+        PathResolver::new(root, cwd)
+    }
+
+    /// Creates a deep copy of this mount namespace, including the entire mount tree.
+    ///
+    /// This is typically used when creating a new namespace for a process or thread.
+    pub fn new_clone(
+        &self,
+        owner: Arc<UserNamespace>,
+        posix_thread: &PosixThread,
+    ) -> Result<Arc<MountNamespace>> {
+        owner.check_cap(CapSet::SYS_ADMIN, posix_thread)?;
+
+        let root_mount = &self.root;
+        let new_mnt_ns = Arc::new_cyclic(|weak_self| {
+            let new_root = root_mount.clone_mount_tree(
+                root_mount.root_dentry(),
+                weak_self,
+                true,
+                MountNsFileCopying::Skip,
+            );
+            let stashed_dentry = StashedDentry::new();
+            MountNamespace {
+                root: new_root,
+                owner,
+                stashed_dentry,
+            }
+        });
+
+        Ok(new_mnt_ns)
+    }
+
+    /// Flushes all pending filesystem metadata and cached file data to the device
+    /// for all mounted filesystems in this mount namespace.
+    pub fn sync(&self) -> Result<()> {
+        let mut mount_queue = VecDeque::new();
+        let mut visited_filesystems = hashbrown::HashSet::new();
+        mount_queue.push_back(self.root.clone());
+
+        while let Some(current_mount) = mount_queue.pop_front() {
+            let fs_ptr = Arc::as_ptr(current_mount.fs());
+            // Only sync each filesystem once.
+            if visited_filesystems.insert(fs_ptr) {
+                current_mount.sync()?;
+            }
+
+            let children = current_mount.children.read();
+            for child_mount in children.values() {
+                mount_queue.push_back(child_mount.clone());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Checks whether a given mount belongs to this mount namespace.
+    pub fn owns(self: &Arc<Self>, mount: &Mount) -> bool {
+        mount.mnt_ns().as_ptr() == Arc::as_ptr(self)
+    }
+
+    /// Returns whether bind-mounting or moving `dentry` into this mount namespace
+    /// would create a mount-namespace loop.
+    pub(super) fn would_form_mnt_ns_loop(&self, dentry: &Dentry) -> bool {
+        let Some(mnt_ns_inode) = try_get_mnt_ns_inode(dentry) else {
+            return false;
+        };
+
+        self >= mnt_ns_inode.ns().as_ref()
+    }
+
+    /// Ensures that importing the mount subtree rooted at `root_mount` into this
+    /// mount namespace would not form a mount-namespace loop.
+    pub(super) fn check_no_mnt_ns_loop_in_tree(&self, root_mount: &Arc<Mount>) -> Result<()> {
+        let mut worklist = VecDeque::new();
+        worklist.push_back(root_mount.clone());
+
+        let mut checked_root_dentries = BTreeSet::new();
+
+        while let Some(mount) = worklist.pop_front() {
+            let root_dentry = mount.root_dentry();
+            if checked_root_dentries.insert(root_dentry.key())
+                && self.would_form_mnt_ns_loop(root_dentry)
+            {
+                return_errno_with_message!(
+                    Errno::ELOOP,
+                    "the mount tree contains a mount namespace file that would create a namespace loop"
+                );
+            }
+            let children = mount.children.read();
+            worklist.extend(children.values().cloned());
+        }
+
+        Ok(())
+    }
+}
+
+// When a mount namespace is dropped, it means that the corresponding mount
+// tree is no longer valid. Therefore, all mounts in its mount tree should be
+// detached from their parents and cleared of their mountpoints.
+impl Drop for MountNamespace {
+    fn drop(&mut self) {
+        let mut worklist = VecDeque::new();
+        worklist.push_back(self.root.clone());
+        while let Some(current_mount) = worklist.pop_front() {
+            let mut children = current_mount.children.write();
+            for (_, child) in children.drain() {
+                child.set_parent(None);
+                child.clear_mountpoint();
+                worklist.push_back(child);
+            }
+        }
+    }
+}
+
+impl NsCommonOps for MountNamespace {
+    const TYPE: NsType = NsType::Mnt;
+
+    fn owner_user_ns(&self) -> Option<&Arc<UserNamespace>> {
+        Some(&self.owner)
+    }
+
+    fn parent(&self) -> Result<&Arc<Self>> {
+        return_errno_with_message!(
+            Errno::EINVAL,
+            "a mount namespace does not have a parent namespace"
+        );
+    }
+
+    fn stashed_dentry(&self) -> &StashedDentry {
+        &self.stashed_dentry
+    }
+}
+
+---
+// SPDX-License-Identifier: MPL-2.0
+
+use super::TMPFS_MAGIC;
+use crate::{
+    fs::{
+        ramfs::RamFs,
+        vfs::{
+            file_system::{FileSystem, FsEventSubscriberStats, SuperBlock},
+            inode::Inode,
+            registry::{FsCreationCtx, FsProperties, FsType},
+        },
+    },
+    prelude::*,
+};
+
+/// The temporary file system (tmpfs) structure.
+//
+// TODO: Currently, tmpfs is implemented as a thin wrapper around ramfs.
+// In the future we need to implement tmpfs-specific features such as
+// memory limits and swap support.
+pub struct TmpFs {
+    inner: Arc<RamFs>,
+}
+
+impl TmpFs {
+    pub fn new() -> Arc<Self> {
+        Arc::new(TmpFs {
+            inner: RamFs::new(),
+        })
+    }
+}
+
+impl FileSystem for TmpFs {
+    fn name(&self) -> &'static str {
+        "tmpfs"
+    }
+
+    fn sync(&self) -> Result<()> {
+        // do nothing
+        Ok(())
+    }
+
+    fn root_inode(&self) -> Arc<dyn Inode> {
+        self.inner.root_inode()
+    }
+
+    fn sb(&self) -> SuperBlock {
+        // TODO: Tmpfs currently wraps RamFs, whose inodes still point to the
+        // inner RamFs. Override statfs-visible fields here as a workaround
+        // rather than changing the semantics of ordinary RamFs instances.
+        let mut sb = self.inner.sb();
+        let max_blocks = default_max_blocks();
+        let max_inodes = default_max_inodes();
+
+        sb.magic = TMPFS_MAGIC;
+        sb.blocks = max_blocks;
+        sb.bfree = max_blocks;
+        sb.bavail = max_blocks;
+        sb.files = max_inodes;
+        sb.ffree = max_inodes;
+        sb
+    }
+
+    fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
+        self.inner.fs_event_subscriber_stats()
+    }
+}
+
+fn default_max_blocks() -> usize {
+    crate::vm::mem_total() / PAGE_SIZE / 2
+}
+
+fn default_max_inodes() -> usize {
+    crate::vm::mem_total() / PAGE_SIZE / 2
+}
+
+pub(super) struct TmpFsType;
+
+impl FsType for TmpFsType {
+    fn name(&self) -> &'static str {
+        "tmpfs"
+    }
+
+    fn properties(&self) -> FsProperties {
+        FsProperties::empty()
+    }
+
+    fn create(&self, _fs_creation_ctx: &FsCreationCtx) -> Result<Arc<dyn FileSystem>> {
+        Ok(TmpFs::new())
+    }
+
+    fn sysnode(&self) -> Option<Arc<dyn aster_systree::SysNode>> {
+        None
+    }
+}
+
+---
+// SPDX-License-Identifier: MPL-2.0
+
+use ostd::mm::VmIo;
+
+use super::SyscallReturn;
+use crate::{
+    fs::{
+        file::file_table::{RawFileDesc, get_file_fast},
+        utils::PATH_MAX,
+        vfs::{file_system::SuperBlock, path::FsPath},
+    },
+    prelude::*,
+};
+
+pub fn sys_statfs(path_ptr: Vaddr, statfs_buf_ptr: Vaddr, ctx: &Context) -> Result<SyscallReturn> {
+    let user_space = ctx.user_space();
+    let path_name = user_space.read_cstring(path_ptr, PATH_MAX)?;
+    debug!(
+        "path = {:?}, statfs_buf_ptr = 0x{:x}",
+        path_name, statfs_buf_ptr,
+    );
+
+    let sb = {
+        let path_name = path_name.to_string_lossy();
+        let fs_path = FsPath::try_from(path_name.as_ref())?;
+        let path = ctx
+            .thread_local
+            .borrow_fs()
+            .resolver()
+            .read()
+            .lookup(&fs_path)?;
+        path.fs().sb()
+    };
+
+    let statfs = Statfs::from(sb);
+    user_space.write_val(statfs_buf_ptr, &statfs)?;
+    Ok(SyscallReturn::Return(0))
+}
+
+pub fn sys_fstatfs(
+    raw_fd: RawFileDesc,
+    statfs_buf_ptr: Vaddr,
+    ctx: &Context,
+) -> Result<SyscallReturn> {
+    debug!(
+        "raw_fd = {}, statfs_buf_addr = 0x{:x}",
+        raw_fd, statfs_buf_ptr
+    );
+
+    let sb = {
+        let mut file_table = ctx.thread_local.borrow_file_table_mut();
+        let file = get_file_fast!(&mut file_table, raw_fd.try_into()?);
+        file.path().fs().sb()
+    };
+
+    let statfs = Statfs::from(sb);
+    ctx.user_space().write_val(statfs_buf_ptr, &statfs)?;
+    Ok(SyscallReturn::Return(0))
+}
+
+/// FS Stat
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod)]
+struct Statfs {
+    /// Type of filesystem
+    f_type: u64,
+    /// Optimal transfer block size
+    f_bsize: usize,
+    /// Total data blocks in filesystem
+    f_blocks: usize,
+    /// Free blocks in filesystem
+    f_bfree: usize,
+    /// Free blocks available to unprivileged user
+    f_bavail: usize,
+    /// Total inodes in filesystem
+    f_files: usize,
+    /// Free inodes in filesystem
+    f_ffree: usize,
+    /// Filesystem ID
+    f_fsid: u64,
+    /// Maximum length of filenames
+    f_namelen: usize,
+    /// Fragment size
+    f_frsize: usize,
+    /// Mount flags of filesystem
+    f_flags: u64,
+    /// Padding bytes reserved for future use
+    f_spare: [u64; 4],
+}
+
+impl From<SuperBlock> for Statfs {
+    fn from(sb: SuperBlock) -> Self {
+        Self {
+            f_type: sb.magic,
+            f_bsize: sb.bsize,
+            f_blocks: sb.blocks,
+            f_bfree: sb.bfree,
+            f_bavail: sb.bavail,
+            f_files: sb.files,
+            f_ffree: sb.ffree,
+            f_fsid: sb.fsid,
+            f_namelen: sb.namelen,
+            f_frsize: sb.frsize,
+            f_flags: sb.flags,
+            f_spare: [0u64; 4],
+        }
+    }
+}
+
+exec
+/bin/bash -lc "sed -n '1,140p' kernel/src/fs/fs_impls/ramfs/fs.rs && printf '\\n---\\n' && rg -n \"struct SuperBlock|impl Default for SuperBlock|type SuperBlock\" kernel/src/fs -g'*.rs'" in /tmp/tmp.sRk6BQPy6c/wt1
+ succeeded in 0ms:
+// SPDX-License-Identifier: MPL-2.0
+
+use core::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
+
+use align_ext::AlignExt;
+use aster_block::{SECTOR_SIZE, bio::BioWaiter};
+use aster_util::slot_vec::SlotVec;
+use device_id::DeviceId;
+use hashbrown::HashMap;
+use ostd::{
+    mm::{HasSize, io::util::HasVmReaderWriter},
+    sync::{PreemptDisabled, RwLockWriteGuard},
+};
+
+use super::{memfd::MemfdInode, xattr::RamXattr, *};
+use crate::{
+    device::{self, DeviceType},
+    fs::{
+        file::{AccessMode, FileIo, InodeMode, InodeType, Permission, StatusFlags, mkmod},
+        pipe::Pipe,
+        pseudofs::AnonDeviceId,
+        utils::{CStr256, DirentVisitor},
+        vfs::{
+            file_system::{FileSystem, FsEventSubscriberStats, SuperBlock},
+            inode::{Extension, FallocMode, Inode, InodeIo, Metadata, MknodType, SymbolicLink},
+            page_cache::{CachePage, PageCache, PageCacheBackend},
+            path::{is_dot, is_dot_or_dotdot, is_dotdot},
+            registry::{FsCreationCtx, FsProperties, FsType},
+            xattr::{XattrName, XattrNamespace, XattrSetFlags},
+        },
+    },
+    prelude::*,
+    process::{Gid, Uid},
+    time::clocks::RealTimeCoarseClock,
+    vm::vmo::Vmo,
+};
+
+/// A volatile file system whose data and metadata exists only in memory.
+pub struct RamFs {
+    name: &'static str,
+    _anon_device_id: AnonDeviceId,
+    /// The super block
+    sb: SuperBlock,
+    /// Root inode
+    root: Arc<RamInode>,
+    /// An inode allocator
+    inode_allocator: AtomicU64,
+    /// FS event subscriber stats for this file system
+    fs_event_subscriber_stats: FsEventSubscriberStats,
+}
+
+impl RamFs {
+    pub fn new() -> Arc<Self> {
+        Self::new_internal("ramfs")
+    }
+
+    pub(in crate::fs) fn new_rootfs() -> Arc<Self> {
+        Self::new_internal("rootfs")
+    }
+
+    fn new_internal(name: &'static str) -> Arc<Self> {
+        let anon_device_id = AnonDeviceId::acquire().expect("no device ID is available for ramfs");
+        let root_dev_id = anon_device_id.id();
+        Arc::new_cyclic(move |weak_fs| Self {
+            name,
+            _anon_device_id: anon_device_id,
+            sb: SuperBlock::new(RAMFS_MAGIC, BLOCK_SIZE, NAME_MAX, root_dev_id),
+            root: Arc::new_cyclic(|weak_root| RamInode {
+                inner: Inner::new_dir(weak_root.clone(), weak_root.clone()),
+                metadata: SpinLock::new(InodeMeta::new_dir(
+                    mkmod!(a+rx, u+w),
+                    Uid::new_root(),
+                    Gid::new_root(),
+                )),
+                ino: ROOT_INO,
+                typ: InodeType::Dir,
+                this: weak_root.clone(),
+                fs: weak_fs.clone(),
+                container_dev_id: root_dev_id,
+                extension: Extension::new(),
+                xattr: RamXattr::new(),
+            }),
+            inode_allocator: AtomicU64::new(ROOT_INO + 1),
+            fs_event_subscriber_stats: FsEventSubscriberStats::new(),
+        })
+    }
+
+    fn alloc_id(&self) -> u64 {
+        self.inode_allocator.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+impl FileSystem for RamFs {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn sync(&self) -> Result<()> {
+        // do nothing
+        Ok(())
+    }
+
+    fn root_inode(&self) -> Arc<dyn Inode> {
+        self.root.clone()
+    }
+
+    fn sb(&self) -> SuperBlock {
+        self.sb.clone()
+    }
+
+    fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
+        &self.fs_event_subscriber_stats
+    }
+}
+
+/// An inode of `RamFs`.
+pub(super) struct RamInode {
+    /// Inode inner specifics
+    inner: Inner,
+    /// Inode metadata
+    metadata: SpinLock<InodeMeta>,
+    /// Inode number
+    ino: u64,
+    /// Type of the inode
+    typ: InodeType,
+    /// Reference to self
+    this: Weak<RamInode>,
+    /// Reference to fs
+    fs: Weak<RamFs>,
+    /// Device ID.
+    /// Detached inodes such as `memfd` store it directly
+    /// because they do not have a valid fs reference.
+    container_dev_id: DeviceId,
+    /// Extensions
+    extension: Extension,
+    /// Extended attributes
+    xattr: RamXattr,
+
+---
+kernel/src/fs/vfs/fs_apis/file_system.rs:69:pub struct SuperBlock {
+kernel/src/fs/fs_impls/ext2/super_block.rs:19:pub struct SuperBlock {
+
+exec
+/bin/bash -lc "sed -n '1,220p' kernel/src/fs/vfs/fs_apis/file_system.rs" in /tmp/tmp.sRk6BQPy6c/wt1
+ succeeded in 0ms:
+// SPDX-License-Identifier: MPL-2.0
+
+use core::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+
+use atomic_integer_wrapper::define_atomic_version_of_integer_like_type;
+use device_id::DeviceId;
+
+use super::inode::Inode;
+use crate::prelude::*;
+
+/// Common interface implemented by each concrete file system instance.
+pub trait FileSystem: Any + Sync + Send {
+    /// Gets the name of this FS type such as `"ext4"` or `"sysfs"`.
+    fn name(&self) -> &'static str;
+
+    /// Gets the source of this file system, e.g., the device name or user-provided source string.
+    fn source(&self) -> Option<&str> {
+        None
+    }
+
+    /// Syncs the file system.
+    fn sync(&self) -> Result<()>;
+
+    /// Returns the root inode of this file system.
+    ///
+    /// For each mount, the VFS invokes this method only once and eagerly when
+    /// it creates the mount root. It never defers the lookup to a later path
+    /// walk. For mounts created by `mount()`, the call happens in the thread
+    /// context that performs the syscall.
+    fn root_inode(&self) -> Arc<dyn Inode>;
+
+    /// Returns the super block of this file system.
+    fn sb(&self) -> SuperBlock;
+
+    /// Returns the flags of this file system.
+    fn flags(&self) -> FsFlags {
+        // TODO: Currently we do not support any flags for filesystems.
+        // Remove the default empty implementation in the future.
+        FsFlags::empty()
+    }
+
+    /// Sets the flags of this file system.
+    fn set_fs_flags(&self, _flags: FsFlags, _data: Option<CString>, _ctx: &Context) -> Result<()> {
+        // TODO: Remove the default empty implementation in the future.
+        warn!("setting file system flags is not implemented");
+        Ok(())
+    }
+
+    /// Returns the FS event subscriber stats of this file system.
+    fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats;
+}
+
+impl dyn FileSystem {
+    pub fn downcast_ref<T: FileSystem>(&self) -> Option<&T> {
+        (self as &dyn Any).downcast_ref::<T>()
+    }
+}
+
+impl Debug for dyn FileSystem {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        f.debug_struct("FileSystem")
+            .field("super_block", &self.sb())
+            .field("flags", &self.flags())
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SuperBlock {
+    pub magic: u64,
+    pub bsize: usize,
+    pub blocks: usize,
+    pub bfree: usize,
+    pub bavail: usize,
+    pub files: usize,
+    pub ffree: usize,
+    pub fsid: u64,
+    pub namelen: usize,
+    pub frsize: usize,
+    pub flags: u64,
+    pub container_dev_id: DeviceId,
+}
+
+impl SuperBlock {
+    pub fn new(magic: u64, block_size: usize, name_max_len: usize, dev_id: DeviceId) -> Self {
+        Self {
+            magic,
+            bsize: block_size,
+            blocks: 0,
+            bfree: 0,
+            bavail: 0,
+            files: 0,
+            ffree: 0,
+            fsid: 0,
+            namelen: name_max_len,
+            frsize: block_size,
+            flags: 0,
+            container_dev_id: dev_id,
+        }
+    }
+}
+
+bitflags! {
+    /// Flags for per file system.
+    pub struct FsFlags: u32 {
+        /// The filesystem is mounted read-only.
+        const RDONLY        =   1 << 0;
+        /// Writes are synced at once.
+        const SYNCHRONOUS   =   1 << 4;
+        /// Allow mandatory locks on an FS.
+        const MANDLOCK      =   1 << 6;
+        /// Directory modifications are synchronous.
+        const DIRSYNC       =   1 << 7;
+        /// Suppress certain messages in kernel log.
+        const SILENT        =   1 << 15;
+        /// Update the on-disk [acm]times lazily.
+        const LAZYTIME      =   1 << 25;
+    }
+}
+
+impl core::fmt::Display for FsFlags {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        if self.contains(FsFlags::RDONLY) {
+            write!(f, "ro")?;
+        } else {
+            write!(f, "rw")?;
+        }
+        if self.contains(FsFlags::SYNCHRONOUS) {
+            write!(f, ",sync")?;
+        }
+        if self.contains(FsFlags::MANDLOCK) {
+            write!(f, ",mandlock")?;
+        }
+        if self.contains(FsFlags::DIRSYNC) {
+            write!(f, ",dirsync")?;
+        }
+        if self.contains(FsFlags::SILENT) {
+            write!(f, ",silent")?;
+        }
+        if self.contains(FsFlags::LAZYTIME) {
+            write!(f, ",lazytime")?;
+        }
+        Ok(())
+    }
+}
+
+impl From<u32> for FsFlags {
+    fn from(value: u32) -> Self {
+        Self::from_bits_truncate(value)
+    }
+}
+
+impl From<FsFlags> for u32 {
+    fn from(value: FsFlags) -> Self {
+        value.bits()
+    }
+}
+
+define_atomic_version_of_integer_like_type!(FsFlags, {
+    /// An atomic version of `FsFlags`.
+    #[expect(dead_code)]
+    #[derive(Debug)]
+    pub struct AtomicFsFlags(AtomicU32);
+});
+
+#[derive(Debug)]
+pub struct FsEventSubscriberStats {
+    // The number of subscribers to this file system.
+    num_subscribers: AtomicI64,
+}
+
+impl FsEventSubscriberStats {
+    pub fn new() -> Self {
+        Self {
+            num_subscribers: AtomicI64::new(0),
+        }
+    }
+
+    pub fn add_subscriber(&self) {
+        self.num_subscribers.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn remove_subscriber(&self) {
+        let subscribers = self.num_subscribers.fetch_sub(1, Ordering::Release);
+        debug_assert!(
+            subscribers >= 0,
+            "the number of subscribers is negative: {} (removed one)",
+            subscribers
+        );
+    }
+
+    pub fn remove_subscribers(&self, num_subscribers: usize) {
+        let subscribers = self
+            .num_subscribers
+            .fetch_sub(num_subscribers as i64, Ordering::Release);
+        debug_assert!(
+            subscribers >= 0,
+            "the number of subscribers is negative: {} (removed {})",
+            subscribers,
+            num_subscribers
+        );
+    }
+
+    pub fn has_any_subscribers(&self) -> bool {
+        self.num_subscribers.load(Ordering::Acquire) > 0
+    }
+}
+
+exec
+/bin/bash -lc "rg -n \"statfs|tmpfs|TMPFS_MAGIC|f_type|filesystem probes\" -g'*.rs' -g'*.c' -g'*.md' kernel test book" in /tmp/tmp.sRk6BQPy6c/wt1
+ succeeded in 0ms:
+book/src/kernel/vm-based-containers/kata.md:69:    --tmpfs /tmp:exec,mode=1777,size=8g
+book/src/kernel/vm-based-containers/kata.md:70:    --tmpfs /var/lib/containerd:exec,mode=755,size=8g
+book/src/kernel/vm-based-containers/kata.md:82:- `--tmpfs /tmp:exec,...` and `--tmpfs /var/lib/containerd:exec,...`
+book/src/kernel/linux-compatibility/README.md:160:| 137     | statfs                 | ✅             | 💯 |
+book/src/kernel/linux-compatibility/README.md:161:| 138     | fstatfs                | ✅             | 💯 |
+book/src/kernel/linux-compatibility/syscall-flag-coverage/file-systems-and-mount-control/README.md:5:mount, umount2, pivot_root, statfs, fstatfs, truncate, ftruncate, fsync, 
+kernel/src/process/program_loader/elf/elf_file.rs:277:    let elf_type = elf_header.pt2.type_.as_type();
+kernel/src/process/program_loader/elf/elf_file.rs:278:    if elf_type != header::Type::Executable && elf_type != header::Type::SharedObject {
+kernel/src/fs/mod.rs:12:    cgroupfs, configfs, devpts, exfat, ext2, procfs, pseudofs, ramfs, sysfs, tmpfs,
+kernel/src/fs/vfs/fs_apis/inode.rs:474:            // succeeds under procfs and btrfs but fails under tmpfs. Here, we just choose a
+kernel/src/device/evdev/mod.rs:32:    Device, DeviceType, DevtmpfsInodeMeta,
+kernel/src/device/evdev/mod.rs:200:    fn devtmpfs_meta(&self) -> Option<DevtmpfsInodeMeta<'_>> {
+kernel/src/device/evdev/mod.rs:201:        Some(DevtmpfsInodeMeta::new(format!(
+kernel/src/device/shm.rs:24:        Some("tmpfs".to_string()),
+kernel/src/device/fb.rs:9:use super::{Device, DeviceType, DevtmpfsInodeMeta, registry::char};
+kernel/src/device/fb.rs:229:    fn devtmpfs_meta(&self) -> Option<DevtmpfsInodeMeta<'_>> {
+kernel/src/device/fb.rs:232:        // so the devtmpfs node is fixed to `fb0`.
+kernel/src/device/fb.rs:234:        Some(DevtmpfsInodeMeta::new("fb0"))
+kernel/src/device/mem/mod.rs:31:    Device, DeviceType, DevtmpfsInodeMeta,
+kernel/src/device/mem/mod.rs:67:    fn devtmpfs_meta(&self) -> Option<DevtmpfsInodeMeta<'_>> {
+kernel/src/device/mem/mod.rs:69:        // that override devtmpfs's default `u+rw` permissions.
+kernel/src/device/mem/mod.rs:74:                DevtmpfsInodeMeta::with_mode(self.file.name(), mkmod!(a+rw))
+kernel/src/device/mem/mod.rs:76:            MemFile::Kmsg => DevtmpfsInodeMeta::with_mode(self.file.name(), mkmod!(a+r, u+w)),
+kernel/src/device/mem/mod.rs:77:            _ => DevtmpfsInodeMeta::new(self.file.name()),
+kernel/src/device/misc/hwrng.rs:15:    device::{Device, DeviceType, DevtmpfsInodeMeta, registry::char},
+kernel/src/device/misc/hwrng.rs:58:    fn devtmpfs_meta(&self) -> Option<DevtmpfsInodeMeta<'_>> {
+kernel/src/device/misc/hwrng.rs:59:        Some(DevtmpfsInodeMeta::new("hwrng"))
+kernel/src/device/misc/tdxguest.rs:62:    device::{Device, DeviceType, DevtmpfsInodeMeta, registry::char::register},
+kernel/src/device/misc/tdxguest.rs:100:    fn devtmpfs_meta(&self) -> Option<DevtmpfsInodeMeta<'_>> {
+kernel/src/device/misc/tdxguest.rs:101:        Some(DevtmpfsInodeMeta::new("tdx_guest"))
+kernel/src/device/registry/block.rs:9:    device::{Device, DeviceType, DevtmpfsInodeMeta, add_node},
+kernel/src/device/registry/block.rs:41:        if let Some(devtmpfs_meta) = device.devtmpfs_meta() {
+kernel/src/device/registry/block.rs:43:            add_node(DeviceType::Block, dev_id, &devtmpfs_meta, path_resolver)?;
+kernel/src/device/registry/block.rs:80:    fn devtmpfs_meta(&self) -> Option<DevtmpfsInodeMeta<'_>> {
+kernel/src/device/registry/block.rs:81:        Some(DevtmpfsInodeMeta::new(self.0.name()))
+kernel/src/fs/fs_impls/devpts/ptmx.rs:7:    device::DevtmpfsInodeMeta,
+kernel/src/fs/fs_impls/devpts/ptmx.rs:177:    fn devtmpfs_meta(&self) -> Option<DevtmpfsInodeMeta<'_>> {
+kernel/src/device/registry/char.rs:115:        if let Some(devtmpfs_meta) = device.devtmpfs_meta() {
+kernel/src/device/registry/char.rs:117:            add_node(DeviceType::Char, dev_id, &devtmpfs_meta, path_resolver)?;
+kernel/src/device/pty/driver.rs:8:        DevtmpfsInodeMeta,
+kernel/src/device/pty/driver.rs:120:    fn devtmpfs_meta(&self, _index: u32) -> Option<DevtmpfsInodeMeta<'_>> {
+kernel/src/device/mod.rs:39:    /// Returns the metadata that specifies a device inode to be created in devtmpfs, if any.
+kernel/src/device/mod.rs:40:    fn devtmpfs_meta(&self) -> Option<DevtmpfsInodeMeta<'_>>;
+kernel/src/device/mod.rs:52:            .field("devtmpfs_meta", &self.devtmpfs_meta())
+kernel/src/device/mod.rs:64:/// The metadata that describes a device inode in devtmpfs.
+kernel/src/device/mod.rs:71:/// matching Linux devtmpfs's default device inode permissions.
+kernel/src/device/mod.rs:72:/// Reference: <https://elixir.bootlin.com/linux/v6.18/source/drivers/base/devtmpfs.c#L11>.
+kernel/src/device/mod.rs:74:pub struct DevtmpfsInodeMeta<'a> {
+kernel/src/device/mod.rs:79:impl<'a> DevtmpfsInodeMeta<'a> {
+kernel/src/device/mod.rs:80:    /// Creates the metadata for a devtmpfs inode with the default mode (`u+rw`).
+kernel/src/device/mod.rs:88:    /// Creates the metadata for a devtmpfs inode with the specified path and mode.
+kernel/src/device/mod.rs:116:    meta: &DevtmpfsInodeMeta<'_>,
+kernel/src/device/mod.rs:172:/// Initializes the device nodes in devtmpfs after mounting rootfs.
+kernel/src/device/mod.rs:177:    // Mount devtmpfs.
+test/initramfs/src/regression/fs/overlayfs/ovl_test.c:129:	// Mount tmpfs to /overlay first (Linux only)
+test/initramfs/src/regression/fs/overlayfs/ovl_test.c:130:	// if (mount("tmpfs", OVERLAYDIR, "tmpfs", 0, NULL) == -1) {
+test/initramfs/src/regression/fs/overlayfs/ovl_test.c:131:	//     handle_error("mount tmpfs");
+test/initramfs/src/regression/fs/overlayfs/ovl_test.c:134:	// Create necessary directories now that tmpfs is mounted
+kernel/src/device/tty/vt/driver.rs:17:        DevtmpfsInodeMeta,
+kernel/src/device/tty/vt/driver.rs:105:    fn devtmpfs_meta(&self, index: u32) -> Option<DevtmpfsInodeMeta<'_>> {
+kernel/src/device/tty/vt/driver.rs:106:        Some(DevtmpfsInodeMeta::new(format!("tty{}", index)))
+kernel/src/syscall/statfs.rs:15:pub fn sys_statfs(path_ptr: Vaddr, statfs_buf_ptr: Vaddr, ctx: &Context) -> Result<SyscallReturn> {
+kernel/src/syscall/statfs.rs:19:        "path = {:?}, statfs_buf_ptr = 0x{:x}",
+kernel/src/syscall/statfs.rs:20:        path_name, statfs_buf_ptr,
+kernel/src/syscall/statfs.rs:35:    let statfs = Statfs::from(sb);
+kernel/src/syscall/statfs.rs:36:    user_space.write_val(statfs_buf_ptr, &statfs)?;
+kernel/src/syscall/statfs.rs:40:pub fn sys_fstatfs(
+kernel/src/syscall/statfs.rs:42:    statfs_buf_ptr: Vaddr,
+kernel/src/syscall/statfs.rs:46:        "raw_fd = {}, statfs_buf_addr = 0x{:x}",
+kernel/src/syscall/statfs.rs:47:        raw_fd, statfs_buf_ptr
+kernel/src/syscall/statfs.rs:56:    let statfs = Statfs::from(sb);
+kernel/src/syscall/statfs.rs:57:    ctx.user_space().write_val(statfs_buf_ptr, &statfs)?;
+kernel/src/syscall/statfs.rs:66:    f_type: u64,
+kernel/src/syscall/statfs.rs:94:            f_type: sb.magic,
+kernel/src/device/tty/hvc.rs:12:        DevtmpfsInodeMeta,
+kernel/src/device/tty/hvc.rs:30:    fn devtmpfs_meta(&self, index: u32) -> Option<DevtmpfsInodeMeta<'_>> {
+kernel/src/device/tty/hvc.rs:31:        Some(DevtmpfsInodeMeta::new(format!("hvc{}", index)))
+kernel/src/device/tty/driver.rs:5:        DevtmpfsInodeMeta,
+kernel/src/device/tty/driver.rs:25:    /// Returns the metadata that specifies a TTY device inode to be created in devtmpfs, if any.
+kernel/src/device/tty/driver.rs:26:    fn devtmpfs_meta(&self, index: u32) -> Option<DevtmpfsInodeMeta<'_>>;
+test/initramfs/src/regression/fs/ext2/rename.c:130:	TEST_SUCC(mount("tmpfs", CROSS_MOUNT_DIR, "tmpfs", 0, NULL));
+kernel/src/device/tty/device.rs:14:        Device, DeviceType, DevtmpfsInodeMeta,
+kernel/src/device/tty/device.rs:48:    fn devtmpfs_meta(&self) -> Option<DevtmpfsInodeMeta<'_>> {
+kernel/src/device/tty/device.rs:49:        Some(DevtmpfsInodeMeta::new("tty0"))
+kernel/src/device/tty/device.rs:76:    fn devtmpfs_meta(&self) -> Option<DevtmpfsInodeMeta<'_>> {
+kernel/src/device/tty/device.rs:78:        Some(DevtmpfsInodeMeta::with_mode("tty", mkmod!(a+rw)))
+kernel/src/device/tty/device.rs:139:    fn devtmpfs_meta(&self) -> Option<DevtmpfsInodeMeta<'_>> {
+kernel/src/device/tty/device.rs:140:        Some(DevtmpfsInodeMeta::new("console"))
+kernel/src/device/tty/mod.rs:8:    device::{Device, DeviceType, DevtmpfsInodeMeta},
+kernel/src/device/tty/mod.rs:329:    fn devtmpfs_meta(&self) -> Option<DevtmpfsInodeMeta<'_>> {
+kernel/src/device/tty/mod.rs:330:        self.driver.devtmpfs_meta(self.index)
+kernel/src/syscall/mod.rs:170:mod statfs;
+kernel/src/device/tty/serial.rs:12:        DevtmpfsInodeMeta,
+kernel/src/device/tty/serial.rs:34:    fn devtmpfs_meta(&self, index: u32) -> Option<DevtmpfsInodeMeta<'_>> {
+kernel/src/device/tty/serial.rs:35:        Some(DevtmpfsInodeMeta::new(format!(
+test/initramfs/src/regression/fs/mount/mount_move.c:27:	TEST_SUCC(mount("tmpfs", MOVE_ROOT, "tmpfs", 0, NULL));
+test/initramfs/src/regression/fs/mount/mount_move.c:30:	TEST_SUCC(mount("tmpfs", MOVE_CHILD, "tmpfs", 0, NULL));
+test/initramfs/src/regression/fs/isolation/pivot_root.c:24:// These will be backed by tmpfs to ensure they are on distinct filesystems.
+test/initramfs/src/regression/fs/isolation/pivot_root.c:43:// Helper to create a marker file on a tmpfs mount.
+test/initramfs/src/regression/fs/isolation/pivot_root.c:47:	CHECK(mount("tmpfs", mount_point, "tmpfs", 0, ""));
+test/initramfs/src/regression/fs/isolation/pivot_root.c:84:	// Mount a tmpfs on `put_old_full_path`. This makes it a different mount from `new_root`.
+test/initramfs/src/regression/fs/isolation/pivot_root.c:87:	TEST_SUCC(mount("tmpfs", put_old_full_path, "tmpfs", 0, NULL));
+test/initramfs/src/regression/fs/isolation/pivot_root.c:89:	// Create marker files on separate tmpfs mounts to verify the pivot.
+test/initramfs/src/regression/fs/isolation/pivot_root.c:158:	// Mount a new tmpfs as the target for pivot_root(".", ".").
+test/initramfs/src/regression/fs/isolation/pivot_root.c:160:	TEST_SUCC(mount("tmpfs", DOT_PIVOT_DIR, "tmpfs", 0, NULL));
+test/initramfs/src/regression/fs/isolation/pivot_root.c:162:	// Mount a extra tmpfs for the following negative test.
+test/initramfs/src/regression/fs/isolation/pivot_root.c:164:	TEST_SUCC(mount("tmpfs", DOT_EXTRA_MOUNT, "tmpfs", 0, NULL));
+test/initramfs/src/regression/fs/isolation/pivot_root.c:206:	// Mounting a new tmpfs on "." adds it on top of the mount stack at "/".
+test/initramfs/src/regression/fs/isolation/pivot_root.c:207:	// The stack is now (top to bottom): new tmpfs -> old root -> new root.
+test/initramfs/src/regression/fs/isolation/pivot_root.c:209:	TEST_SUCC(mount("tmpfs", ".", "tmpfs", 0, NULL));
+test/initramfs/src/regression/fs/isolation/pivot_root.c:211:	// Unmounting "." removes the topmost mount (the new tmpfs).
+kernel/src/fs/fs_impls/ramfs/memfd.rs:18:        tmpfs::TmpFs,
+kernel/src/syscall/arch/generic.rs:154:            statfs::{sys_fstatfs, sys_statfs},
+kernel/src/syscall/arch/generic.rs:240:            SYS_STATFS = 43                  => sys_statfs(args[..2]);
+kernel/src/syscall/arch/generic.rs:241:            SYS_FSTATFS = 44                 => sys_fstatfs(args[..2]);
+kernel/src/syscall/arch/x86.rs:158:    statfs::{sys_fstatfs, sys_statfs},
+kernel/src/syscall/arch/x86.rs:305:    SYS_STATFS = 137           => sys_statfs(args[..2]);
+kernel/src/syscall/arch/x86.rs:306:    SYS_FSTATFS = 138          => sys_fstatfs(args[..2]);
+kernel/src/fs/fs_impls/tmpfs/fs.rs:3:use super::TMPFS_MAGIC;
+kernel/src/fs/fs_impls/tmpfs/fs.rs:16:/// The temporary file system (tmpfs) structure.
+kernel/src/fs/fs_impls/tmpfs/fs.rs:18:// TODO: Currently, tmpfs is implemented as a thin wrapper around ramfs.
+kernel/src/fs/fs_impls/tmpfs/fs.rs:19:// In the future we need to implement tmpfs-specific features such as
+kernel/src/fs/fs_impls/tmpfs/fs.rs:35:        "tmpfs"
+kernel/src/fs/fs_impls/tmpfs/fs.rs:49:        // inner RamFs. Override statfs-visible fields here as a workaround
+kernel/src/fs/fs_impls/tmpfs/fs.rs:55:        sb.magic = TMPFS_MAGIC;
+kernel/src/fs/fs_impls/tmpfs/fs.rs:81:        "tmpfs"
+kernel/src/fs/fs_impls/tmpfs/mod.rs:3://! Temporary file system (tmpfs) based on ramfs.
+kernel/src/fs/fs_impls/tmpfs/mod.rs:10:const TMPFS_MAGIC: u64 = 0x0102_1994;
+test/initramfs/src/regression/device/devtmpfs_mode.c:9: * This test covers devtmpfs modes for devices whose tests do not yet exist.
+test/initramfs/src/regression/device/devtmpfs_mode.c:25:	 * Devices that fall back to the kernel devtmpfs default (0600).
+kernel/src/fs/fs_impls/mod.rs:17:pub mod tmpfs;
+kernel/src/fs/fs_impls/mod.rs:25:    tmpfs::init();
+test/initramfs/src/regression/security/namespace/mnt_ns.c:24:	// Mount a tmpfs in the new namespace. This should not be visible to the parent.
+test/initramfs/src/regression/security/namespace/mnt_ns.c:204:	// Mount tmpfs on test0 (first layer)
+test/initramfs/src/regression/security/namespace/mnt_ns.c:205:	TEST_SUCC(mount("none", COMPLEX_BASE, "tmpfs", 0, ""));
+test/initramfs/src/regression/security/namespace/mnt_ns.c:207:	// Mount tmpfs on test0 again (second layer, stacked mount)
+test/initramfs/src/regression/security/namespace/mnt_ns.c:208:	TEST_SUCC(mount("none", COMPLEX_BASE, "tmpfs", 0, ""));
+test/initramfs/src/regression/security/namespace/mnt_ns.c:213:	// Mount tmpfs on test0/content (third layer)
+test/initramfs/src/regression/security/namespace/mnt_ns.c:214:	TEST_SUCC(mount("none", COMPLEX_CONTENT, "tmpfs", 0, ""));
+
+exec
+/bin/bash -lc "rg -n \"fn path\\(&self\\)\" kernel/src/fs -g'*.rs'" in /tmp/tmp.sRk6BQPy6c/wt1
+ succeeded in 0ms:
+kernel/src/fs/vfs/notify/inotify.rs:370:    fn path(&self) -> &Path {
+kernel/src/fs/file/inode_handle.rs:79:    pub fn path(&self) -> &Path {
+kernel/src/fs/file/inode_handle.rs:467:    fn path(&self) -> &Path {
+kernel/src/fs/file/file_handle.rs:98:    fn path(&self) -> &Path;
+
+exec
+/bin/bash -lc "rg -n \"fn mem_total|mem_total\\(\" kernel ostd -g'*.rs'" in /tmp/tmp.sRk6BQPy6c/wt1
+ succeeded in 0ms:
+kernel/src/vm/mod.rs:31:pub fn mem_total() -> usize {
+kernel/src/fs/fs_impls/tmpfs/fs.rs:70:    crate::vm::mem_total() / PAGE_SIZE / 2
+kernel/src/fs/fs_impls/tmpfs/fs.rs:74:    crate::vm::mem_total() / PAGE_SIZE / 2
+kernel/src/fs/fs_impls/procfs/meminfo.rs:37:        let total = crate::vm::mem_total();
+kernel/src/syscall/sysinfo.rs:30:        totalram: crate::vm::mem_total() as u64,
+
+exec
+/bin/bash -lc "sed -n '1,80p' kernel/src/vm/mod.rs" in /tmp/tmp.sRk6BQPy6c/wt1
+ succeeded in 0ms:
+// SPDX-License-Identifier: MPL-2.0
+
+//! Virtual memory (VM).
+//!
+//! There are two primary VM abstractions:
+//!  * The VMAR (used to be Virtual Memory Address Region, now an orphan
+//!    initialism) represents the entire virtual address space of a process;
+//!  * The VMO (Virtual Memory Object) is a set of logically contiguous memory
+//!    frames that can be mapped into one virtual address range. Frames in a
+//!    VMO can be non-contiguous in physical memory.
+
+use osdk_frame_allocator::FrameAllocator;
+use osdk_heap_allocator::{HeapAllocator, type_from_layout};
+
+pub mod perms;
+pub mod vmar;
+pub mod vmo;
+
+#[ostd::global_frame_allocator]
+static FRAME_ALLOCATOR: FrameAllocator = FrameAllocator;
+
+#[ostd::global_heap_allocator]
+static HEAP_ALLOCATOR: HeapAllocator = HeapAllocator;
+
+#[ostd::global_heap_allocator_slot_map]
+const fn slot_type_from_layout(layout: core::alloc::Layout) -> Option<ostd::mm::heap::SlotInfo> {
+    type_from_layout(layout)
+}
+
+/// Total physical memory in the entire system in bytes.
+pub fn mem_total() -> usize {
+    use ostd::boot::{boot_info, memory_region::MemoryRegionType};
+
+    let regions = &boot_info().memory_regions;
+    regions
+        .iter()
+        .filter(|region| region.typ() == MemoryRegionType::Usable)
+        .map(|region| region.len())
+        .sum::<usize>()
+}
+
+codex
+I’m now looking at the API shift around `Path::fs()` and whether the tmpfs statfs numbers are internally consistent, because those are the only places this patch can plausibly regress behavior.
+exec
+/bin/bash -lc "rg -n \"fn fs\\(&self\\)\" kernel/src/fs -g'*.rs' && printf '\\n---\\n' && sed -n '1,220p' kernel/src/fs/vfs/inode.rs" in /tmp/tmp.sRk6BQPy6c/wt1
+ exited 2 in 0ms:
+kernel/src/fs/vfs/path/mod.rs:104:    pub fn fs(&self) -> &Arc<dyn FileSystem> {
+kernel/src/fs/vfs/path/mount.rs:552:    pub(in crate::fs) fn fs(&self) -> &Arc<dyn FileSystem> {
+kernel/src/fs/utils/systree_inode.rs:422:    default fn fs(&self) -> Arc<dyn FileSystem> {
+kernel/src/fs/vfs/fs_apis/inode.rs:420:    fn fs(&self) -> Arc<dyn FileSystem>;
+kernel/src/fs/fs_impls/devpts/slave.rs:140:    fn fs(&self) -> Arc<dyn FileSystem> {
+kernel/src/fs/fs_impls/devpts/mod.rs:357:    fn fs(&self) -> Arc<dyn FileSystem> {
+kernel/src/fs/fs_impls/devpts/ptmx.rs:154:    fn fs(&self) -> Arc<dyn FileSystem> {
+kernel/src/fs/fs_impls/sysfs/inode.rs:95:    fn fs(&self) -> Arc<dyn FileSystem> {
+kernel/src/fs/pipe/anon_pipe.rs:97:    fn fs(&self) -> Arc<dyn FileSystem>;
+kernel/src/fs/fs_impls/overlayfs/fs.rs:217:    fn fs(&self) -> Arc<OverlayFs> {
+kernel/src/fs/fs_impls/overlayfs/fs.rs:451:    pub fn fs(&self) -> Arc<dyn FileSystem> {
+kernel/src/fs/fs_impls/overlayfs/fs.rs:1002:    fn fs(&self) -> Arc<dyn FileSystem>;
+kernel/src/fs/fs_impls/cgroupfs/inode.rs:91:    fn fs(&self) -> Arc<dyn FileSystem> {
+kernel/src/fs/fs_impls/pseudofs/nsfs.rs:118:    fn fs(&self) -> Arc<dyn FileSystem>;
+kernel/src/fs/fs_impls/ext2/block_group.rs:304:    fn fs(&self) -> Arc<Ext2> {
+kernel/src/fs/fs_impls/ext2/xattr.rs:351:    fn fs(&self) -> Arc<Ext2> {
+kernel/src/fs/fs_impls/pseudofs/mod.rs:358:    fn fs(&self) -> Arc<dyn FileSystem> {
+kernel/src/fs/fs_impls/ext2/inode.rs:99:    pub fn fs(&self) -> Arc<Ext2> {
+kernel/src/fs/fs_impls/ext2/inode.rs:1250:    pub fn fs(&self) -> Arc<Ext2> {
+kernel/src/fs/fs_impls/ext2/inode.rs:1965:    pub fn fs(&self) -> Arc<Ext2> {
+kernel/src/fs/fs_impls/configfs/inode.rs:87:    fn fs(&self) -> Arc<dyn FileSystem> {
+kernel/src/fs/fs_impls/ext2/indirect_block_cache.rs:131:    fn fs(&self) -> Arc<Ext2> {
+kernel/src/fs/fs_impls/ramfs/fs.rs:1228:    fn fs(&self) -> Arc<dyn FileSystem> {
+kernel/src/fs/fs_impls/ext2/impl_for_vfs/inode.rs:237:    fn fs(&self) -> Arc<dyn FileSystem> {
+kernel/src/fs/fs_impls/ramfs/memfd.rs:223:    fn fs(&self) -> Arc<dyn FileSystem> {
+kernel/src/fs/fs_impls/exfat/bitmap.rs:85:    fn fs(&self) -> Arc<ExfatFs> {
+kernel/src/fs/fs_impls/exfat/fat.rs:121:    fn fs(&self) -> Arc<ExfatFs> {
+kernel/src/fs/fs_impls/procfs/template/mod.rs:51:    fn fs(&self) -> Arc<dyn FileSystem> {
+kernel/src/fs/fs_impls/procfs/template/sym.rs:85:    fn fs(&self) -> Arc<dyn FileSystem>;
+kernel/src/fs/fs_impls/exfat/inode.rs:235:    fn fs(&self) -> Arc<ExfatFs> {
+kernel/src/fs/fs_impls/exfat/inode.rs:1446:    fn fs(&self) -> alloc::sync::Arc<dyn FileSystem> {
+kernel/src/fs/fs_impls/procfs/template/file.rs:88:    fn fs(&self) -> Arc<dyn FileSystem>;
+kernel/src/fs/fs_impls/procfs/template/dir.rs:131:    fn fs(&self) -> Arc<dyn FileSystem>;
+
+---
+sed: can't read kernel/src/fs/vfs/inode.rs: No such file or directory
+
+exec
+/bin/bash -lc "sed -n '380,460p' kernel/src/fs/vfs/fs_apis/inode.rs && printf '\\n---\\n' && sed -n '520,590p' kernel/src/fs/vfs/path/mount.rs" in /tmp/tmp.sRk6BQPy6c/wt1
+ succeeded in 0ms:
+    }
+
+    fn unlink(&self, name: &str) -> Result<()> {
+        Err(Error::new(Errno::ENOTDIR))
+    }
+
+    fn rmdir(&self, name: &str) -> Result<()> {
+        Err(Error::new(Errno::ENOTDIR))
+    }
+
+    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>> {
+        Err(Error::new(Errno::ENOTDIR))
+    }
+
+    fn rename(&self, old_name: &str, target: &Arc<dyn Inode>, new_name: &str) -> Result<()> {
+        Err(Error::new(Errno::ENOTDIR))
+    }
+
+    fn read_link(&self) -> Result<SymbolicLink> {
+        Err(Error::new(Errno::EISDIR))
+    }
+
+    fn write_link(&self, target: &str) -> Result<()> {
+        Err(Error::new(Errno::EISDIR))
+    }
+
+    fn sync_all(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn sync_data(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Manipulates a range of space of the file according to the specified allocate mode,
+    /// the manipulated range starts at `offset` and continues for `len` bytes.
+    fn fallocate(&self, mode: FallocMode, offset: usize, len: usize) -> Result<()> {
+        return_errno!(Errno::EOPNOTSUPP);
+    }
+
+    fn fs(&self) -> Arc<dyn FileSystem>;
+
+    /// Returns the revalidation policy for cached children of this directory.
+    ///
+    /// See [`RevalidationPolicy`] for the full protocol description.
+    ///
+    /// Default: empty (no revalidation).
+    /// Correct for filesystems where all mutations go through the VFS.
+    fn revalidation_policy(&self) -> RevalidationPolicy {
+        RevalidationPolicy::empty()
+    }
+
+    /// Checks whether a cached child inode still exists under this directory.
+    ///
+    /// Called on a positive cache hit
+    /// when [`RevalidationPolicy::REVALIDATE_EXISTS`] is set.
+    /// Returns `true` if `child` is still a valid child named `name`;
+    /// `false` if the entry should be dropped and the lookup retried.
+    ///
+    /// See [`RevalidationPolicy`] for the full protocol description.
+    ///
+    /// # Precondition
+    ///
+    /// Only called when `self.revalidation_policy()` includes `REVALIDATE_EXISTS`.
+    /// Otherwise, the return value is considered garbage.
+    fn revalidate_exists(&self, _name: &str, _child: &dyn Inode) -> bool {
+        true
+    }
+
+    /// Checks whether a name is still absent under this directory.
+    ///
+    /// Called on a negative cache hit
+    /// when [`RevalidationPolicy::REVALIDATE_ABSENT`] is set.
+    /// Returns `true` if `name` is still absent;
+    /// `false` if a child may now exist and the lookup should be retried.
+    ///
+    /// See [`RevalidationPolicy`] for the full protocol description.
+    ///
+    /// # Precondition
+    ///
+    /// Only called when `self.revalidation_policy()` includes `REVALIDATE_ABSENT`.
+
+---
+            self.flags.store(mount_flags, Ordering::Relaxed);
+        }
+
+        Ok(())
+    }
+
+    /// Gets the parent mount node if any.
+    pub(in crate::fs) fn parent(&self) -> Option<Weak<Self>> {
+        self.parent.read().as_ref().cloned()
+    }
+
+    /// Returns whether `self` is `ancestor` or a descendant of it in the mount tree.
+    pub(super) fn is_equal_or_descendant_of(&self, ancestor: &Arc<Self>) -> bool {
+        let mut current = self.this();
+        loop {
+            if Arc::ptr_eq(&current, ancestor) {
+                return true;
+            }
+
+            let Some(parent) = current.parent().and_then(|parent| parent.upgrade()) else {
+                return false;
+            };
+            current = parent;
+        }
+    }
+
+    /// Gets the associated mount namespace.
+    pub(super) fn mnt_ns(&self) -> &Weak<MountNamespace> {
+        &self.mnt_ns
+    }
+
+    /// Gets the associated FS.
+    pub(in crate::fs) fn fs(&self) -> &Arc<dyn FileSystem> {
+        &self.fs
+    }
+
+    pub(in crate::fs) fn flags(&self) -> PerMountFlags {
+        self.flags.load(Ordering::Relaxed)
+    }
+
+    /// Sets the parent mount node.
+    ///
+    /// In some cases we may need to reset the parent of
+    /// the created Mount, such as move mount.
+    pub(super) fn set_parent(&self, mount: Option<&Arc<Mount>>) {
+        let mut parent = self.parent.write();
+        *parent = mount.map(Arc::downgrade);
+    }
+
+    /// Finds the corresponding `Mount` in the given mount namespace.
+    pub(super) fn find_corresponding_mount(
+        &self,
+        mnt_ns: &Arc<MountNamespace>,
+    ) -> Option<Arc<Self>> {
+        // Collect the ancestors from self to the root mount (The root mount is not included).
+        let mut ancestors = VecDeque::new();
+        let mut current = self.this();
+        while let Some(weak_parent) = current.parent() {
+            ancestors.push_front(current.clone());
+            current = weak_parent.upgrade().unwrap();
+        }
+
+        let mut target_mount = mnt_ns.root().clone();
+        while let Some(ancestor) = ancestors.pop_front() {
+            // Find the child mount that matches the mountpoint of ancestor.
+            let mount_point = ancestor.mountpoint().unwrap();
+            let child_mount = target_mount
+                .children
+                .read()
+                .get(&mount_point.key())
+                .cloned();
+
+exec
+/bin/bash -lc "sed -n '500,570p' kernel/src/fs/vfs/path/mod.rs" in /tmp/tmp.sRk6BQPy6c/wt1
+ succeeded in 0ms:
+impl Path {
+    pub fn inode(&self) -> &Arc<dyn Inode>;
+    pub fn type_(&self) -> InodeType;
+
+    /// Creates a `Path` by making an inode of the `type_` with the `mode`.
+    pub fn mknod(&self, name: &str, mode: InodeMode, type_: MknodType) -> Result<Self> {
+        let inner = self
+            .dentry
+            .as_dir_dentry_or_err()?
+            .mknod(name, mode, type_)?;
+        Ok(Self::new(self.mount.clone(), inner))
+    }
+
+    /// Links a new name for the `Path`.
+    pub fn link(&self, old: &Self, name: &str) -> Result<()> {
+        if !Arc::ptr_eq(&old.mount, &self.mount) {
+            return_errno_with_message!(Errno::EXDEV, "the operation cannot cross mounts");
+        }
+
+        self.dentry.as_dir_dentry_or_err()?.link(old.inode(), name)
+    }
+
+    /// Unlinks a name from the `Path`.
+    pub fn unlink(&self, name: &str) -> Result<()> {
+        self.dentry.as_dir_dentry_or_err()?.unlink(name)
+    }
+
+    /// Removes a directory by `rmdir()` the inner inode.
+    pub fn rmdir(&self, name: &str) -> Result<()> {
+        self.dentry.as_dir_dentry_or_err()?.rmdir(name)
+    }
+
+    /// Renames a `Path` to the new `Path` by `rename()` the inner inode.
+    pub fn rename(&self, old_name: &str, new_dir: &Self, new_name: &str) -> Result<()> {
+        if !Arc::ptr_eq(&self.mount, &new_dir.mount) {
+            return_errno_with_message!(Errno::EXDEV, "the operation cannot cross mounts");
+        }
+
+        DirDentry::rename(&self.dentry, old_name, &new_dir.dentry, new_name)
+    }
+}
+
+// Methods inherited from `Inode`.
+#[inherit_methods(from = "self.inode()")]
+impl Path {
+    pub fn sync_all(&self) -> Result<()>;
+    pub fn sync_data(&self) -> Result<()>;
+    pub fn metadata(&self) -> Metadata;
+    pub fn mode(&self) -> Result<InodeMode>;
+    pub fn set_mode(&self, mode: InodeMode) -> Result<()>;
+    pub fn size(&self) -> usize;
+    pub fn resize(&self, size: usize) -> Result<()>;
+    pub fn owner(&self) -> Result<Uid>;
+    pub fn set_owner(&self, uid: Uid) -> Result<()>;
+    pub fn group(&self) -> Result<Gid>;
+    pub fn set_group(&self, gid: Gid) -> Result<()>;
+    pub fn atime(&self) -> Duration;
+    pub fn set_atime(&self, time: Duration);
+    pub fn mtime(&self) -> Duration;
+    pub fn set_mtime(&self, time: Duration);
+    pub fn ctime(&self) -> Duration;
+    pub fn set_ctime(&self, time: Duration);
+    pub fn set_xattr(
+        &self,
+        name: XattrName,
+        value_reader: &mut VmReader,
+        flags: XattrSetFlags,
+    ) -> Result<()>;
+    pub fn get_xattr(&self, name: XattrName, value_writer: &mut VmWriter) -> Result<usize>;
+    pub fn list_xattr(
+        &self,
+
+codex
+I found the semantic pivot: `Path::fs()` no longer means “filesystem of the inode at this path,” it now means “filesystem mounted here.” I’m checking the existing uses to see whether that distinction matters anywhere besides `statfs`.
+exec
+/bin/bash -lc "sed -n '250,430p' kernel/src/fs/vfs/notify/mod.rs && printf '\\n---\\n' && sed -n '60,120p' kernel/src/fs/vfs/notify/inotify.rs && printf '\\n---\\n' && sed -n '430,520p' kernel/src/fs/vfs/path/dentry.rs" in /tmp/tmp.sRk6BQPy6c/wt1
+ succeeded in 0ms:
+        const OPEN_PERM       = 0x00010000; // Open event in a permission hook
+        const ACCESS_PERM     = 0x00020000; // Access event in a permissions hook
+        const OPEN_EXEC_PERM  = 0x00040000; // Open/exec event in a permission hook
+        const EVENT_ON_CHILD  = 0x08000000; // Set on inode mark that cares about things that happen to its children.
+        const RENAME          = 0x10000000; // File was renamed
+        const DN_MULTISHOT    = 0x20000000; // dnotify multishot
+        const ISDIR           = 0x40000000; // Event occurred against dir
+    }
+}
+
+impl From<u32> for FsEvents {
+    fn from(value: u32) -> Self {
+        Self::from_bits_truncate(value)
+    }
+}
+
+impl From<FsEvents> for u32 {
+    fn from(value: FsEvents) -> Self {
+        value.bits()
+    }
+}
+
+define_atomic_version_of_integer_like_type!(FsEvents, {
+    #[derive(Debug)]
+    pub(super) struct AtomicFsEvents(AtomicU32);
+});
+
+/// Notifies that a file was accessed.
+pub fn on_access(file: &Arc<dyn FileLike>) {
+    // TODO: Check fmode flags (FMODE_NONOTIFY, FMODE_NONOTIFY_PERM).
+    let path = file.path();
+
+    if !path.fs().fs_event_subscriber_stats().has_any_subscribers() {
+        return;
+    }
+    notify_parent(path, FsEvents::ACCESS);
+}
+
+/// Notifies that a file was modified.
+pub fn on_modify(file: &Arc<dyn FileLike>) {
+    // TODO: Check fmode flags (FMODE_NONOTIFY, FMODE_NONOTIFY_PERM).
+    let path = file.path();
+
+    if !path.fs().fs_event_subscriber_stats().has_any_subscribers() {
+        return;
+    }
+    notify_parent(path, FsEvents::MODIFY);
+}
+
+/// Notifies that a path's content was changed.
+pub fn on_change(path: &Path) {
+    if !path.fs().fs_event_subscriber_stats().has_any_subscribers() {
+        return;
+    }
+    notify_parent(path, FsEvents::MODIFY);
+}
+
+/// Notifies that a file was deleted from a directory.
+pub fn on_delete(
+    dir_inode: &Arc<dyn Inode>,
+    inode: &Arc<dyn Inode>,
+    name: impl FnOnce() -> String,
+) {
+    if !dir_inode
+        .fs()
+        .fs_event_subscriber_stats()
+        .has_any_subscribers()
+    {
+        return;
+    }
+    if inode.type_() == InodeType::Dir {
+        notify_inode_with_name(dir_inode, FsEvents::DELETE | FsEvents::ISDIR, name)
+    } else {
+        notify_inode_with_name(dir_inode, FsEvents::DELETE, name)
+    }
+}
+
+/// Notifies that an inode's link count changed.
+pub fn on_link_count(inode: &Arc<dyn Inode>) {
+    if !inode.fs().fs_event_subscriber_stats().has_any_subscribers() {
+        return;
+    }
+    notify_inode(inode, FsEvents::ATTRIB);
+}
+
+/// Notifies that an inode was removed (link count reached 0).
+pub fn on_inode_removed(inode: &Arc<dyn Inode>) {
+    if !inode.fs().fs_event_subscriber_stats().has_any_subscribers() {
+        return;
+    }
+    notify_inode(inode, FsEvents::DELETE_SELF);
+}
+
+/// Notifies that a file was linked to a directory.
+pub fn on_link(dir_inode: &Arc<dyn Inode>, inode: &Arc<dyn Inode>, name: impl FnOnce() -> String) {
+    if !dir_inode
+        .fs()
+        .fs_event_subscriber_stats()
+        .has_any_subscribers()
+    {
+        return;
+    }
+    notify_inode(inode, FsEvents::ATTRIB);
+    notify_inode_with_name(dir_inode, FsEvents::CREATE, name);
+}
+
+/// Notifies that a directory was created.
+pub fn on_mkdir(dir_path: &Path, name: impl FnOnce() -> String) {
+    if !dir_path
+        .fs()
+        .fs_event_subscriber_stats()
+        .has_any_subscribers()
+    {
+        return;
+    }
+    notify_inode_with_name(dir_path.inode(), FsEvents::CREATE | FsEvents::ISDIR, name);
+}
+
+/// Notifies that a file was created.
+pub fn on_create(file_path: &Path, name: impl FnOnce() -> String) {
+    if !file_path
+        .fs()
+        .fs_event_subscriber_stats()
+        .has_any_subscribers()
+    {
+        return;
+    }
+    notify_inode_with_name(file_path.inode(), FsEvents::CREATE, name);
+}
+
+/// Notifies that a file was opened.
+pub fn on_open(file: &Arc<dyn FileLike>) {
+    // TODO: Check fmode flags (FMODE_NONOTIFY, FMODE_NONOTIFY_PERM).
+    let path = file.path();
+
+    if !path.fs().fs_event_subscriber_stats().has_any_subscribers() {
+        return;
+    }
+    notify_parent(path, FsEvents::OPEN);
+}
+
+/// Notifies that a file was closed.
+pub fn on_close(file: &Arc<dyn FileLike>) {
+    // TODO: Check fmode flags (FMODE_NONOTIFY, FMODE_NONOTIFY_PERM).
+    let path = file.path();
+
+    if !path.fs().fs_event_subscriber_stats().has_any_subscribers() {
+        return;
+    }
+    let events = match file.access_mode() {
+        AccessMode::O_RDONLY => FsEvents::CLOSE_NOWRITE,
+        _ => FsEvents::CLOSE_WRITE,
+    };
+    notify_parent(path, events);
+}
+
+/// Notifies that a file's attributes changed.
+pub fn on_attr_change(path: &Path) {
+    if !path.fs().fs_event_subscriber_stats().has_any_subscribers() {
+        return;
+    }
+    notify_parent(path, FsEvents::ATTRIB);
+}
+
+/// Notifies a path's parent and the path itself about filesystem events.
+///
+/// If the parent is watching or if subscribers have registered interesting events with
+/// parent and name information, notifies the parent with child name info.
+/// Otherwise, notifies only the child without name information.
+/// This function is already called after filesystem checking in the callers.
+///
+/// The child's real name (from `path.name()`) is used to notify the parent, since
+/// FS events do not cross mount boundaries.
+fn notify_parent(path: &Path, mut events: FsEvents) {
+    if path.inode().type_() == InodeType::Dir {
+        events |= FsEvents::ISDIR;
+    }
+
+    let parent = path.parent_within_mount();
+    if let Some(parent) = parent {
+        notify_inode_with_name(parent.inode(), events, || path.name());
+
+---
+}
+
+impl Drop for InotifyFile {
+    /// Cleans up all subscribers when the inotify file is dropped.
+    ///
+    /// This will remove all subscribers from their inodes.
+    fn drop(&mut self) {
+        let watch_map = self.watch_map.get_mut();
+
+        for (_, entry) in watch_map.drain() {
+            let (Some(inode), Some(subscriber)) =
+                (entry.inode.upgrade(), entry.subscriber.upgrade())
+            else {
+                continue;
+            };
+
+            if inode
+                .fs_event_publisher()
+                .unwrap()
+                .remove_subscriber(&(subscriber as _))
+            {
+                inode.fs().fs_event_subscriber_stats().remove_subscriber();
+            }
+        }
+    }
+}
+
+/// The default maximum capacity of the event queue.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v6.14/source/fs/notify/inotify/inotify_user.c#L853>
+const DEFAULT_MAX_QUEUED_EVENTS: usize = 16384;
+
+impl InotifyFile {
+    /// Creates a new inotify file.
+    pub fn new(is_nonblocking: bool) -> Result<Arc<Self>> {
+        let pseudo_path = AnonInodeFs::new_path(|_| "anon_inode:inotify".to_string());
+
+        Ok(Arc::new_cyclic(|weak_self| Self {
+            // Allocate watch descriptors from 1.
+            // Reference: <https://elixir.bootlin.com/linux/v6.17/source/fs/notify/inotify/inotify_user.c#L402>
+            next_wd: AtomicU32::new(1),
+            watch_map: SpinLock::new(HashMap::new()),
+            read_mutex: Mutex::new(()),
+            is_nonblocking: AtomicBool::new(is_nonblocking),
+            event_queue: SpinLock::new(VecDeque::new()),
+            queue_capacity: DEFAULT_MAX_QUEUED_EVENTS,
+            pollee: Pollee::new(),
+            this: weak_self.clone(),
+            pseudo_path,
+        }))
+    }
+
+    /// Allocates a new watch descriptor.
+    fn alloc_wd(&self) -> Result<u32> {
+        const MAX_VALID_WD: u32 = i32::MAX as u32;
+
+        let new_wd = self.next_wd.fetch_add(1, Ordering::Relaxed);
+        if new_wd > MAX_VALID_WD {
+            // Roll back the allocation if we exceed the limit.
+            self.next_wd.fetch_sub(1, Ordering::Relaxed);
+            return_errno_with_message!(Errno::ENOSPC, "the inotify watch limit is reached");
+
+---
+            old_inode.clone(),
+            DentryOptions::Leaf((String::from(name), self.this())),
+        );
+        let mut children = children.upgrade();
+        self.insert_positive_child(&mut children, name, dentry.clone());
+        fs::vfs::notify::on_link(dentry.parent().unwrap().inode(), dentry.inode(), || {
+            name.to_string()
+        });
+        Ok(())
+    }
+
+    /// Deletes a `Dentry` by `unlink()` the inner inode.
+    pub(super) fn unlink(&self, name: &str) -> Result<()> {
+        if is_dot_or_dotdot(name) {
+            return_errno_with_message!(Errno::EINVAL, "unlink on . or ..");
+        }
+
+        let dir_inode = self.inode();
+        let child_inode = self.remove_child(name, |dir_inode, name| dir_inode.unlink(name))?;
+
+        let nlinks = child_inode.metadata().nr_hard_links;
+        fs::vfs::notify::on_link_count(&child_inode);
+        if nlinks == 0 {
+            // FIXME: `DELETE_SELF` should be generated after closing the last FD.
+            fs::vfs::notify::on_inode_removed(&child_inode);
+        }
+        fs::vfs::notify::on_delete(dir_inode, &child_inode, || name.to_string());
+        if nlinks == 0 {
+            // Ideally, we would use `fs_event_publisher()` here to avoid creating a
+            // `FsEventPublisher` instance on a dying inode. However, it isn't possible because we
+            // need to disable new subscribers.
+            let publisher = child_inode.fs_event_publisher_or_init();
+            let removed_nr_subscribers = publisher.disable_new_and_remove_subscribers();
+            child_inode
+                .fs()
+                .fs_event_subscriber_stats()
+                .remove_subscribers(removed_nr_subscribers);
+        }
+        Ok(())
+    }
+
+    /// Deletes a directory `Dentry` by `rmdir()` the inner inode.
+    pub(super) fn rmdir(&self, name: &str) -> Result<()> {
+        if is_dot(name) {
+            return_errno_with_message!(Errno::EINVAL, "rmdir on .");
+        }
+        if is_dotdot(name) {
+            return_errno_with_message!(Errno::ENOTEMPTY, "rmdir on ..");
+        }
+
+        let dir_inode = self.inode();
+        let child_inode = self.remove_child(name, |dir_inode, name| dir_inode.rmdir(name))?;
+
+        let nlinks = child_inode.metadata().nr_hard_links;
+        if nlinks == 0 {
+            // FIXME: `DELETE_SELF` should be generated after closing the last FD.
+            fs::vfs::notify::on_inode_removed(&child_inode);
+        }
+        fs::vfs::notify::on_delete(dir_inode, &child_inode, || name.to_string());
+        if nlinks == 0 {
+            // Ideally, we would use `fs_event_publisher()` here to avoid creating a
+            // `FsEventPublisher` instance on a dying inode. However, it isn't possible because we
+            // need to disable new subscribers.
+            let publisher = child_inode.fs_event_publisher_or_init();
+            let removed_nr_subscribers = publisher.disable_new_and_remove_subscribers();
+            child_inode
+                .fs()
+                .fs_event_subscriber_stats()
+                .remove_subscribers(removed_nr_subscribers);
+        }
+        Ok(())
+    }
+
+    fn remove_child(
+        &self,
+        name: &str,
+        remove_child_fn: impl FnOnce(&dyn Inode, &str) -> Result<()>,
+    ) -> Result<Arc<dyn Inode>> {
+        let dir_inode = self.inode();
+        let mut children = self.children.upread();
+        let cached_child = match children.find(name) {
+            None => None,
+            Some(cached_entry) if !self.revalidate_cached_entry(name, &cached_entry) => {
+                let mut children_for_update = children.upgrade();
+                let _ = children_for_update.remove(name);
+                children = children_for_update.downgrade();
+                None
+            }
+            Some(cached_entry) => {
+                if cached_entry.is_mountpoint() {
+                    return_errno_with_message!(Errno::EBUSY, "dentry is mountpoint");
+
+exec
+/bin/bash -lc "rg -n \"statfs|fstatfs|tmpfs\" test/initramfs/src -g'*.c'" in /tmp/tmp.sRk6BQPy6c/wt1
+ succeeded in 0ms:
+test/initramfs/src/regression/fs/ext2/rename.c:130:	TEST_SUCC(mount("tmpfs", CROSS_MOUNT_DIR, "tmpfs", 0, NULL));
+test/initramfs/src/regression/fs/overlayfs/ovl_test.c:129:	// Mount tmpfs to /overlay first (Linux only)
+test/initramfs/src/regression/fs/overlayfs/ovl_test.c:130:	// if (mount("tmpfs", OVERLAYDIR, "tmpfs", 0, NULL) == -1) {
+test/initramfs/src/regression/fs/overlayfs/ovl_test.c:131:	//     handle_error("mount tmpfs");
+test/initramfs/src/regression/fs/overlayfs/ovl_test.c:134:	// Create necessary directories now that tmpfs is mounted
+test/initramfs/src/regression/fs/isolation/pivot_root.c:24:// These will be backed by tmpfs to ensure they are on distinct filesystems.
+test/initramfs/src/regression/fs/isolation/pivot_root.c:43:// Helper to create a marker file on a tmpfs mount.
+test/initramfs/src/regression/fs/isolation/pivot_root.c:47:	CHECK(mount("tmpfs", mount_point, "tmpfs", 0, ""));
+test/initramfs/src/regression/fs/isolation/pivot_root.c:84:	// Mount a tmpfs on `put_old_full_path`. This makes it a different mount from `new_root`.
+test/initramfs/src/regression/fs/isolation/pivot_root.c:87:	TEST_SUCC(mount("tmpfs", put_old_full_path, "tmpfs", 0, NULL));
+test/initramfs/src/regression/fs/isolation/pivot_root.c:89:	// Create marker files on separate tmpfs mounts to verify the pivot.
+test/initramfs/src/regression/fs/isolation/pivot_root.c:158:	// Mount a new tmpfs as the target for pivot_root(".", ".").
+test/initramfs/src/regression/fs/isolation/pivot_root.c:160:	TEST_SUCC(mount("tmpfs", DOT_PIVOT_DIR, "tmpfs", 0, NULL));
+test/initramfs/src/regression/fs/isolation/pivot_root.c:162:	// Mount a extra tmpfs for the following negative test.
+test/initramfs/src/regression/fs/isolation/pivot_root.c:164:	TEST_SUCC(mount("tmpfs", DOT_EXTRA_MOUNT, "tmpfs", 0, NULL));
+test/initramfs/src/regression/fs/isolation/pivot_root.c:206:	// Mounting a new tmpfs on "." adds it on top of the mount stack at "/".
+test/initramfs/src/regression/fs/isolation/pivot_root.c:207:	// The stack is now (top to bottom): new tmpfs -> old root -> new root.
+test/initramfs/src/regression/fs/isolation/pivot_root.c:209:	TEST_SUCC(mount("tmpfs", ".", "tmpfs", 0, NULL));
+test/initramfs/src/regression/fs/isolation/pivot_root.c:211:	// Unmounting "." removes the topmost mount (the new tmpfs).
+test/initramfs/src/regression/security/namespace/mnt_ns.c:24:	// Mount a tmpfs in the new namespace. This should not be visible to the parent.
+test/initramfs/src/regression/security/namespace/mnt_ns.c:204:	// Mount tmpfs on test0 (first layer)
+test/initramfs/src/regression/security/namespace/mnt_ns.c:205:	TEST_SUCC(mount("none", COMPLEX_BASE, "tmpfs", 0, ""));
+test/initramfs/src/regression/security/namespace/mnt_ns.c:207:	// Mount tmpfs on test0 again (second layer, stacked mount)
+test/initramfs/src/regression/security/namespace/mnt_ns.c:208:	TEST_SUCC(mount("none", COMPLEX_BASE, "tmpfs", 0, ""));
+test/initramfs/src/regression/security/namespace/mnt_ns.c:213:	// Mount tmpfs on test0/content (third layer)
+test/initramfs/src/regression/security/namespace/mnt_ns.c:214:	TEST_SUCC(mount("none", COMPLEX_CONTENT, "tmpfs", 0, ""));
+test/initramfs/src/regression/fs/mount/mount_move.c:27:	TEST_SUCC(mount("tmpfs", MOVE_ROOT, "tmpfs", 0, NULL));
+test/initramfs/src/regression/fs/mount/mount_move.c:30:	TEST_SUCC(mount("tmpfs", MOVE_CHILD, "tmpfs", 0, NULL));
+test/initramfs/src/regression/device/devtmpfs_mode.c:9: * This test covers devtmpfs modes for devices whose tests do not yet exist.
+test/initramfs/src/regression/device/devtmpfs_mode.c:25:	 * Devices that fall back to the kernel devtmpfs default (0600).
+
+codex
+I want to be sure I’m not inventing a tmpfs-specific invariant that the code already satisfies, so I’m checking the block-size constants and the filesystem statistics contract before I call anything a defect.
+exec
+/bin/bash -lc "rg -n \"const BLOCK_SIZE|PAGE_SIZE\" kernel/src/fs -g'*.rs' && printf '\\n---\\n' && sed -n '1,120p' kernel/src/fs/fs_impls/ramfs/mod.rs" in /tmp/tmp.sRk6BQPy6c/wt1
+ succeeded in 0ms:
+kernel/src/fs/fs_impls/devpts/mod.rs:32:const BLOCK_SIZE: usize = 1024;
+kernel/src/fs/vfs/page_cache.rs:80:        if old_size > new_size && !new_size.is_multiple_of(PAGE_SIZE) {
+kernel/src/fs/vfs/page_cache.rs:81:            let gap_size = old_size.min(new_size.align_up(PAGE_SIZE)) - new_size;
+kernel/src/fs/vfs/page_cache.rs:97:        let first_page_end = start.align_up(PAGE_SIZE);
+kernel/src/fs/vfs/page_cache.rs:104:        let last_page_start = end.align_down(PAGE_SIZE);
+kernel/src/fs/vfs/page_cache.rs:110:        for offset in (first_page_end..last_page_start).step_by(PAGE_SIZE) {
+kernel/src/fs/vfs/page_cache.rs:111:            self.pages().fill_zeros(offset, PAGE_SIZE)?;
+kernel/src/fs/fs_impls/sysfs/fs.rs:30:const BLOCK_SIZE: usize = 4096;
+kernel/src/fs/fs_impls/ramfs/mod.rs:13:const BLOCK_SIZE: usize = 4096;
+kernel/src/fs/fs_impls/ramfs/memfd.rs:140:                let eof_page = old_size.align_down(PAGE_SIZE);
+kernel/src/fs/fs_impls/overlayfs/fs.rs:894:            .alloc_segment(XATTR_VALUE_MAX_LEN / PAGE_SIZE)?;
+kernel/src/fs/fs_impls/overlayfs/fs.rs:1564:        f1.resize(PAGE_SIZE).unwrap();
+kernel/src/fs/fs_impls/procfs/mod.rs:71:const BLOCK_SIZE: usize = 1024;
+kernel/src/fs/fs_impls/cgroupfs/fs.rs:33:const BLOCK_SIZE: usize = 4096;
+kernel/src/fs/fs_impls/tmpfs/fs.rs:70:    crate::vm::mem_total() / PAGE_SIZE / 2
+kernel/src/fs/fs_impls/tmpfs/fs.rs:74:    crate::vm::mem_total() / PAGE_SIZE / 2
+kernel/src/fs/fs_impls/exfat/inode.rs:142:        if inner.size < idx * PAGE_SIZE {
+kernel/src/fs/fs_impls/exfat/inode.rs:145:        let sector_id = inner.get_sector_id(idx * PAGE_SIZE / inner.fs().sector_size())?;
+kernel/src/fs/fs_impls/exfat/inode.rs:161:        let sector_id = inner.get_sector_id(idx * PAGE_SIZE / inner.fs().sector_size())?;
+kernel/src/fs/fs_impls/exfat/inode.rs:177:        self.inner.read().size.align_up(PAGE_SIZE) / PAGE_SIZE
+kernel/src/fs/fs_impls/exfat/inode.rs:1269:    off.is_multiple_of(PAGE_SIZE)
+kernel/src/fs/fs_impls/procfs/pid/task/status.rs:158:            let anon = vmar_ref.get_rss_counter(RssType::Anon) * (PAGE_SIZE / 1024);
+kernel/src/fs/fs_impls/procfs/pid/task/status.rs:159:            let file = vmar_ref.get_rss_counter(RssType::File) * (PAGE_SIZE / 1024);
+kernel/src/fs/fs_impls/configfs/fs.rs:36:const BLOCK_SIZE: usize = 4096;
+kernel/src/fs/fs_impls/exfat/fs.rs:380:        if self.fs_size() < idx * PAGE_SIZE {
+kernel/src/fs/fs_impls/exfat/fs.rs:394:        if self.fs_size() < idx * PAGE_SIZE {
+kernel/src/fs/fs_impls/exfat/fs.rs:408:        self.fs_size() / PAGE_SIZE
+
+---
+// SPDX-License-Identifier: MPL-2.0
+
+//! Ramfs based on PageCache
+
+pub use fs::RamFs;
+use fs::RamFsType;
+
+mod fs;
+pub mod memfd;
+mod xattr;
+
+const RAMFS_MAGIC: u64 = 0x8584_58f6;
+const BLOCK_SIZE: usize = 4096;
+const ROOT_INO: u64 = 1;
+const NAME_MAX: usize = 255;
+
+pub(super) fn init() {
+    crate::fs::vfs::registry::register(&RamFsType).unwrap();
+}
+
+web search: 
+web search: Linux tmpfs statfs bfree bavail files free blocks documentation
+web search: 
+web search: man tmpfs size option blocks f_blocks free space tmpfs size
+codex
+I’m checking whether tmpfs already has any usage accounting hidden in RamFs. If it does, the new superblock values might just be masking that; if it does not, the free-space numbers are likely dead-on-arrival.
+exec
+/bin/bash -lc "rg -n \"blocks\\b|files\\b|bfree\\b|ffree\\b|alloc.*block|free.*block|inode_allocator\" kernel/src/fs/fs_impls/ramfs -g'*.rs'" in /tmp/tmp.sRk6BQPy6c/wt1
+ succeeded in 0ms:
+kernel/src/fs/fs_impls/ramfs/fs.rs:50:    inode_allocator: AtomicU64,
+kernel/src/fs/fs_impls/ramfs/fs.rs:86:            inode_allocator: AtomicU64::new(ROOT_INO + 1),
+kernel/src/fs/fs_impls/ramfs/fs.rs:92:        self.inode_allocator.fetch_add(1, Ordering::Relaxed)
+kernel/src/fs/fs_impls/ramfs/fs.rs:257:    blocks: usize,
+kernel/src/fs/fs_impls/ramfs/fs.rs:272:            blocks: 0,
+kernel/src/fs/fs_impls/ramfs/fs.rs:287:            blocks: 1,
+kernel/src/fs/fs_impls/ramfs/fs.rs:300:        self.blocks = new_size.align_up(BLOCK_SIZE) / BLOCK_SIZE;
+kernel/src/fs/fs_impls/ramfs/fs.rs:305:        self.blocks = self.size.align_up(BLOCK_SIZE) / BLOCK_SIZE;
+kernel/src/fs/fs_impls/ramfs/fs.rs:311:        self.blocks = self.size.align_up(BLOCK_SIZE) / BLOCK_SIZE;
+kernel/src/fs/fs_impls/ramfs/fs.rs:315:        self.blocks
+kernel/src/fs/fs_impls/ramfs/fs.rs:616:        self.metadata.lock().blocks
+kernel/src/fs/fs_impls/ramfs/fs.rs:673:                    inode_meta.blocks = new_size_aligned / BLOCK_SIZE;
+kernel/src/fs/fs_impls/ramfs/fs.rs:1198:        // Symlink's metadata.blocks should be 0, so just set the size.
+kernel/src/fs/fs_impls/ramfs/memfd.rs:310:                "file seals can only be applied to memfd files",
+
+web search: 
+web search: site:kernel.org tmpfs documentation size nr_inodes statfs
+web search: 
+web search: site:elixir.bootlin.com tmpfs statfs free blocks inodes kernel source
+web search: 
+web search: Linux tmpfs statfs code free blocks inodes kernel source git.kernel.org
+codex
+I’ve narrowed it to one likely functional problem: the tmpfs stats are still not tied to actual allocation, so they can’t back a real space probe. I’m pulling exact line numbers now and then I’ll write the review file.
+exec
+/bin/bash -lc "nl -ba kernel/src/fs/fs_impls/tmpfs/fs.rs | sed -n '35,90p' && printf '\\n---\\n' && nl -ba kernel/src/fs/vfs/path/mod.rs | sed -n '95,110p' && printf '\\n---\\n' && nl -ba kernel/src/syscall/statfs.rs | sed -n '20,60p'" in /tmp/tmp.sRk6BQPy6c/wt1
+ succeeded in 0ms:
+    35	        "tmpfs"
+    36	    }
+    37	
+    38	    fn sync(&self) -> Result<()> {
+    39	        // do nothing
+    40	        Ok(())
+    41	    }
+    42	
+    43	    fn root_inode(&self) -> Arc<dyn Inode> {
+    44	        self.inner.root_inode()
+    45	    }
+    46	
+    47	    fn sb(&self) -> SuperBlock {
+    48	        // TODO: Tmpfs currently wraps RamFs, whose inodes still point to the
+    49	        // inner RamFs. Override statfs-visible fields here as a workaround
+    50	        // rather than changing the semantics of ordinary RamFs instances.
+    51	        let mut sb = self.inner.sb();
+    52	        let max_blocks = default_max_blocks();
+    53	        let max_inodes = default_max_inodes();
+    54	
+    55	        sb.magic = TMPFS_MAGIC;
+    56	        sb.blocks = max_blocks;
+    57	        sb.bfree = max_blocks;
+    58	        sb.bavail = max_blocks;
+    59	        sb.files = max_inodes;
+    60	        sb.ffree = max_inodes;
+    61	        sb
+    62	    }
+    63	
+    64	    fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
+    65	        self.inner.fs_event_subscriber_stats()
+    66	    }
+    67	}
+    68	
+    69	fn default_max_blocks() -> usize {
+    70	    crate::vm::mem_total() / PAGE_SIZE / 2
+    71	}
+    72	
+    73	fn default_max_inodes() -> usize {
+    74	    crate::vm::mem_total() / PAGE_SIZE / 2
+    75	}
+    76	
+    77	pub(super) struct TmpFsType;
+    78	
+    79	impl FsType for TmpFsType {
+    80	    fn name(&self) -> &'static str {
+    81	        "tmpfs"
+    82	    }
+    83	
+    84	    fn properties(&self) -> FsProperties {
+    85	        FsProperties::empty()
+    86	    }
+    87	
+    88	    fn create(&self, _fs_creation_ctx: &FsCreationCtx) -> Result<Arc<dyn FileSystem>> {
+    89	        Ok(TmpFs::new())
+    90	    }
+
+---
+    95	        &self.mount
+    96	    }
+    97	
+    98	    /// Gets the dentry of current `Path`.
+    99	    pub(in crate::fs) fn dentry(&self) -> &Arc<Dentry> {
+   100	        &self.dentry
+   101	    }
+   102	
+   103	    // Gets the file system of current `Path`.
+   104	    pub fn fs(&self) -> &Arc<dyn FileSystem> {
+   105	        self.mount.fs()
+   106	    }
+   107	
+   108	    /// Returns true if the current `Path` is the root of its mount.
+   109	    pub fn is_mount_root(&self) -> bool {
+   110	        Arc::ptr_eq(&self.dentry, self.mount.root_dentry())
+
+---
+    20	        path_name, statfs_buf_ptr,
+    21	    );
+    22	
+    23	    let sb = {
+    24	        let path_name = path_name.to_string_lossy();
+    25	        let fs_path = FsPath::try_from(path_name.as_ref())?;
+    26	        let path = ctx
+    27	            .thread_local
+    28	            .borrow_fs()
+    29	            .resolver()
+    30	            .read()
+    31	            .lookup(&fs_path)?;
+    32	        path.fs().sb()
+    33	    };
+    34	
+    35	    let statfs = Statfs::from(sb);
+    36	    user_space.write_val(statfs_buf_ptr, &statfs)?;
+    37	    Ok(SyscallReturn::Return(0))
+    38	}
+    39	
+    40	pub fn sys_fstatfs(
+    41	    raw_fd: RawFileDesc,
+    42	    statfs_buf_ptr: Vaddr,
+    43	    ctx: &Context,
+    44	) -> Result<SyscallReturn> {
+    45	    debug!(
+    46	        "raw_fd = {}, statfs_buf_addr = 0x{:x}",
+    47	        raw_fd, statfs_buf_ptr
+    48	    );
+    49	
+    50	    let sb = {
+    51	        let mut file_table = ctx.thread_local.borrow_file_table_mut();
+    52	        let file = get_file_fast!(&mut file_table, raw_fd.try_into()?);
+    53	        file.path().fs().sb()
+    54	    };
+    55	
+    56	    let statfs = Statfs::from(sb);
+    57	    ctx.user_space().write_val(statfs_buf_ptr, &statfs)?;
+    58	    Ok(SyscallReturn::Return(0))
+    59	}
+    60	
+
+codex
+I’m going to create the review artifact using the skill’s assembler so the output matches the expected Markdown structure.
+exec
+/bin/bash -lc "sed -n '1,240p' .agents/skills/aster-code-review/scripts/pass_contract.md && printf '\\n---\\n' && sed -n '1,260p' .agents/skills/aster-code-review/scripts/assemble_review.sh" in /tmp/tmp.sRk6BQPy6c/wt1
+ succeeded in 0ms:
+# Pass contract
+
+You are a reviewer applying the persona guideline(s) included below to the change or files under review
+(the **REVIEW INPUT** at the very end of this prompt).
+Find as many real defects as possible within the included persona(s)' remit
+— runtime correctness for Development,
+security/soundness for Security,
+ABI/hardware for Hardware,
+doc style/currency for Documentation,
+and structure/process for Maintainability
+— without inventing issues; a false alarm is a real cost.
+
+For each persona block below,
+work that persona's concerns in the order its file gives.
+For each candidate rule,
+read its one-line gist first
+and drill into the full rule (its linked subsections) only on a suspected violation.
+When a rule has `#### Steps`,
+use those steps as the review procedure for deciding whether the code violates that rule.
+Emit a JSON comment object only for a confirmed violation;
+emit nothing for compliant code.
+Stay within the remit of the persona(s) you are given.
+
+Each persona searches only for defects whose failure belongs to that persona.
+Do not run a general bug sweep from every persona.
+When another persona is the clear natural owner,
+do not duplicate that investigation here.
+For example,
+Maintainability should inspect design shape, readability, naming, layout,
+and commit hygiene;
+it should not trace runtime permission semantics, Linux/POSIX behavior,
+wrong predicates, or data-flow edge cases unless they are evidence of a
+maintainability rule violation.
+
+Within each included persona's owned failure modes,
+reason about the code even when no explicit guideline names the issue.
+Examples include off-by-one and reachable panic for Development,
+input-validation or permission-boundary flaws for Security,
+ABI/alignment hazards for Hardware,
+navigation or currency defects for Documentation,
+and structural or process defects for Maintainability.
+Ground each non-guideline finding in a short plain-language description of the defect
+("Off by one", "Use after free", "Reachable panic", …)
+— not the bare word `bug`, and not a coined hyphenated short-name,
+which would read as a guideline.
+Never stay silent about a real defect that belongs to the included persona
+because "no guideline covers it".
+
+Be **adversarial**:
+before dismissing a suspected in-scope defect as safe,
+state the concrete input or interleaving that would trigger it.
+Report an in-scope defect unless you can show that case cannot happen.
+"It looks fine" is not a verdict.
+
+The REVIEW INPUT is the unit of review;
+you MAY read surrounding code in the working tree for extra context.
+
+## Output
+
+Output **only** a JSON array of comment objects (no prose around it):
+
+```json
+[{"file":"path/relative/to/repo.rs","line":42,"persona":"development","grounding":"lock-ordering","severity":"major",
+  "problem":"`foo()` takes `b.lock()` while already holding `a.lock()`, the reverse of the `a`-before-`b` order elsewhere — a deadlock",
+  "fix":"take `a.lock()` before `b.lock()` here too, matching the rest of the module",
+  "diff":"the few relevant lines (a diff hunk, or source lines in files mode)"}]
+```
+
+- `persona` — which persona section the comment belongs to (`maintainability`, `development`, `security`, `hardware`, `documentation`);
+  used to file the comment under the right section.
+  In a single-persona (fan-out) pass it is always that persona.
+- `grounding` — what the comment rests on, in one of two forms kept visually distinct:
+  when you **cite a guideline**, its short-name
+  — a lowercase kebab identifier (e.g. `lock-ordering`), rendered as code;
+  when you report a **bug no guideline covers**, a short plain-language description of the defect
+  (e.g. "Off by one", "Use after free", "Incorrect cleanup"), rendered as prose.
+  Do not coin a hyphenated pseudo-short-name for a bug
+  — that reads as a guideline
+  — and never use the bare word `bug`,
+  which says nothing the reader cannot already see.
+- `severity` — **required**,
+  one of `critical` (must fix) / `major` (should fix) / `minor` (worth fixing) / `nit` (optional or stylistic).
+- `problem` and `fix` are **both required**
+  — every comment proposes a remedy.
+  They are posted as GitHub-flavored Markdown,
+  so wrap every code identifier, path, type, function or variable name, and literal value in backticks
+  (`self.len`, `Ordering::Acquire`, `kernel/src/foo.rs`),
+  and put any multi-line snippet in `fix` in a fenced ```` ``` ```` block.
+  (The `grounding` of a bug stays plain prose, as described above
+  — only `problem` and `fix` take inline code.)
+- Every field above is required on every comment,
+  with a single exception for `line`, described next.
+- `line` is the line the comment anchors to
+  — the post-change line in the commit's diff (`diff` mode),
+  or the file's line number (`files` mode).
+  It is **required for a finding about code**.
+- For a finding about a **commit message** (`diff` mode shows each commit's message),
+  set `file` to the commit locus (e.g. `commit abc1234 message`),
+  **omit `line`** (its one exception),
+  and ground it in a commit-hygiene rule (`imperative-subject`, `atomic-commits`, …).
+- Report only issues within the included persona(s)' remit.
+  If you find nothing, output `[]`.
+
+---
+#!/usr/bin/env bash
+
+# SPDX-License-Identifier: MPL-2.0
+
+#
+# assemble_review.sh — deterministic merge of persona comment fragments into the review file body.
+# No LLM judgement here:
+# group by persona in a fixed order,
+# sort by file then line within each group,
+# drop exact duplicates *within a persona*,
+# write the frontmatter,
+# and leave a <!-- SUMMARY --> placeholder for the orchestrator's LLM summary step.
+#
+# Usage: assemble_review.sh [--overwrite] <meta-file> <frag-dir> <output-file>
+#   meta-file: lines `mode=`, `base=` (diff) or `files=` (files), `head=`,
+#              `branch=`, `date=`, `title=`
+#   frag-dir:  one <persona>.json per persona, each a JSON array of comments:
+#       {"file","line","grounding","severity","problem","fix","diff"}
+#   --overwrite: replace <output-file> if it already exists (otherwise fail).
+set -euo pipefail
+
+overwrite=0
+pos=()
+for a in "$@"; do
+    case "$a" in
+        --overwrite) overwrite=1 ;;
+        --*) echo "assemble_review.sh: unknown flag: $a" >&2; exit 2 ;;
+        *) pos+=("$a") ;;
+    esac
+done
+if [[ ${#pos[@]} -ne 3 ]]; then
+    echo "usage: assemble_review.sh [--overwrite] <meta-file> <frag-dir> <output-file>" >&2
+    exit 2
+fi
+meta="${pos[0]}"; fragdir="${pos[1]}"; out="${pos[2]}"
+
+# Refuse to clobber an existing review unless --overwrite (design §3).
+if [[ -e "$out" && $overwrite -eq 0 ]]; then
+    echo "assemble_review.sh: refusing to overwrite existing $out (pass --overwrite)" >&2
+    exit 1
+fi
+
+python3 - "$meta" "$fragdir" "$out" <<'PY'
+import json, os, re, sys
+meta_path, fragdir, out = sys.argv[1], sys.argv[2], sys.argv[3]
+
+# A guideline short-name is a lowercase kebab identifier (e.g. `lock-ordering`) and
+# renders as code — a citable rule. A bug's grounding is a short plain-language
+# description (e.g. "Off by one") and renders as prose, so it never reads as a rule name.
+KEBAB = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
+def grounding_tag(g):
+    return "`%s`" % g if KEBAB.fullmatch(g) else g
+
+meta = {}
+for line in open(meta_path):
+    line = line.strip()
+    if "=" in line:
+        k, v = line.split("=", 1)
+        meta[k] = v
+
+# Fixed persona order -> review section title.
+# "Correctness" is the Development persona's section (a bare "## Development" reads oddly; see the design doc).
+ORDER = [("maintainability", "Maintainability"),
+         ("development",      "Correctness"),
+         ("security",         "Security"),
+         ("hardware",         "Hardware"),
+         ("documentation",    "Documentation")]
+
+def load(persona):
+    p = os.path.join(fragdir, persona + ".json")
+    if not os.path.exists(p):
+        return []          # persona not activated / did not run: legitimately absent
+    # An EXISTING fragment that is unparseable or not a JSON array means a pass
+    # produced broken output. Failing closed (rather than dropping it) is essential:
+    # this skill is recall-first, so a silently-discarded fragment is a silent
+    # recall hole the benchmark/orchestrator would never notice.
+    try:
+        data = json.load(open(p))
+    except Exception as e:
+        sys.stderr.write(f"assemble: FATAL: unparseable fragment {p}: {e}\n")
+        sys.exit(2)
+    if not isinstance(data, list):
+        sys.stderr.write(f"assemble: FATAL: fragment {p} is not a JSON array of comments\n")
+        sys.exit(2)
+    return data
+
+L = ["---",
+     f"date: {meta.get('date','')}",
+     f"mode: {meta.get('mode','diff')}"]
+if meta.get("base"):
+    L.append(f"base: {meta['base']}")
+if meta.get("files"):
+    L.append(f"files: {meta['files']}")
+L += [f"head: {meta.get('head','')}",
+      f"branch: {meta.get('branch','')}"]
+if meta.get("title"):
+    # json.dumps yields a valid YAML double-quoted scalar (escapes embedded quotes).
+    L.append("title: " + json.dumps(meta["title"]))
+L += ["---", "", "# Summary", "", "<!-- SUMMARY -->", ""]
+
+counts = {}
+for persona, title in ORDER:
+    # Dedup is per-persona: identical comments from two different personas are both kept,
+    # in their own sections (design §4).
+    seen = set()
+    uniq = []
+    for c in load(persona):
+        # "Exact" duplicate: identical in EVERY field (a normalized full-object key),
+        # so two comments that differ in grounding, severity, or diff are both kept.
+        # A partial key would collapse distinct findings — a recall hole.
+        key = json.dumps(c, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(c)
+    counts[persona] = len(uniq)
+    if not uniq:
+        continue
+    # Sort by file, then line, then a stable text key
+    # so co-located comments have a deterministic order regardless of pass output order.
+    uniq.sort(key=lambda c: (str(c.get("file", "")),
+                             int(c.get("line", 0) or 0),
+                             str(c.get("grounding", "")),
+                             str(c.get("problem", ""))))
+    L += [f"## {title}", ""]
+    for c in uniq:
+        loc = "`%s`" % c.get("file", "?")
+        if c.get("line"):
+            loc += " line %s" % c["line"]
+        L += [f"### {loc}", ""]
+        diff = c.get("diff")
+        if diff:
+            L.append("> ```diff")
+            L += ["> " + dl for dl in str(diff).splitlines()]
+            L += ["> ```", ""]
+        L.append("%s (%s): %s" % (grounding_tag(c.get("grounding", "issue")),
+                                  c.get("severity", "major"),
+                                  (c.get("problem", "") or "").strip()))
+        L += ["", "**Fix.** %s" % (c.get("fix", "") or "").strip(), ""]
+
+open(out, "w").write("\n".join(L).rstrip() + "\n")
+sys.stderr.write("assemble: " + ", ".join(f"{p}={counts[p]}" for p, _ in ORDER) + "\n")
+PY
+
+codex
+I’m also checking the local guideline key for the public API comment, because if I include a documentation finding it needs to cite the project’s actual rule name.
+exec
+/bin/bash -lc "rg -n \"Doc comments|doc comment|third-person|Comments\" book/src/to-contribute/coding-guidelines -g'*.md'" in /tmp/tmp.sRk6BQPy6c/wt1
+ succeeded in 0ms:
+book/src/to-contribute/coding-guidelines/README.md:66:| Rust | Do not disclose implementation details in doc comments | [`no-impl-in-docs`](rust-guidelines/language-items/comments-and-documentation.md#no-impl-in-docs) |
+book/src/to-contribute/coding-guidelines/rust-guidelines/README.md:23:  - **[Comments and Documentation](language-items/comments-and-documentation.md)** —
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/unsafety.md:29:must include a `# Safety` section in their doc comments
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/README.md:20:- **[Comments and Documentation](comments-and-documentation.md)** —
+book/src/to-contribute/coding-guidelines/general-guidelines/README.md:111:## Comments
+book/src/to-contribute/coding-guidelines/general-guidelines/README.md:115:For prose in Markdown and doc comments,
+book/src/to-contribute/coding-guidelines/general-guidelines/README.md:134:Comments should explain the intent behind the code,
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md:1:# Comments and Documentation
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md:18:The first line of a doc comment should be concise and one sentence.
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md:21:- **Functions and methods** — third-person singular present indicative verb
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md:59:and code identifiers in doc comments
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md:73:### Do not disclose implementation details in doc comments (`no-impl-in-docs`) {#no-impl-in-docs}
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md:75:Doc comments should describe _what_ the API does
+
+exec
+/bin/bash -lc "sed -n '1,100p' book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md && printf '\\n---\\n' && sed -n '100,150p' book/src/to-contribute/coding-guidelines/general-guidelines/README.md" in /tmp/tmp.sRk6BQPy6c/wt1
+ succeeded in 0ms:
+# Comments and Documentation
+
+API documentation describes API meaning and usage
+and is rendered by rustdoc.
+Public APIs should be documented,
+including crates, modules, structs, traits, functions, and macros.
+The `#![warn(missing_docs)]` lint helps enforce this baseline.
+
+Asterinas follows Rust community documentation conventions.
+Two primary references are:
+1. The rustdoc book:
+   [How to write documentation](https://doc.rust-lang.org/rustdoc/how-to-write-documentation.html)
+2. The Rust RFC book:
+   [API Documentation Conventions](https://rust-lang.github.io/rfcs/1574-more-api-documentation-conventions.html#appendix-a-full-conventions-text)
+
+### Follow RFC 1574 summary line conventions (`rfc1574-summary`) {#rfc1574-summary}
+
+The first line of a doc comment should be concise and one sentence.
+Its grammatical form depends on what the item is:
+
+- **Functions and methods** — third-person singular present indicative verb
+  ("Returns", "Creates", "Acquires"), describing the action performed.
+- **Types (structs, enums, traits, type aliases), modules, and fields** —
+  a noun phrase naming the thing, not describing an action.
+  This matches the Rust standard library convention
+  (e.g., `Vec` is "A contiguous growable array type").
+
+```rust
+/// Returns the mapping's start address.
+pub fn map_to_addr(&self) -> Vaddr {
+    self.map_to_addr
+}
+
+/// A policy for how [`FsPath::from_fd_at`] treats an empty `path_str`.
+pub enum EmptyPathStr { /* ... */ }
+
+/// A guard that releases a [`SpinLock`] when dropped.
+pub struct SpinLockGuard<'a, T> { /* ... */ }
+```
+
+### End sentence comments with punctuation (`comment-punctuation`) {#comment-punctuation}
+
+If a comment line is a full sentence,
+end it with proper punctuation.
+This improves readability in dense code
+and avoids fragmented prose.
+
+```rust
+// Good — complete sentence with punctuation.
+// SAFETY: The pointer is derived from a live allocation.
+
+// Bad — complete sentence without punctuation
+// SAFETY: The pointer is derived from a live allocation
+```
+
+### Wrap identifiers in backticks (`backtick-identifiers`) {#backtick-identifiers}
+
+Type names, method names,
+and code identifiers in doc comments
+should be wrapped in backticks for rustdoc rendering.
+When referring to types,
+prefer rustdoc links (`[TypeName]`) where possible.
+
+```rust
+/// Acquires the [`SpinLock`] and returns a guard
+/// that releases the lock on [`Drop`].
+///
+/// Callers must not call `acquire` while holding
+/// a [`RwMutex`] to avoid deadlock.
+pub fn acquire(&self) -> SpinLockGuard<'_, T> { ... }
+```
+
+### Do not disclose implementation details in doc comments (`no-impl-in-docs`) {#no-impl-in-docs}
+
+Doc comments should describe _what_ the API does
+and _how to use it_,
+not _how it is implemented internally_.
+
+```rust
+// Good — behavior-oriented
+/// Returns the number of active connections.
+
+// Bad — leaks implementation details
+/// Returns the length of the internal `HashMap`
+/// that tracks connections by socket address.
+```
+
+### Add module-level documentation for major components (`module-docs`) {#module-docs}
+
+A module file that serves as
+an important kernel component
+(e.g., subsystem entry point, major data structure, driver)
+should begin with a `//!` comment explaining:
+1. What the module does
+2. The key types it exposes
+3. How it relates to neighboring modules
+
+```rust
+//! Virtual memory area (VMA) management.
+//!
+
+---
+let can_read = mode.is_readable();
+
+// Bad — verb suggests an action, not a query
+fn check_permission(&self, perm: Permission) -> bool { ... }
+// Bad — negated name
+let is_not_empty = !buf.is_empty();
+```
+
+See also:
+PR [#1488](https://github.com/asterinas/asterinas/pull/1488#discussion_r1841827039).
+
+## Comments
+
+### Prefer semantic line breaks (`semantic-line-breaks`) {#semantic-line-breaks}
+
+For prose in Markdown and doc comments,
+insert line breaks at semantic boundaries
+so each line carries one coherent idea.
+At minimum, break at sentence boundaries.
+For longer sentences, also consider breaking at clause boundaries.
+
+Semantic line breaks make diffs smaller,
+reviews easier,
+and merge conflicts less noisy.
+
+As an exception,
+RFC documents that are mostly read-only
+can use regular paragraph wrapping.
+
+See also:
+[Semantic Line Breaks](https://sembr.org/).
+
+### Explain why, not what (`explain-why`) {#explain-why}
+
+Comments should explain the intent behind the code,
+not restate what the code does.
+If a comment merely paraphrases the code,
+it adds noise without insight.
+
+If a comment is needed to explain what code does,
+first try to rewrite the code.
+Do not write good comments to compensate for bad code —
+rewrite it to be straightforward.
+
+See also:
+_The Art of Readable Code_, Chapter 6 "Knowing What to Comment";
+PR [#2265](https://github.com/asterinas/asterinas/pull/2265#discussion_r2266220943)
+and [#2050](https://github.com/asterinas/asterinas/pull/2050#discussion_r2224106025).
+
+### Document design decisions (`design-decisions`) {#design-decisions}
+
+
+exec
+/bin/bash -lc 'rg -n "missing_docs" kernel/src kernel/Cargo.toml Cargo.toml' in /tmp/tmp.sRk6BQPy6c/wt1
+ exited 1 in 0ms:
+codex
+I’m writing two findings: one correctness issue around stale `statfs` resource counters, and one maintainability issue around changing `Path::fs()` semantics globally when the syscall fix only needs the mounted filesystem.
+exec
+/bin/bash -lc 'mkdir -p .review-tmp/frags' in /tmp/tmp.sRk6BQPy6c/wt1
+ succeeded in 0ms:
+apply patch
+patch: completed
+/tmp/tmp.sRk6BQPy6c/wt1/.review-tmp/frags/development.json
+/tmp/tmp.sRk6BQPy6c/wt1/.review-tmp/frags/documentation.json
+/tmp/tmp.sRk6BQPy6c/wt1/.review-tmp/frags/maintainability.json
+/tmp/tmp.sRk6BQPy6c/wt1/.review-tmp/frags/security.json
+/tmp/tmp.sRk6BQPy6c/wt1/.review-tmp/meta
+diff --git a/.review-tmp/frags/development.json b/.review-tmp/frags/development.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..197b06d9e24aba7b2e13e7f66ec0824ae8e64433
+--- /dev/null
++++ b/.review-tmp/frags/development.json
+@@ -0,0 +1,12 @@
++[
++  {
++    "file": "kernel/src/fs/fs_impls/tmpfs/fs.rs",
++    "line": 57,
++    "persona": "development",
++    "grounding": "Stale resource accounting",
++    "severity": "major",
++    "problem": "`TmpFs::sb()` now advertises nonzero `blocks`, `bfree`, `bavail`, `files`, and `ffree`, but each call resets the free counters back to the total defaults and the wrapped `RamFs` allocation paths do not decrement them. After creating or extending files, `statfs()` and `fstatfs()` will still report the tmpfs as completely empty, so space-aware callers can keep writing based on bogus availability until the real allocator fails.",
++    "fix": "Add tmpfs or RamFs accounting for allocated data blocks and live inodes, and derive `bfree`, `bavail`, and `ffree` from those live counters. If the immediate goal is only filesystem-type probing, keep the `TMPFS_MAGIC` override separate from capacity fields until the counters can be made accurate.",
++    "diff": "+        sb.blocks = max_blocks;\n+        sb.bfree = max_blocks;\n+        sb.bavail = max_blocks;\n+        sb.files = max_inodes;\n+        sb.ffree = max_inodes;"
++  }
++]
+diff --git a/.review-tmp/frags/documentation.json b/.review-tmp/frags/documentation.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe51488c7066f6687ef680d6bfaa4f7768ef205c
+--- /dev/null
++++ b/.review-tmp/frags/documentation.json
+@@ -0,0 +1 @@
++[]
+diff --git a/.review-tmp/frags/maintainability.json b/.review-tmp/frags/maintainability.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..b14e66e0b28fde9830e85dc3e6bf7d1aaf56d75a
+--- /dev/null
++++ b/.review-tmp/frags/maintainability.json
+@@ -0,0 +1,12 @@
++[
++  {
++    "file": "kernel/src/fs/vfs/path/mod.rs",
++    "line": 104,
++    "persona": "maintainability",
++    "grounding": "Ambiguous API semantics",
++    "severity": "minor",
++    "problem": "This new `Path::fs()` shadows the previously inherited `Inode::fs()` forwarding method, but changes the meaning from the inode's filesystem to the mount's filesystem. The distinction is exactly what the `statfs` fix depends on, yet all existing `path.fs()` call sites now get the new behavior through the same name, making it easy to accidentally use mount-level state where inode-level state was intended.",
++    "fix": "Preserve the old `Path::fs()` forwarding semantics and add an explicit mount-oriented accessor, for example `mounted_fs()` or `mount_fs()`, then update `sys_statfs()` and `sys_fstatfs()` to call that accessor. If the semantic change is intentional for all callers, document the mount-vs-inode distinction in the method docs and audit each existing `path.fs()` call site in the same commit.",
++    "diff": "+    // Gets the file system of current `Path`.\n+    pub fn fs(&self) -> &Arc<dyn FileSystem> {\n+        self.mount.fs()\n+    }\n@@\n-    pub fn fs(&self) -> Arc<dyn FileSystem>;"
++  }
++]
+diff --git a/.review-tmp/frags/security.json b/.review-tmp/frags/security.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe51488c7066f6687ef680d6bfaa4f7768ef205c
+--- /dev/null
++++ b/.review-tmp/frags/security.json
+@@ -0,0 +1 @@
++[]
+diff --git a/.review-tmp/meta b/.review-tmp/meta
+new file mode 100644
+index 0000000000000000000000000000000000000000..c89ba25e96cfa13a90f0ce4a84376cea03235b79
+--- /dev/null
++++ b/.review-tmp/meta
+@@ -0,0 +1,9 @@
++mode=diff
++base=ba2f4aa92
++head=3749ab332
++branch=HEAD
++output=/tmp/tmp.sRk6BQPy6c/wt1.on.md
++overwrite=1
++per_persona_context=auto
++date=2026-08-07
++title=Make tmpfs visible to statfs-based filesystem probes
+
+diff --git a/.review-tmp/frags/development.json b/.review-tmp/frags/development.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..197b06d9e24aba7b2e13e7f66ec0824ae8e64433
+--- /dev/null
++++ b/.review-tmp/frags/development.json
+@@ -0,0 +1,12 @@
++[
++  {
++    "file": "kernel/src/fs/fs_impls/tmpfs/fs.rs",
++    "line": 57,
++    "persona": "development",
++    "grounding": "Stale resource accounting",
++    "severity": "major",
++    "problem": "`TmpFs::sb()` now advertises nonzero `blocks`, `bfree`, `bavail`, `files`, and `ffree`, but each call resets the free counters back to the total defaults and the wrapped `RamFs` allocation paths do not decrement them. After creating or extending files, `statfs()` and `fstatfs()` will still report the tmpfs as completely empty, so space-aware callers can keep writing based on bogus availability until the real allocator fails.",
++    "fix": "Add tmpfs or RamFs accounting for allocated data blocks and live inodes, and derive `bfree`, `bavail`, and `ffree` from those live counters. If the immediate goal is only filesystem-type probing, keep the `TMPFS_MAGIC` override separate from capacity fields until the counters can be made accurate.",
++    "diff": "+        sb.blocks = max_blocks;\n+        sb.bfree = max_blocks;\n+        sb.bavail = max_blocks;\n+        sb.files = max_inodes;\n+        sb.ffree = max_inodes;"
++  }
++]
+diff --git a/.review-tmp/frags/documentation.json b/.review-tmp/frags/documentation.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe51488c7066f6687ef680d6bfaa4f7768ef205c
+--- /dev/null
++++ b/.review-tmp/frags/documentation.json
+@@ -0,0 +1 @@
++[]
+diff --git a/.review-tmp/frags/maintainability.json b/.review-tmp/frags/maintainability.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..b14e66e0b28fde9830e85dc3e6bf7d1aaf56d75a
+--- /dev/null
++++ b/.review-tmp/frags/maintainability.json
+@@ -0,0 +1,12 @@
++[
++  {
++    "file": "kernel/src/fs/vfs/path/mod.rs",
++    "line": 104,
++    "persona": "maintainability",
++    "grounding": "Ambiguous API semantics",
++    "severity": "minor",
++    "problem": "This new `Path::fs()` shadows the previously inherited `Inode::fs()` forwarding method, but changes the meaning from the inode's filesystem to the mount's filesystem. The distinction is exactly what the `statfs` fix depends on, yet all existing `path.fs()` call sites now get the new behavior through the same name, making it easy to accidentally use mount-level state where inode-level state was intended.",
++    "fix": "Preserve the old `Path::fs()` forwarding semantics and add an explicit mount-oriented accessor, for example `mounted_fs()` or `mount_fs()`, then update `sys_statfs()` and `sys_fstatfs()` to call that accessor. If the semantic change is intentional for all callers, document the mount-vs-inode distinction in the method docs and audit each existing `path.fs()` call site in the same commit.",
++    "diff": "+    // Gets the file system of current `Path`.\n+    pub fn fs(&self) -> &Arc<dyn FileSystem> {\n+        self.mount.fs()\n+    }\n@@\n-    pub fn fs(&self) -> Arc<dyn FileSystem>;"
++  }
++]
+diff --git a/.review-tmp/frags/security.json b/.review-tmp/frags/security.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe51488c7066f6687ef680d6bfaa4f7768ef205c
+--- /dev/null
++++ b/.review-tmp/frags/security.json
+@@ -0,0 +1 @@
++[]
+diff --git a/.review-tmp/meta b/.review-tmp/meta
+new file mode 100644
+index 0000000000000000000000000000000000000000..c89ba25e96cfa13a90f0ce4a84376cea03235b79
+--- /dev/null
++++ b/.review-tmp/meta
+@@ -0,0 +1,9 @@
++mode=diff
++base=ba2f4aa92
++head=3749ab332
++branch=HEAD
++output=/tmp/tmp.sRk6BQPy6c/wt1.on.md
++overwrite=1
++per_persona_context=auto
++date=2026-08-07
++title=Make tmpfs visible to statfs-based filesystem probes
+
+codex
+The findings are staged as persona fragments. I’m running the deterministic assembler now, then I’ll fill in the summary and clean up the temporary fragments.
+exec
+/bin/bash -lc 'SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/assemble_review.sh" --overwrite .review-tmp/meta .review-tmp/frags /tmp/tmp.sRk6BQPy6c/wt1.on.md' in /tmp/tmp.sRk6BQPy6c/wt1
+ succeeded in 0ms:
+assemble: maintainability=1, development=1, security=0, hardware=0, documentation=0
+
+diff --git a/.review-tmp/frags/development.json b/.review-tmp/frags/development.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..197b06d9e24aba7b2e13e7f66ec0824ae8e64433
+--- /dev/null
++++ b/.review-tmp/frags/development.json
+@@ -0,0 +1,12 @@
++[
++  {
++    "file": "kernel/src/fs/fs_impls/tmpfs/fs.rs",
++    "line": 57,
++    "persona": "development",
++    "grounding": "Stale resource accounting",
++    "severity": "major",
++    "problem": "`TmpFs::sb()` now advertises nonzero `blocks`, `bfree`, `bavail`, `files`, and `ffree`, but each call resets the free counters back to the total defaults and the wrapped `RamFs` allocation paths do not decrement them. After creating or extending files, `statfs()` and `fstatfs()` will still report the tmpfs as completely empty, so space-aware callers can keep writing based on bogus availability until the real allocator fails.",
++    "fix": "Add tmpfs or RamFs accounting for allocated data blocks and live inodes, and derive `bfree`, `bavail`, and `ffree` from those live counters. If the immediate goal is only filesystem-type probing, keep the `TMPFS_MAGIC` override separate from capacity fields until the counters can be made accurate.",
++    "diff": "+        sb.blocks = max_blocks;\n+        sb.bfree = max_blocks;\n+        sb.bavail = max_blocks;\n+        sb.files = max_inodes;\n+        sb.ffree = max_inodes;"
++  }
++]
+diff --git a/.review-tmp/frags/documentation.json b/.review-tmp/frags/documentation.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe51488c7066f6687ef680d6bfaa4f7768ef205c
+--- /dev/null
++++ b/.review-tmp/frags/documentation.json
+@@ -0,0 +1 @@
++[]
+diff --git a/.review-tmp/frags/maintainability.json b/.review-tmp/frags/maintainability.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..b14e66e0b28fde9830e85dc3e6bf7d1aaf56d75a
+--- /dev/null
++++ b/.review-tmp/frags/maintainability.json
+@@ -0,0 +1,12 @@
++[
++  {
++    "file": "kernel/src/fs/vfs/path/mod.rs",
++    "line": 104,
++    "persona": "maintainability",
++    "grounding": "Ambiguous API semantics",
++    "severity": "minor",
++    "problem": "This new `Path::fs()` shadows the previously inherited `Inode::fs()` forwarding method, but changes the meaning from the inode's filesystem to the mount's filesystem. The distinction is exactly what the `statfs` fix depends on, yet all existing `path.fs()` call sites now get the new behavior through the same name, making it easy to accidentally use mount-level state where inode-level state was intended.",
++    "fix": "Preserve the old `Path::fs()` forwarding semantics and add an explicit mount-oriented accessor, for example `mounted_fs()` or `mount_fs()`, then update `sys_statfs()` and `sys_fstatfs()` to call that accessor. If the semantic change is intentional for all callers, document the mount-vs-inode distinction in the method docs and audit each existing `path.fs()` call site in the same commit.",
++    "diff": "+    // Gets the file system of current `Path`.\n+    pub fn fs(&self) -> &Arc<dyn FileSystem> {\n+        self.mount.fs()\n+    }\n@@\n-    pub fn fs(&self) -> Arc<dyn FileSystem>;"
++  }
++]
+diff --git a/.review-tmp/frags/security.json b/.review-tmp/frags/security.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe51488c7066f6687ef680d6bfaa4f7768ef205c
+--- /dev/null
++++ b/.review-tmp/frags/security.json
+@@ -0,0 +1 @@
++[]
+diff --git a/.review-tmp/meta b/.review-tmp/meta
+new file mode 100644
+index 0000000000000000000000000000000000000000..c89ba25e96cfa13a90f0ce4a84376cea03235b79
+--- /dev/null
++++ b/.review-tmp/meta
+@@ -0,0 +1,9 @@
++mode=diff
++base=ba2f4aa92
++head=3749ab332
++branch=HEAD
++output=/tmp/tmp.sRk6BQPy6c/wt1.on.md
++overwrite=1
++per_persona_context=auto
++date=2026-08-07
++title=Make tmpfs visible to statfs-based filesystem probes
+
+exec
+/bin/bash -lc "sed -n '1,220p' /tmp/tmp.sRk6BQPy6c/wt1.on.md" in /tmp/tmp.sRk6BQPy6c/wt1
+ succeeded in 0ms:
+---
+date: 2026-08-07
+mode: diff
+base: ba2f4aa92
+head: 3749ab332
+branch: HEAD
+title: "Make tmpfs visible to statfs-based filesystem probes"
+---
+
+# Summary
+
+<!-- SUMMARY -->
+
+## Maintainability
+
+### `kernel/src/fs/vfs/path/mod.rs` line 104
+
+> ```diff
+> +    // Gets the file system of current `Path`.
+> +    pub fn fs(&self) -> &Arc<dyn FileSystem> {
+> +        self.mount.fs()
+> +    }
+> @@
+> -    pub fn fs(&self) -> Arc<dyn FileSystem>;
+> ```
+
+Ambiguous API semantics (minor): This new `Path::fs()` shadows the previously inherited `Inode::fs()` forwarding method, but changes the meaning from the inode's filesystem to the mount's filesystem. The distinction is exactly what the `statfs` fix depends on, yet all existing `path.fs()` call sites now get the new behavior through the same name, making it easy to accidentally use mount-level state where inode-level state was intended.
+
+**Fix.** Preserve the old `Path::fs()` forwarding semantics and add an explicit mount-oriented accessor, for example `mounted_fs()` or `mount_fs()`, then update `sys_statfs()` and `sys_fstatfs()` to call that accessor. If the semantic change is intentional for all callers, document the mount-vs-inode distinction in the method docs and audit each existing `path.fs()` call site in the same commit.
+
+## Correctness
+
+### `kernel/src/fs/fs_impls/tmpfs/fs.rs` line 57
+
+> ```diff
+> +        sb.blocks = max_blocks;
+> +        sb.bfree = max_blocks;
+> +        sb.bavail = max_blocks;
+> +        sb.files = max_inodes;
+> +        sb.ffree = max_inodes;
+> ```
+
+Stale resource accounting (major): `TmpFs::sb()` now advertises nonzero `blocks`, `bfree`, `bavail`, `files`, and `ffree`, but each call resets the free counters back to the total defaults and the wrapped `RamFs` allocation paths do not decrement them. After creating or extending files, `statfs()` and `fstatfs()` will still report the tmpfs as completely empty, so space-aware callers can keep writing based on bogus availability until the real allocator fails.
+
+**Fix.** Add tmpfs or RamFs accounting for allocated data blocks and live inodes, and derive `bfree`, `bavail`, and `ffree` from those live counters. If the immediate goal is only filesystem-type probing, keep the `TMPFS_MAGIC` override separate from capacity fields until the counters can be made accurate.
+
+diff --git a/.review-tmp/frags/development.json b/.review-tmp/frags/development.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..197b06d9e24aba7b2e13e7f66ec0824ae8e64433
+--- /dev/null
++++ b/.review-tmp/frags/development.json
+@@ -0,0 +1,12 @@
++[
++  {
++    "file": "kernel/src/fs/fs_impls/tmpfs/fs.rs",
++    "line": 57,
++    "persona": "development",
++    "grounding": "Stale resource accounting",
++    "severity": "major",
++    "problem": "`TmpFs::sb()` now advertises nonzero `blocks`, `bfree`, `bavail`, `files`, and `ffree`, but each call resets the free counters back to the total defaults and the wrapped `RamFs` allocation paths do not decrement them. After creating or extending files, `statfs()` and `fstatfs()` will still report the tmpfs as completely empty, so space-aware callers can keep writing based on bogus availability until the real allocator fails.",
++    "fix": "Add tmpfs or RamFs accounting for allocated data blocks and live inodes, and derive `bfree`, `bavail`, and `ffree` from those live counters. If the immediate goal is only filesystem-type probing, keep the `TMPFS_MAGIC` override separate from capacity fields until the counters can be made accurate.",
++    "diff": "+        sb.blocks = max_blocks;\n+        sb.bfree = max_blocks;\n+        sb.bavail = max_blocks;\n+        sb.files = max_inodes;\n+        sb.ffree = max_inodes;"
++  }
++]
+diff --git a/.review-tmp/frags/documentation.json b/.review-tmp/frags/documentation.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe51488c7066f6687ef680d6bfaa4f7768ef205c
+--- /dev/null
++++ b/.review-tmp/frags/documentation.json
+@@ -0,0 +1 @@
++[]
+diff --git a/.review-tmp/frags/maintainability.json b/.review-tmp/frags/maintainability.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..b14e66e0b28fde9830e85dc3e6bf7d1aaf56d75a
+--- /dev/null
++++ b/.review-tmp/frags/maintainability.json
+@@ -0,0 +1,12 @@
++[
++  {
++    "file": "kernel/src/fs/vfs/path/mod.rs",
++    "line": 104,
++    "persona": "maintainability",
++    "grounding": "Ambiguous API semantics",
++    "severity": "minor",
++    "problem": "This new `Path::fs()` shadows the previously inherited `Inode::fs()` forwarding method, but changes the meaning from the inode's filesystem to the mount's filesystem. The distinction is exactly what the `statfs` fix depends on, yet all existing `path.fs()` call sites now get the new behavior through the same name, making it easy to accidentally use mount-level state where inode-level state was intended.",
++    "fix": "Preserve the old `Path::fs()` forwarding semantics and add an explicit mount-oriented accessor, for example `mounted_fs()` or `mount_fs()`, then update `sys_statfs()` and `sys_fstatfs()` to call that accessor. If the semantic change is intentional for all callers, document the mount-vs-inode distinction in the method docs and audit each existing `path.fs()` call site in the same commit.",
++    "diff": "+    // Gets the file system of current `Path`.\n+    pub fn fs(&self) -> &Arc<dyn FileSystem> {\n+        self.mount.fs()\n+    }\n@@\n-    pub fn fs(&self) -> Arc<dyn FileSystem>;"
++  }
++]
+diff --git a/.review-tmp/frags/security.json b/.review-tmp/frags/security.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe51488c7066f6687ef680d6bfaa4f7768ef205c
+--- /dev/null
++++ b/.review-tmp/frags/security.json
+@@ -0,0 +1 @@
++[]
+diff --git a/.review-tmp/meta b/.review-tmp/meta
+new file mode 100644
+index 0000000000000000000000000000000000000000..c89ba25e96cfa13a90f0ce4a84376cea03235b79
+--- /dev/null
++++ b/.review-tmp/meta
+@@ -0,0 +1,9 @@
++mode=diff
++base=ba2f4aa92
++head=3749ab332
++branch=HEAD
++output=/tmp/tmp.sRk6BQPy6c/wt1.on.md
++overwrite=1
++per_persona_context=auto
++date=2026-08-07
++title=Make tmpfs visible to statfs-based filesystem probes
+
+codex
+The assembled review is in place. I’m adding the final summary section and then removing only the temporary review scaffolding I created.
+apply patch
+patch: completed
+/tmp/tmp.sRk6BQPy6c/wt1.on.md
+diff --git a/.review-tmp/frags/development.json b/.review-tmp/frags/development.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..197b06d9e24aba7b2e13e7f66ec0824ae8e64433
+--- /dev/null
++++ b/.review-tmp/frags/development.json
+@@ -0,0 +1,12 @@
++[
++  {
++    "file": "kernel/src/fs/fs_impls/tmpfs/fs.rs",
++    "line": 57,
++    "persona": "development",
++    "grounding": "Stale resource accounting",
++    "severity": "major",
++    "problem": "`TmpFs::sb()` now advertises nonzero `blocks`, `bfree`, `bavail`, `files`, and `ffree`, but each call resets the free counters back to the total defaults and the wrapped `RamFs` allocation paths do not decrement them. After creating or extending files, `statfs()` and `fstatfs()` will still report the tmpfs as completely empty, so space-aware callers can keep writing based on bogus availability until the real allocator fails.",
++    "fix": "Add tmpfs or RamFs accounting for allocated data blocks and live inodes, and derive `bfree`, `bavail`, and `ffree` from those live counters. If the immediate goal is only filesystem-type probing, keep the `TMPFS_MAGIC` override separate from capacity fields until the counters can be made accurate.",
++    "diff": "+        sb.blocks = max_blocks;\n+        sb.bfree = max_blocks;\n+        sb.bavail = max_blocks;\n+        sb.files = max_inodes;\n+        sb.ffree = max_inodes;"
++  }
++]
+diff --git a/.review-tmp/frags/documentation.json b/.review-tmp/frags/documentation.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe51488c7066f6687ef680d6bfaa4f7768ef205c
+--- /dev/null
++++ b/.review-tmp/frags/documentation.json
+@@ -0,0 +1 @@
++[]
+diff --git a/.review-tmp/frags/maintainability.json b/.review-tmp/frags/maintainability.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..b14e66e0b28fde9830e85dc3e6bf7d1aaf56d75a
+--- /dev/null
++++ b/.review-tmp/frags/maintainability.json
+@@ -0,0 +1,12 @@
++[
++  {
++    "file": "kernel/src/fs/vfs/path/mod.rs",
++    "line": 104,
++    "persona": "maintainability",
++    "grounding": "Ambiguous API semantics",
++    "severity": "minor",
++    "problem": "This new `Path::fs()` shadows the previously inherited `Inode::fs()` forwarding method, but changes the meaning from the inode's filesystem to the mount's filesystem. The distinction is exactly what the `statfs` fix depends on, yet all existing `path.fs()` call sites now get the new behavior through the same name, making it easy to accidentally use mount-level state where inode-level state was intended.",
++    "fix": "Preserve the old `Path::fs()` forwarding semantics and add an explicit mount-oriented accessor, for example `mounted_fs()` or `mount_fs()`, then update `sys_statfs()` and `sys_fstatfs()` to call that accessor. If the semantic change is intentional for all callers, document the mount-vs-inode distinction in the method docs and audit each existing `path.fs()` call site in the same commit.",
++    "diff": "+    // Gets the file system of current `Path`.\n+    pub fn fs(&self) -> &Arc<dyn FileSystem> {\n+        self.mount.fs()\n+    }\n@@\n-    pub fn fs(&self) -> Arc<dyn FileSystem>;"
++  }
++]
+diff --git a/.review-tmp/frags/security.json b/.review-tmp/frags/security.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe51488c7066f6687ef680d6bfaa4f7768ef205c
+--- /dev/null
++++ b/.review-tmp/frags/security.json
+@@ -0,0 +1 @@
++[]
+diff --git a/.review-tmp/meta b/.review-tmp/meta
+new file mode 100644
+index 0000000000000000000000000000000000000000..c89ba25e96cfa13a90f0ce4a84376cea03235b79
+--- /dev/null
++++ b/.review-tmp/meta
+@@ -0,0 +1,9 @@
++mode=diff
++base=ba2f4aa92
++head=3749ab332
++branch=HEAD
++output=/tmp/tmp.sRk6BQPy6c/wt1.on.md
++overwrite=1
++per_persona_context=auto
++date=2026-08-07
++title=Make tmpfs visible to statfs-based filesystem probes
+diff --git a//tmp/tmp.sRk6BQPy6c/wt1.on.md b//tmp/tmp.sRk6BQPy6c/wt1.on.md
+index 4c555b4e83a3e6ac5f7ba5cf6353f1fed628d7ae..e25f7d55a17e8bd1dda2a699c362a63a41de7f2e
+--- a//tmp/tmp.sRk6BQPy6c/wt1.on.md
++++ b//tmp/tmp.sRk6BQPy6c/wt1.on.md
+@@ -9,7 +9,7 @@
+ 
+ # Summary
+ 
+-<!-- SUMMARY -->
++The change correctly identifies that `statfs()` needs the mounted filesystem rather than the wrapped RamFs inode filesystem for tmpfs. The two review concerns are both around making that narrow fix safe: the tmpfs capacity fields are now visible but not backed by live accounting, and the new `Path::fs()` name changes a broader API semantic than the syscall fix needs. The stale free-space counters are the higher-risk issue because they make `statfs()` callers see tmpfs as fully free after writes.
+ 
+ ## Maintainability
+ 
+
+diff --git a/.review-tmp/frags/development.json b/.review-tmp/frags/development.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..197b06d9e24aba7b2e13e7f66ec0824ae8e64433
+--- /dev/null
++++ b/.review-tmp/frags/development.json
+@@ -0,0 +1,12 @@
++[
++  {
++    "file": "kernel/src/fs/fs_impls/tmpfs/fs.rs",
++    "line": 57,
++    "persona": "development",
++    "grounding": "Stale resource accounting",
++    "severity": "major",
++    "problem": "`TmpFs::sb()` now advertises nonzero `blocks`, `bfree`, `bavail`, `files`, and `ffree`, but each call resets the free counters back to the total defaults and the wrapped `RamFs` allocation paths do not decrement them. After creating or extending files, `statfs()` and `fstatfs()` will still report the tmpfs as completely empty, so space-aware callers can keep writing based on bogus availability until the real allocator fails.",
++    "fix": "Add tmpfs or RamFs accounting for allocated data blocks and live inodes, and derive `bfree`, `bavail`, and `ffree` from those live counters. If the immediate goal is only filesystem-type probing, keep the `TMPFS_MAGIC` override separate from capacity fields until the counters can be made accurate.",
++    "diff": "+        sb.blocks = max_blocks;\n+        sb.bfree = max_blocks;\n+        sb.bavail = max_blocks;\n+        sb.files = max_inodes;\n+        sb.ffree = max_inodes;"
++  }
++]
+diff --git a/.review-tmp/frags/documentation.json b/.review-tmp/frags/documentation.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe51488c7066f6687ef680d6bfaa4f7768ef205c
+--- /dev/null
++++ b/.review-tmp/frags/documentation.json
+@@ -0,0 +1 @@
++[]
+diff --git a/.review-tmp/frags/maintainability.json b/.review-tmp/frags/maintainability.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..b14e66e0b28fde9830e85dc3e6bf7d1aaf56d75a
+--- /dev/null
++++ b/.review-tmp/frags/maintainability.json
+@@ -0,0 +1,12 @@
++[
++  {
++    "file": "kernel/src/fs/vfs/path/mod.rs",
++    "line": 104,
++    "persona": "maintainability",
++    "grounding": "Ambiguous API semantics",
++    "severity": "minor",
++    "problem": "This new `Path::fs()` shadows the previously inherited `Inode::fs()` forwarding method, but changes the meaning from the inode's filesystem to the mount's filesystem. The distinction is exactly what the `statfs` fix depends on, yet all existing `path.fs()` call sites now get the new behavior through the same name, making it easy to accidentally use mount-level state where inode-level state was intended.",
++    "fix": "Preserve the old `Path::fs()` forwarding semantics and add an explicit mount-oriented accessor, for example `mounted_fs()` or `mount_fs()`, then update `sys_statfs()` and `sys_fstatfs()` to call that accessor. If the semantic change is intentional for all callers, document the mount-vs-inode distinction in the method docs and audit each existing `path.fs()` call site in the same commit.",
++    "diff": "+    // Gets the file system of current `Path`.\n+    pub fn fs(&self) -> &Arc<dyn FileSystem> {\n+        self.mount.fs()\n+    }\n@@\n-    pub fn fs(&self) -> Arc<dyn FileSystem>;"
++  }
++]
+diff --git a/.review-tmp/frags/security.json b/.review-tmp/frags/security.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe51488c7066f6687ef680d6bfaa4f7768ef205c
+--- /dev/null
++++ b/.review-tmp/frags/security.json
+@@ -0,0 +1 @@
++[]
+diff --git a/.review-tmp/meta b/.review-tmp/meta
+new file mode 100644
+index 0000000000000000000000000000000000000000..c89ba25e96cfa13a90f0ce4a84376cea03235b79
+--- /dev/null
++++ b/.review-tmp/meta
+@@ -0,0 +1,9 @@
++mode=diff
++base=ba2f4aa92
++head=3749ab332
++branch=HEAD
++output=/tmp/tmp.sRk6BQPy6c/wt1.on.md
++overwrite=1
++per_persona_context=auto
++date=2026-08-07
++title=Make tmpfs visible to statfs-based filesystem probes
+diff --git a//tmp/tmp.sRk6BQPy6c/wt1.on.md b//tmp/tmp.sRk6BQPy6c/wt1.on.md
+index 4c555b4e83a3e6ac5f7ba5cf6353f1fed628d7ae..e25f7d55a17e8bd1dda2a699c362a63a41de7f2e
+--- a//tmp/tmp.sRk6BQPy6c/wt1.on.md
++++ b//tmp/tmp.sRk6BQPy6c/wt1.on.md
+@@ -9,7 +9,7 @@
+ 
+ # Summary
+ 
+-<!-- SUMMARY -->
++The change correctly identifies that `statfs()` needs the mounted filesystem rather than the wrapped RamFs inode filesystem for tmpfs. The two review concerns are both around making that narrow fix safe: the tmpfs capacity fields are now visible but not backed by live accounting, and the new `Path::fs()` name changes a broader API semantic than the syscall fix needs. The stale free-space counters are the higher-risk issue because they make `statfs()` callers see tmpfs as fully free after writes.
+ 
+ ## Maintainability
+ 
+
+codex
+The review file now has the summary and findings. I’m cleaning up the temporary files and doing a quick readback of the final artifact.
+exec
+/bin/bash -lc "rm -r .review-tmp && sed -n '1,220p' /tmp/tmp.sRk6BQPy6c/wt1.on.md" in /tmp/tmp.sRk6BQPy6c/wt1
+ succeeded in 0ms:
+---
+date: 2026-08-07
+mode: diff
+base: ba2f4aa92
+head: 3749ab332
+branch: HEAD
+title: "Make tmpfs visible to statfs-based filesystem probes"
+---
+
+# Summary
+
+The change correctly identifies that `statfs()` needs the mounted filesystem rather than the wrapped RamFs inode filesystem for tmpfs. The two review concerns are both around making that narrow fix safe: the tmpfs capacity fields are now visible but not backed by live accounting, and the new `Path::fs()` name changes a broader API semantic than the syscall fix needs. The stale free-space counters are the higher-risk issue because they make `statfs()` callers see tmpfs as fully free after writes.
+
+## Maintainability
+
+### `kernel/src/fs/vfs/path/mod.rs` line 104
+
+> ```diff
+> +    // Gets the file system of current `Path`.
+> +    pub fn fs(&self) -> &Arc<dyn FileSystem> {
+> +        self.mount.fs()
+> +    }
+> @@
+> -    pub fn fs(&self) -> Arc<dyn FileSystem>;
+> ```
+
+Ambiguous API semantics (minor): This new `Path::fs()` shadows the previously inherited `Inode::fs()` forwarding method, but changes the meaning from the inode's filesystem to the mount's filesystem. The distinction is exactly what the `statfs` fix depends on, yet all existing `path.fs()` call sites now get the new behavior through the same name, making it easy to accidentally use mount-level state where inode-level state was intended.
+
+**Fix.** Preserve the old `Path::fs()` forwarding semantics and add an explicit mount-oriented accessor, for example `mounted_fs()` or `mount_fs()`, then update `sys_statfs()` and `sys_fstatfs()` to call that accessor. If the semantic change is intentional for all callers, document the mount-vs-inode distinction in the method docs and audit each existing `path.fs()` call site in the same commit.
+
+## Correctness
+
+### `kernel/src/fs/fs_impls/tmpfs/fs.rs` line 57
+
+> ```diff
+> +        sb.blocks = max_blocks;
+> +        sb.bfree = max_blocks;
+> +        sb.bavail = max_blocks;
+> +        sb.files = max_inodes;
+> +        sb.ffree = max_inodes;
+> ```
+
+Stale resource accounting (major): `TmpFs::sb()` now advertises nonzero `blocks`, `bfree`, `bavail`, `files`, and `ffree`, but each call resets the free counters back to the total defaults and the wrapped `RamFs` allocation paths do not decrement them. After creating or extending files, `statfs()` and `fstatfs()` will still report the tmpfs as completely empty, so space-aware callers can keep writing based on bogus availability until the real allocator fails.
+
+**Fix.** Add tmpfs or RamFs accounting for allocated data blocks and live inodes, and derive `bfree`, `bavail`, and `ffree` from those live counters. If the immediate goal is only filesystem-type probing, keep the `TMPFS_MAGIC` override separate from capacity fields until the counters can be made accurate.
+
+diff --git a/.review-tmp/frags/development.json b/.review-tmp/frags/development.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..197b06d9e24aba7b2e13e7f66ec0824ae8e64433
+--- /dev/null
++++ b/.review-tmp/frags/development.json
+@@ -0,0 +1,12 @@
++[
++  {
++    "file": "kernel/src/fs/fs_impls/tmpfs/fs.rs",
++    "line": 57,
++    "persona": "development",
++    "grounding": "Stale resource accounting",
++    "severity": "major",
++    "problem": "`TmpFs::sb()` now advertises nonzero `blocks`, `bfree`, `bavail`, `files`, and `ffree`, but each call resets the free counters back to the total defaults and the wrapped `RamFs` allocation paths do not decrement them. After creating or extending files, `statfs()` and `fstatfs()` will still report the tmpfs as completely empty, so space-aware callers can keep writing based on bogus availability until the real allocator fails.",
++    "fix": "Add tmpfs or RamFs accounting for allocated data blocks and live inodes, and derive `bfree`, `bavail`, and `ffree` from those live counters. If the immediate goal is only filesystem-type probing, keep the `TMPFS_MAGIC` override separate from capacity fields until the counters can be made accurate.",
++    "diff": "+        sb.blocks = max_blocks;\n+        sb.bfree = max_blocks;\n+        sb.bavail = max_blocks;\n+        sb.files = max_inodes;\n+        sb.ffree = max_inodes;"
++  }
++]
+diff --git a/.review-tmp/frags/documentation.json b/.review-tmp/frags/documentation.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe51488c7066f6687ef680d6bfaa4f7768ef205c
+--- /dev/null
++++ b/.review-tmp/frags/documentation.json
+@@ -0,0 +1 @@
++[]
+diff --git a/.review-tmp/frags/maintainability.json b/.review-tmp/frags/maintainability.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..b14e66e0b28fde9830e85dc3e6bf7d1aaf56d75a
+--- /dev/null
++++ b/.review-tmp/frags/maintainability.json
+@@ -0,0 +1,12 @@
++[
++  {
++    "file": "kernel/src/fs/vfs/path/mod.rs",
++    "line": 104,
++    "persona": "maintainability",
++    "grounding": "Ambiguous API semantics",
++    "severity": "minor",
++    "problem": "This new `Path::fs()` shadows the previously inherited `Inode::fs()` forwarding method, but changes the meaning from the inode's filesystem to the mount's filesystem. The distinction is exactly what the `statfs` fix depends on, yet all existing `path.fs()` call sites now get the new behavior through the same name, making it easy to accidentally use mount-level state where inode-level state was intended.",
++    "fix": "Preserve the old `Path::fs()` forwarding semantics and add an explicit mount-oriented accessor, for example `mounted_fs()` or `mount_fs()`, then update `sys_statfs()` and `sys_fstatfs()` to call that accessor. If the semantic change is intentional for all callers, document the mount-vs-inode distinction in the method docs and audit each existing `path.fs()` call site in the same commit.",
++    "diff": "+    // Gets the file system of current `Path`.\n+    pub fn fs(&self) -> &Arc<dyn FileSystem> {\n+        self.mount.fs()\n+    }\n@@\n-    pub fn fs(&self) -> Arc<dyn FileSystem>;"
++  }
++]
+diff --git a/.review-tmp/frags/security.json b/.review-tmp/frags/security.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe51488c7066f6687ef680d6bfaa4f7768ef205c
+--- /dev/null
++++ b/.review-tmp/frags/security.json
+@@ -0,0 +1 @@
++[]
+diff --git a/.review-tmp/meta b/.review-tmp/meta
+new file mode 100644
+index 0000000000000000000000000000000000000000..c89ba25e96cfa13a90f0ce4a84376cea03235b79
+--- /dev/null
++++ b/.review-tmp/meta
+@@ -0,0 +1,9 @@
++mode=diff
++base=ba2f4aa92
++head=3749ab332
++branch=HEAD
++output=/tmp/tmp.sRk6BQPy6c/wt1.on.md
++overwrite=1
++per_persona_context=auto
++date=2026-08-07
++title=Make tmpfs visible to statfs-based filesystem probes
+diff --git a//tmp/tmp.sRk6BQPy6c/wt1.on.md b//tmp/tmp.sRk6BQPy6c/wt1.on.md
+index 4c555b4e83a3e6ac5f7ba5cf6353f1fed628d7ae..e25f7d55a17e8bd1dda2a699c362a63a41de7f2e
+--- a//tmp/tmp.sRk6BQPy6c/wt1.on.md
++++ b//tmp/tmp.sRk6BQPy6c/wt1.on.md
+@@ -9,7 +9,7 @@
+ 
+ # Summary
+ 
+-<!-- SUMMARY -->
++The change correctly identifies that `statfs()` needs the mounted filesystem rather than the wrapped RamFs inode filesystem for tmpfs. The two review concerns are both around making that narrow fix safe: the tmpfs capacity fields are now visible but not backed by live accounting, and the new `Path::fs()` name changes a broader API semantic than the syscall fix needs. The stale free-space counters are the higher-risk issue because they make `statfs()` callers see tmpfs as fully free after writes.
+ 
+ ## Maintainability
+ 
+
+codex
+The final artifact reads cleanly and the temporary review fragments are gone. I’m checking the worktree state once so I can report only what changed.
+exec
+/bin/bash -lc 'git status --short' in /tmp/tmp.sRk6BQPy6c/wt1
+ succeeded in 0ms:
+ D .claude/settings.json
+?? .agents/
+?? .claude/skills/
+
+diff --git a/.review-tmp/frags/development.json b/.review-tmp/frags/development.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..197b06d9e24aba7b2e13e7f66ec0824ae8e64433
+--- /dev/null
++++ b/.review-tmp/frags/development.json
+@@ -0,0 +1,12 @@
++[
++  {
++    "file": "kernel/src/fs/fs_impls/tmpfs/fs.rs",
++    "line": 57,
++    "persona": "development",
++    "grounding": "Stale resource accounting",
++    "severity": "major",
++    "problem": "`TmpFs::sb()` now advertises nonzero `blocks`, `bfree`, `bavail`, `files`, and `ffree`, but each call resets the free counters back to the total defaults and the wrapped `RamFs` allocation paths do not decrement them. After creating or extending files, `statfs()` and `fstatfs()` will still report the tmpfs as completely empty, so space-aware callers can keep writing based on bogus availability until the real allocator fails.",
++    "fix": "Add tmpfs or RamFs accounting for allocated data blocks and live inodes, and derive `bfree`, `bavail`, and `ffree` from those live counters. If the immediate goal is only filesystem-type probing, keep the `TMPFS_MAGIC` override separate from capacity fields until the counters can be made accurate.",
++    "diff": "+        sb.blocks = max_blocks;\n+        sb.bfree = max_blocks;\n+        sb.bavail = max_blocks;\n+        sb.files = max_inodes;\n+        sb.ffree = max_inodes;"
++  }
++]
+diff --git a/.review-tmp/frags/documentation.json b/.review-tmp/frags/documentation.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe51488c7066f6687ef680d6bfaa4f7768ef205c
+--- /dev/null
++++ b/.review-tmp/frags/documentation.json
+@@ -0,0 +1 @@
++[]
+diff --git a/.review-tmp/frags/maintainability.json b/.review-tmp/frags/maintainability.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..b14e66e0b28fde9830e85dc3e6bf7d1aaf56d75a
+--- /dev/null
++++ b/.review-tmp/frags/maintainability.json
+@@ -0,0 +1,12 @@
++[
++  {
++    "file": "kernel/src/fs/vfs/path/mod.rs",
++    "line": 104,
++    "persona": "maintainability",
++    "grounding": "Ambiguous API semantics",
++    "severity": "minor",
++    "problem": "This new `Path::fs()` shadows the previously inherited `Inode::fs()` forwarding method, but changes the meaning from the inode's filesystem to the mount's filesystem. The distinction is exactly what the `statfs` fix depends on, yet all existing `path.fs()` call sites now get the new behavior through the same name, making it easy to accidentally use mount-level state where inode-level state was intended.",
++    "fix": "Preserve the old `Path::fs()` forwarding semantics and add an explicit mount-oriented accessor, for example `mounted_fs()` or `mount_fs()`, then update `sys_statfs()` and `sys_fstatfs()` to call that accessor. If the semantic change is intentional for all callers, document the mount-vs-inode distinction in the method docs and audit each existing `path.fs()` call site in the same commit.",
++    "diff": "+    // Gets the file system of current `Path`.\n+    pub fn fs(&self) -> &Arc<dyn FileSystem> {\n+        self.mount.fs()\n+    }\n@@\n-    pub fn fs(&self) -> Arc<dyn FileSystem>;"
++  }
++]
+diff --git a/.review-tmp/frags/security.json b/.review-tmp/frags/security.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe51488c7066f6687ef680d6bfaa4f7768ef205c
+--- /dev/null
++++ b/.review-tmp/frags/security.json
+@@ -0,0 +1 @@
++[]
+diff --git a/.review-tmp/meta b/.review-tmp/meta
+new file mode 100644
+index 0000000000000000000000000000000000000000..c89ba25e96cfa13a90f0ce4a84376cea03235b79
+--- /dev/null
++++ b/.review-tmp/meta
+@@ -0,0 +1,9 @@
++mode=diff
++base=ba2f4aa92
++head=3749ab332
++branch=HEAD
++output=/tmp/tmp.sRk6BQPy6c/wt1.on.md
++overwrite=1
++per_persona_context=auto
++date=2026-08-07
++title=Make tmpfs visible to statfs-based filesystem probes
+diff --git a//tmp/tmp.sRk6BQPy6c/wt1.on.md b//tmp/tmp.sRk6BQPy6c/wt1.on.md
+index 4c555b4e83a3e6ac5f7ba5cf6353f1fed628d7ae..e25f7d55a17e8bd1dda2a699c362a63a41de7f2e
+--- a//tmp/tmp.sRk6BQPy6c/wt1.on.md
++++ b//tmp/tmp.sRk6BQPy6c/wt1.on.md
+@@ -9,7 +9,7 @@
+ 
+ # Summary
+ 
+-<!-- SUMMARY -->
++The change correctly identifies that `statfs()` needs the mounted filesystem rather than the wrapped RamFs inode filesystem for tmpfs. The two review concerns are both around making that narrow fix safe: the tmpfs capacity fields are now visible but not backed by live accounting, and the new `Path::fs()` name changes a broader API semantic than the syscall fix needs. The stale free-space counters are the higher-risk issue because they make `statfs()` callers see tmpfs as fully free after writes.
+ 
+ ## Maintainability
+ 
+
+codex
+Review complete: [wt1.on.md](/tmp/tmp.sRk6BQPy6c/wt1.on.md)
+
+Findings:
+- Major: [tmpfs/fs.rs](/tmp/tmp.sRk6BQPy6c/wt1/kernel/src/fs/fs_impls/tmpfs/fs.rs:57) reports tmpfs free blocks/inodes as fully available on every `sb()` call, without live accounting.
+- Minor: [path/mod.rs](/tmp/tmp.sRk6BQPy6c/wt1/kernel/src/fs/vfs/path/mod.rs:104) changes `Path::fs()` from inode-filesystem semantics to mount-filesystem semantics under the same API name.
+
+No tests were run; this was a review-only pass.
+diff --git a/.review-tmp/frags/development.json b/.review-tmp/frags/development.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..197b06d9e24aba7b2e13e7f66ec0824ae8e64433
+--- /dev/null
++++ b/.review-tmp/frags/development.json
+@@ -0,0 +1,12 @@
++[
++  {
++    "file": "kernel/src/fs/fs_impls/tmpfs/fs.rs",
++    "line": 57,
++    "persona": "development",
++    "grounding": "Stale resource accounting",
++    "severity": "major",
++    "problem": "`TmpFs::sb()` now advertises nonzero `blocks`, `bfree`, `bavail`, `files`, and `ffree`, but each call resets the free counters back to the total defaults and the wrapped `RamFs` allocation paths do not decrement them. After creating or extending files, `statfs()` and `fstatfs()` will still report the tmpfs as completely empty, so space-aware callers can keep writing based on bogus availability until the real allocator fails.",
++    "fix": "Add tmpfs or RamFs accounting for allocated data blocks and live inodes, and derive `bfree`, `bavail`, and `ffree` from those live counters. If the immediate goal is only filesystem-type probing, keep the `TMPFS_MAGIC` override separate from capacity fields until the counters can be made accurate.",
++    "diff": "+        sb.blocks = max_blocks;\n+        sb.bfree = max_blocks;\n+        sb.bavail = max_blocks;\n+        sb.files = max_inodes;\n+        sb.ffree = max_inodes;"
++  }
++]
+diff --git a/.review-tmp/frags/documentation.json b/.review-tmp/frags/documentation.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe51488c7066f6687ef680d6bfaa4f7768ef205c
+--- /dev/null
++++ b/.review-tmp/frags/documentation.json
+@@ -0,0 +1 @@
++[]
+diff --git a/.review-tmp/frags/maintainability.json b/.review-tmp/frags/maintainability.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..b14e66e0b28fde9830e85dc3e6bf7d1aaf56d75a
+--- /dev/null
++++ b/.review-tmp/frags/maintainability.json
+@@ -0,0 +1,12 @@
++[
++  {
++    "file": "kernel/src/fs/vfs/path/mod.rs",
++    "line": 104,
++    "persona": "maintainability",
++    "grounding": "Ambiguous API semantics",
++    "severity": "minor",
++    "problem": "This new `Path::fs()` shadows the previously inherited `Inode::fs()` forwarding method, but changes the meaning from the inode's filesystem to the mount's filesystem. The distinction is exactly what the `statfs` fix depends on, yet all existing `path.fs()` call sites now get the new behavior through the same name, making it easy to accidentally use mount-level state where inode-level state was intended.",
++    "fix": "Preserve the old `Path::fs()` forwarding semantics and add an explicit mount-oriented accessor, for example `mounted_fs()` or `mount_fs()`, then update `sys_statfs()` and `sys_fstatfs()` to call that accessor. If the semantic change is intentional for all callers, document the mount-vs-inode distinction in the method docs and audit each existing `path.fs()` call site in the same commit.",
++    "diff": "+    // Gets the file system of current `Path`.\n+    pub fn fs(&self) -> &Arc<dyn FileSystem> {\n+        self.mount.fs()\n+    }\n@@\n-    pub fn fs(&self) -> Arc<dyn FileSystem>;"
++  }
++]
+diff --git a/.review-tmp/frags/security.json b/.review-tmp/frags/security.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe51488c7066f6687ef680d6bfaa4f7768ef205c
+--- /dev/null
++++ b/.review-tmp/frags/security.json
+@@ -0,0 +1 @@
++[]
+diff --git a/.review-tmp/meta b/.review-tmp/meta
+new file mode 100644
+index 0000000000000000000000000000000000000000..c89ba25e96cfa13a90f0ce4a84376cea03235b79
+--- /dev/null
++++ b/.review-tmp/meta
+@@ -0,0 +1,9 @@
++mode=diff
++base=ba2f4aa92
++head=3749ab332
++branch=HEAD
++output=/tmp/tmp.sRk6BQPy6c/wt1.on.md
++overwrite=1
++per_persona_context=auto
++date=2026-08-07
++title=Make tmpfs visible to statfs-based filesystem probes
+diff --git a//tmp/tmp.sRk6BQPy6c/wt1.on.md b//tmp/tmp.sRk6BQPy6c/wt1.on.md
+index 4c555b4e83a3e6ac5f7ba5cf6353f1fed628d7ae..e25f7d55a17e8bd1dda2a699c362a63a41de7f2e
+--- a//tmp/tmp.sRk6BQPy6c/wt1.on.md
++++ b//tmp/tmp.sRk6BQPy6c/wt1.on.md
+@@ -9,7 +9,7 @@
+ 
+ # Summary
+ 
+-<!-- SUMMARY -->
++The change correctly identifies that `statfs()` needs the mounted filesystem rather than the wrapped RamFs inode filesystem for tmpfs. The two review concerns are both around making that narrow fix safe: the tmpfs capacity fields are now visible but not backed by live accounting, and the new `Path::fs()` name changes a broader API semantic than the syscall fix needs. The stale free-space counters are the higher-risk issue because they make `statfs()` callers see tmpfs as fully free after writes.
+ 
+ ## Maintainability
+ 
+
+tokens used
+195,465
+Review complete: [wt1.on.md](/tmp/tmp.sRk6BQPy6c/wt1.on.md)
+
+Findings:
+- Major: [tmpfs/fs.rs](/tmp/tmp.sRk6BQPy6c/wt1/kernel/src/fs/fs_impls/tmpfs/fs.rs:57) reports tmpfs free blocks/inodes as fully available on every `sb()` call, without live accounting.
+- Minor: [path/mod.rs](/tmp/tmp.sRk6BQPy6c/wt1/kernel/src/fs/vfs/path/mod.rs:104) changes `Path::fs()` from inode-filesystem semantics to mount-filesystem semantics under the same API name.
+
+No tests were run; this was a review-only pass.
+WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp" (codex_home: AbsolutePathBuf("/tmp/tmp.do3cWQaf9T"))
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /root/asterinas/.agents/skills/aster-code-review/benchmark
+model: gpt-5.5
+provider: OpenAI
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR] (network access enabled)
+reasoning effort: high
+reasoning summaries: none
+session id: 019fda99-a11e-7a60-ae55-8cbcfd0bd4ac
+--------
+user
+You are grading a code review for recall.
+Each expected defect gives a defect description for context and a MATCH IF criterion for grading.
+For each expected defect, decide whether ANY produced review comment semantically satisfies its MATCH IF criterion at the stated code location.
+Wording, grounding label, persona, and severity may differ; judge the underlying defect.
+Respond with ONLY two space-separated integers: caught total. The total must equal the number of expected defects below.
+
+===== EXPECTED DEFECTS =====
+# Expected defects
+
+1. location: kernel/src/fs/fs_impls/tmpfs/fs.rs (persona: maintainability, grounding: no-magic-number, severity: minor)
+   defect: The literal `2` encodes the tmpfs default capacity policy in both `default_max_blocks` and `default_max_inodes`, but the policy has no semantic name, making the "50% of memory" rule easy to miss or accidentally change inconsistently.
+   MATCH IF: A reviewer should flag the duplicated literal `2` in the tmpfs default block and inode limit helpers as an unnamed capacity policy and ask for a named constant.
+
+2. location: kernel/src/fs/fs_impls/tmpfs/fs.rs (persona: maintainability, grounding: backtick-identifiers, severity: minor)
+   defect: The new `TmpFs::sb` workaround comment names implementation concepts such as Tmpfs and RamFs as plain prose instead of formatting those identifiers with Markdown backticks, which makes the code-oriented comment inconsistent with the local comment style.
+   MATCH IF: A reviewer should flag that the new tmpfs workaround comment leaves code identifiers such as `RamFs` unformatted and ask for backticks around them.
+
+3. location: kernel/src/fs/vfs/path/mod.rs (persona: maintainability, grounding: consistency, severity: minor)
+   defect: `Path::fs` is a new public method, but its summary is written as a plain `//` comment, so it will not appear in rustdoc with the rest of the public `Path` API.
+   MATCH IF: A reviewer should flag that the public `Path::fs` method uses a plain `//` summary instead of `///` and ask for a rustdoc comment.
+
+===== PRODUCED REVIEW =====
+---
+date: 2026-08-07
+mode: diff
+base: ba2f4aa92
+head: 3749ab332
+branch: HEAD
+title: "Make tmpfs visible to statfs-based filesystem probes"
+---
+
+# Summary
+
+The change correctly identifies that `statfs()` needs the mounted filesystem rather than the wrapped RamFs inode filesystem for tmpfs. The two review concerns are both around making that narrow fix safe: the tmpfs capacity fields are now visible but not backed by live accounting, and the new `Path::fs()` name changes a broader API semantic than the syscall fix needs. The stale free-space counters are the higher-risk issue because they make `statfs()` callers see tmpfs as fully free after writes.
+
+## Maintainability
+
+### `kernel/src/fs/vfs/path/mod.rs` line 104
+
+> ```diff
+> +    // Gets the file system of current `Path`.
+> +    pub fn fs({prompt}self) -> {prompt}Arc<dyn FileSystem> {
+> +        self.mount.fs()
+> +    }
+> @@
+> -    pub fn fs({prompt}self) -> Arc<dyn FileSystem>;
+> ```
+
+Ambiguous API semantics (minor): This new `Path::fs()` shadows the previously inherited `Inode::fs()` forwarding method, but changes the meaning from the inode's filesystem to the mount's filesystem. The distinction is exactly what the `statfs` fix depends on, yet all existing `path.fs()` call sites now get the new behavior through the same name, making it easy to accidentally use mount-level state where inode-level state was intended.
+
+**Fix.** Preserve the old `Path::fs()` forwarding semantics and add an explicit mount-oriented accessor, for example `mounted_fs()` or `mount_fs()`, then update `sys_statfs()` and `sys_fstatfs()` to call that accessor. If the semantic change is intentional for all callers, document the mount-vs-inode distinction in the method docs and audit each existing `path.fs()` call site in the same commit.
+
+## Correctness
+
+### `kernel/src/fs/fs_impls/tmpfs/fs.rs` line 57
+
+> ```diff
+> +        sb.blocks = max_blocks;
+> +        sb.bfree = max_blocks;
+> +        sb.bavail = max_blocks;
+> +        sb.files = max_inodes;
+> +        sb.ffree = max_inodes;
+> ```
+
+Stale resource accounting (major): `TmpFs::sb()` now advertises nonzero `blocks`, `bfree`, `bavail`, `files`, and `ffree`, but each call resets the free counters back to the total defaults and the wrapped `RamFs` allocation paths do not decrement them. After creating or extending files, `statfs()` and `fstatfs()` will still report the tmpfs as completely empty, so space-aware callers can keep writing based on bogus availability until the real allocator fails.
+
+**Fix.** Add tmpfs or RamFs accounting for allocated data blocks and live inodes, and derive `bfree`, `bavail`, and `ffree` from those live counters. If the immediate goal is only filesystem-type probing, keep the `TMPFS_MAGIC` override separate from capacity fields until the counters can be made accurate.
+warning: Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.
+codex
+0 3
+tokens used
+1,992
+0009-tmpfs-statfs                  recall 0/3 [fan-out]
+----
+reviews kept for inspection in: /tmp/tmp.2KOao8bcZE  (per problem: review.md + expected-defects.txt)
+recall: 0/3 (0%, gate >=100%) across 1 problems; per-persona-context: 0 combined, 1 fan-out; precision: 0/0 clean; harness errors: 0
+make[1]: *** [Makefile:41: benchmark] Error 1
+make: *** [Makefile:28: benchmark] Error 2

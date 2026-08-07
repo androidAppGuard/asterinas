@@ -1,0 +1,1594 @@
+OK: 13 problems (10 diff, 3 files), 24 defects (0 negative), problem_ids unique (numeric ids too)
+WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp" (codex_home: AbsolutePathBuf("/tmp/tmp.oesyy0JvoR"))
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /tmp/tmp.ACCVc0ilor/wt1
+model: gpt-5.5
+provider: OpenAI
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR] (network access enabled)
+reasoning effort: high
+reasoning summaries: none
+session id: 019fda85-bcc1-7873-9253-a7e0cdc65679
+--------
+user
+Use the aster-code-review skill with these arguments: diff 171adc36a4ec2add6f3392f5b34fb47f5f36c251 --per-persona-context=yes /tmp/tmp.ACCVc0ilor/wt1.on.md --overwrite. Review this working tree.
+warning: Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.
+codex
+I’ll use the `aster-code-review` skill for this diff-based review and write the requested Markdown output file. I’m going to read the skill instructions first, then inspect the target diff and repository context.
+exec
+/bin/bash -lc "sed -n '1,240p' /tmp/tmp.ACCVc0ilor/wt1/.agents/skills/aster-code-review/SKILL.md" in /tmp/tmp.ACCVc0ilor/wt1
+ succeeded in 0ms:
+---
+name: aster-code-review
+description: Review code against Asterinas's persona-keyed coding guidelines and write a Markdown review file. Use when asked to review a Git change (diff mode) or a set of target files (files mode) for defects, or inside a write-test-review loop.
+---
+
+# aster-code-review
+
+Review code against Asterinas's coding guidelines
+— the persona-keyed pages under `book/src/to-contribute/coding-guidelines/`
+— and write one Markdown review file.
+The review is **recall-first**: miss as few real defects as possible.
+It makes both objective calls (undeniable bugs) and subjective calls (guideline violations, each grounded in a cited rule).
+
+There are two review modes, both **anchored at the current checkout (HEAD)**:
+
+- **`diff <base>`** — a Git change:
+  the **commit series** the branch adds over its merge-base with `<base>`
+  — each commit's message *and* its diff,
+  so the review covers per-commit intent and commit hygiene, not just the net change.
+  (Commit first; uncommitted edits are not reviewed in diff mode.)
+- **`files <path[:lines] ...>`**
+  — target code: the working-tree contents of the named files,
+  optionally narrowed to line ranges.
+
+To review at a specific commit, check it out first (it becomes HEAD).
+
+This skill is agent-agnostic (Claude Code and Codex).
+Only step 3's spawn primitive differs between agents;
+everything else is identical.
+
+## Interface
+
+However the skill is triggered,
+it receives ONE raw argument string that begins with a mode word:
+
+```
+diff   <base>              <output> [--overwrite] [--per-persona-context=auto|yes|no]
+files  <path[:lines] ...>  <output> [--overwrite] [--per-persona-context=auto|yes|no]
+```
+
+- `<base>` (diff) — **required**,
+  any ref or SHA;
+  reviews the commit series `merge-base(<base>, HEAD)..HEAD` (each commit's message + diff).
+- `<path[:lines] ...>` (files) — **required**, one or more targets in the working tree.
+  A target is a path, optionally `path:N-M` or `path:N-M,K-L` (1-based, inclusive);
+  repeat a path to add ranges.
+  Wrap a path in double quotes to allow spaces or colons (`"a: b.rs":10-20`).
+- `<output>` — **required, last positional** (`cp src... dest` style);
+  refuse to overwrite unless `--overwrite`.
+- `--overwrite` — replace the output file if it already exists.
+- `--per-persona-context` — `yes`: fan out one isolated agent per persona (best recall).
+  `no`: one combined agent reviews all personas (cheaper, lower recall).
+  `auto` (default) currently resolves to `yes`;
+  it will become a benchmark-driven heuristic.
+  Controls step 3 only.
+
+**Do not pre-split the argument string yourself.**
+Pass it verbatim, as a single quoted argument,
+to `resolve_target.sh` (step 1)
+— the script self-tokenizes (whitespace-split except inside double quotes),
+which keeps the parse deterministic and identical across agents.
+
+## Pipeline
+
+Run these steps in order.
+Steps 1 and 5 are deterministic scripts;
+steps 6–8 use the model.
+
+The helper scripts live in the skill's own `scripts/` directory,
+at `.agents/skills/aster-code-review/scripts/` inside the repository under review.
+**Invoke every script by its absolute path**
+— the working directory is the code under review (the repo root), *not* the skill directory,
+so a bare `scripts/…` is not found (notably on Codex, which runs commands from the repo root; do not `cd` into the skill dir either — `resolve_target.sh` needs the repo as its cwd).
+Shells do not persist between commands,
+so **set `SKILL` at the start of each command that uses it** (or inline the `$(git rev-parse …)`):
+
+```sh
+SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/resolve_target.sh" '<raw args>'
+```
+
+The steps below write `$SKILL/scripts/…` as shorthand for that absolute path.
+
+1. **Resolve the target.**
+   `"$SKILL/scripts/resolve_target.sh" '<raw args>'` prints the canonical review input
+   — the commit series (each commit's message + diff) in `diff` mode,
+   annotated file excerpts in `files` mode;
+   save it to a temp file.
+   Run it again with `--meta` first (`"$SKILL/scripts/resolve_target.sh" --meta '<raw args>'`) to get
+   `mode=`, `base=`/`files=`, `head=`, `branch=`, `output=`, `overwrite=`, `per_persona_context=`;
+   add `date=` (today) and an optional `title=` to make the meta file.
+   Pass the raw argument string as a single quoted argument
+   so the script's tokenizer sees it intact.
+2. **Activate personas.**
+   Pick which of the five personas run,
+   from the reviewed paths — changed paths in `diff` mode,
+   named paths in `files` mode (see *Activation*).
+3. **Fan out.**
+   Spawn the persona passes (see *Spawning*).
+   With `per_persona_context` = `yes` or `auto` (the default),
+   run **one isolated PASS per activated persona** — best recall.
+   With `no`, run **one combined PASS** over all activated personas in a single context
+   — cheaper, lower recall.
+   Build each pass's prompt deterministically with `"$SKILL/scripts/build_pass_prompt.sh" <input-file> <persona>...`
+   — one persona for fan-out, all activated personas for combined
+   — and spawn the sub-agent with **that exact text**.
+   Each pass returns a JSON array of comments;
+   file each under its persona's `<fragdir>/<persona>.json` (the comment's `persona` field says which),
+   so step 5 is unchanged.
+4. **Collect** the per-persona JSON fragments.
+5. **Assemble.**
+   `"$SKILL/scripts/assemble_review.sh" [--overwrite] <meta> <fragdir> <output>` performs the deterministic merge (group by persona in fixed order, sort by file→line, drop exact duplicates *within a persona*, write frontmatter, leave a `<!-- SUMMARY -->` placeholder).
+   Pass `--overwrite` only if the user gave it;
+   otherwise the script refuses to clobber an existing `<output>`.
+6. **Verify** (see *Verification*).
+7. **Consolidate** (see *Consolidation*).
+8. **Summary.**
+   Replace `<!-- SUMMARY -->` with a constructive summary over the final comments:
+   what the code does well, the top issues ranked by severity,
+   any structural recommendations.
+
+## Activation
+
+A persona runs unless the reviewed paths *provably* contain nothing in its remit (reviewed paths = changed paths in `diff` mode, named paths in `files` mode):
+
+- **maintainability, development, security** — any reviewed code.
+- **hardware** — a reviewed path is assembly (`*.S`, `*.asm`),
+  an architecture directory (`.../arch/...`), or contains `asm!` / `global_asm!`.
+- **documentation** — a reviewed path is `book/`, any `*.md`,
+  syscall-coverage files (`*.scml`), or a user-facing API surface (a syscall or kernel parameter).
+
+Activation is path-based and deterministic;
+do not use a model to triage (a wrongly-skipped persona is a silent recall hole).
+
+## Pass contract
+
+The shared reviewer contract
+— the review methodology and the JSON comment schema every pass must follow
+— lives in [`scripts/pass_contract.md`](scripts/pass_contract.md),
+inlined as the **stable head** of every pass prompt by `build_pass_prompt.sh` (step 3).
+Do not paraphrase it into the prompt yourself:
+retyping it breaks the byte-identical prefix the prompt cache relies on (see [`execution_model.md`](spec/execution_model.md)).
+A pass reads only the persona block(s) it is given (selective exposure),
+reviews the **REVIEW INPUT** at the foot of the prompt,
+and returns a JSON array of comments per that schema.
+
+## Spawning a pass
+
+Build every pass prompt with `"$SKILL/scripts/build_pass_prompt.sh" <input-file> <persona>...`
+and spawn the sub-agent with its **exact** output
+— only a script keeps the prompt's stable head (contract + guideline) byte-identical across passes and reviews,
+which is what lets the prompt cache reuse it (see [`execution_model.md`](spec/execution_model.md)).
+
+**Default (`per_persona_context` = `yes`/`auto`)**
+— one pass per activated persona,
+each in a CLEAN context with only its own persona block (selective exposure):
+
+- **Claude Code** — spawn a Task sub-agent per persona.
+- **Codex** — run `codex exec "<build_pass_prompt.sh output>"` per persona
+  (pass the built PROMPT TEXT as the argument).
+
+**Never spawn a pass by re-running `aster_code_review.sh` / `run_agent.sh`,
+nor by re-issuing the skill's own arguments** (e.g. `codex exec … diff <base> <out>`).
+A pass is a *reviewer* invocation whose input is the `build_pass_prompt.sh` text
+— not another run of this skill.
+Re-entering the launcher spawns another orchestrator that spawns another … , an infinite fork bomb;
+the launcher now refuses it (`ACR_AGENT_RUNNING`).
+
+Passes are independent;
+order does not matter.
+Collect each pass's JSON.
+
+**Combined (`per_persona_context` = `no`)**
+— build ONE prompt with all activated personas (`"$SKILL/scripts/build_pass_prompt.sh" <input> <p1> <p2> ...`)
+and run a single pass;
+it reviews through every lens at once and tags each comment with its `persona`.
+The input and spawn overhead are paid once,
+so it is cheaper
+— but a larger shared context dilutes focus,
+so it finds fewer defects.
+The default stays fan-out:
+recall comes first,
+and `no` is an explicit, opt-in concession.
+
+## Verification (step 6)
+
+For each comment, isolate the key premise it rests on
+— especially an external-system fact (Linux/POSIX behaviour, the System V ABI, Rust semantics).
+Try to **refute** it:
+re-read the cited code and consult an authoritative source.
+Assign a verdict:
+
+- **confirmed** — keep the comment unchanged.
+- **uncertain** — keep it, but prefix `problem` with `(unverified) `.
+- **refuted** — remove the comment,
+  and append it to a `## Retracted by verification` list at the foot of the file with a one-line reason.
+
+Remove **only** on confident refutation;
+an unsure check is `uncertain`, not `refuted`.
+This is the only step that may remove a comment, and only false positives.
+
+## Consolidation (step 7)
+
+Find clusters of comments that share one root cause or one fix
+(e.g. several manual lock/unlock pairs that all want RAII).
+For each cluster, write a single unified fix
+and repoint each member's `**Fix.**` at it ("Shared with the other `raii` comments: …").
+**Never remove a comment**
+— every symptom stays at its own location.
+
+## Output format
+
+The assembled file is:
+frontmatter (`date`, `mode`, `base` or `files`, `head`, `branch`, optional `title`),
+a `# Summary`,
+then a `## <section>` per persona in the order **Maintainability, Correctness, Security, Hardware, Documentation** (Correctness is the Development persona's section).
+Each comment is a `### \`file\` line N` subsection:
+a quoted ` ```diff ` snippet,
+then a prose line `` `<grounding>` (<severity>): <problem> ``,
+then a `**Fix.**` paragraph.
+Do not restructure what the script emits;
+only fill the summary and apply the verify/consolidate edits.
+
+codex
+The skill expects a deterministic pipeline: resolve the diff input, activate personas from changed paths, run isolated review passes, assemble, then verify and summarize. I’m resolving the requested review target now.
+exec
+/bin/bash -lc 'SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/resolve_target.sh" --meta '"'diff 171adc36a4ec2add6f3392f5b34fb47f5f36c251 --per-persona-context=yes /tmp/tmp.ACCVc0ilor/wt1.on.md --overwrite'" in /tmp/tmp.ACCVc0ilor/wt1
+ succeeded in 0ms:
+mode=diff
+base=171adc36a
+head=6678565c8
+branch=HEAD
+output=/tmp/tmp.ACCVc0ilor/wt1.on.md
+overwrite=1
+per_persona_context=yes
+
+codex
+The target resolves to a diff review from base `171adc36a` to HEAD `6678565c8`, with overwrite enabled and per-persona isolation requested. Next I’m materializing the review input and checking the changed path set to determine active personas.
+exec
+/bin/bash -lc 'git log --oneline --decorate --no-merges 171adc36a4ec2add6f3392f5b34fb47f5f36c251..HEAD' in /tmp/tmp.ACCVc0ilor/wt1
+exec
+/bin/bash -lc 'SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/resolve_target.sh" '"'diff 171adc36a4ec2add6f3392f5b34fb47f5f36c251 --per-persona-context=yes /tmp/tmp.ACCVc0ilor/wt1.on.md --overwrite' > /tmp/aster-review-input.txt; wc -l /tmp/aster-review-input.txt" in /tmp/tmp.ACCVc0ilor/wt1
+exec
+/bin/bash -lc 'git diff --name-only 171adc36a4ec2add6f3392f5b34fb47f5f36c251...HEAD' in /tmp/tmp.ACCVc0ilor/wt1
+ succeeded in 0ms:
+kernel/src/syscall/getcwd.rs
+
+ succeeded in 101ms:
+ succeeded in 122ms:
+29 /tmp/aster-review-input.txt
+
+codex
+The diff is small and touches `kernel/src/syscall/getcwd.rs`. That activates maintainability, correctness, security, and documentation; hardware is not activated because there are no arch, assembly, or inline assembly changes.
+codex
+I’m going to start the four isolated persona passes now. In parallel, I’ll inspect the small syscall change locally so verification and consolidation aren’t just a blind merge of pass output.
+exec
+/bin/bash -lc 'SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/build_pass_prompt.sh" /tmp/aster-review-input.txt maintainability > /tmp/aster-prompt-maintainability.txt; wc -l /tmp/aster-prompt-maintainability.txt' in /tmp/tmp.ACCVc0ilor/wt1
+exec
+/bin/bash -lc 'SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/build_pass_prompt.sh" /tmp/aster-review-input.txt documentation > /tmp/aster-prompt-documentation.txt; wc -l /tmp/aster-prompt-documentation.txt' in /tmp/tmp.ACCVc0ilor/wt1
+exec
+/bin/bash -lc 'SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/build_pass_prompt.sh" /tmp/aster-review-input.txt development > /tmp/aster-prompt-development.txt; wc -l /tmp/aster-prompt-development.txt' in /tmp/tmp.ACCVc0ilor/wt1
+exec
+/bin/bash -lc 'SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/build_pass_prompt.sh" /tmp/aster-review-input.txt security > /tmp/aster-prompt-security.txt; wc -l /tmp/aster-prompt-security.txt' in /tmp/tmp.ACCVc0ilor/wt1
+ succeeded in 147ms:
+275 /tmp/aster-prompt-documentation.txt
+
+ succeeded in 151ms:
+1614 /tmp/aster-prompt-maintainability.txt
+
+ succeeded in 146ms:
+330 /tmp/aster-prompt-security.txt
+
+ succeeded in 152ms:
+795 /tmp/aster-prompt-development.txt
+
+codex
+The pass prompts are built from the skill scripts, with the stable contract and each persona’s guideline block inlined. I’m checking whether the local `codex` CLI is available for the skill’s prescribed pass execution path.
+exec
+/bin/bash -lc 'command -v codex && codex --version' in /tmp/tmp.ACCVc0ilor/wt1
+ succeeded in 0ms:
+/root/.local/bin/codex
+WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp" (codex_home: AbsolutePathBuf("/tmp/tmp.oesyy0JvoR"))
+codex-cli 0.142.5
+
+exec
+/bin/bash -lc "codex exec --help | sed -n '1,160p'" in /tmp/tmp.ACCVc0ilor/wt1
+ succeeded in 0ms:
+WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp" (codex_home: AbsolutePathBuf("/tmp/tmp.oesyy0JvoR"))
+Run Codex non-interactively
+
+Usage: codex exec [OPTIONS] [PROMPT]
+       codex exec [OPTIONS] <COMMAND> [ARGS]
+
+Commands:
+  resume  Resume a previous session by id or pick the most recent with --last
+  review  Run a code review against the current repository
+  help    Print this message or the help of the given subcommand(s)
+
+Arguments:
+  [PROMPT]
+          Initial instructions for the agent. If not provided as an argument (or if `-` is used),
+          instructions are read from stdin. If stdin is piped and a prompt is also provided, stdin
+          is appended as a `<stdin>` block
+
+Options:
+  -c, --config <key=value>
+          Override a configuration value that would otherwise be loaded from `~/.codex/config.toml`.
+          Use a dotted path (`foo.bar.baz`) to override nested values. The `value` portion is parsed
+          as TOML. If it fails to parse as TOML, the raw string is used as a literal.
+          
+          Examples: - `-c model="o3"` - `-c 'sandbox_permissions=["disk-full-read-access"]'` - `-c
+          shell_environment_policy.inherit=all`
+
+      --enable <FEATURE>
+          Enable a feature (repeatable). Equivalent to `-c features.<name>=true`
+
+      --disable <FEATURE>
+          Disable a feature (repeatable). Equivalent to `-c features.<name>=false`
+
+      --strict-config
+          Error out when config.toml contains fields that are not recognized by this version of
+          Codex
+
+  -i, --image <FILE>...
+          Optional image(s) to attach to the initial prompt
+
+  -m, --model <MODEL>
+          Model the agent should use
+
+      --oss
+          Use open-source provider
+
+      --local-provider <OSS_PROVIDER>
+          Specify which local provider to use (lmstudio or ollama). If not specified with --oss,
+          will use config default or show selection
+
+  -p, --profile <CONFIG_PROFILE_V2>
+          Layer $CODEX_HOME/<name>.config.toml on top of the base user config
+
+  -s, --sandbox <SANDBOX_MODE>
+          Select the sandbox policy to use when executing model-generated shell commands
+          
+          [possible values: read-only, workspace-write, danger-full-access]
+
+      --dangerously-bypass-approvals-and-sandbox
+          Skip all confirmation prompts and execute commands without sandboxing. EXTREMELY
+          DANGEROUS. Intended solely for running in environments that are externally sandboxed
+
+      --dangerously-bypass-hook-trust
+          Run enabled hooks without requiring persisted hook trust for this invocation. DANGEROUS.
+          Intended only for automation that already vets hook sources
+
+  -C, --cd <DIR>
+          Tell the agent to use the specified directory as its working root
+
+      --add-dir <DIR>
+          Additional directories that should be writable alongside the primary workspace
+
+      --skip-git-repo-check
+          Allow running Codex outside a Git repository
+
+      --ephemeral
+          Run without persisting session files to disk
+
+      --ignore-user-config
+          Do not load `$CODEX_HOME/config.toml`; auth still uses `CODEX_HOME`
+
+      --ignore-rules
+          Do not load user or project execpolicy `.rules` files
+
+      --output-schema <FILE>
+          Path to a JSON Schema file describing the model's final response shape
+
+      --color <COLOR>
+          Specifies color settings for use in the output
+          
+          [default: auto]
+          [possible values: always, never, auto]
+
+      --json
+          Print events to stdout as JSONL
+
+  -o, --output-last-message <FILE>
+          Specifies file where the last message from the agent should be written
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+codex
+The Codex CLI is available, so I’m using the skill’s intended `codex exec` pass execution path. Each pass will write its final JSON array to a separate fragment file under `/tmp/aster-review-frags`.
+2026-08-07T04:41:47.092432Z ERROR codex_core::tools::router: error=exec_command failed for `/bin/bash -lc 'rm -rf /tmp/aster-review-frags /tmp/aster-review-logs; mkdir -p /tmp/aster-review-frags /tmp/aster-review-logs'`: CreateProcess { message: "Rejected(\"`/bin/bash -lc 'rm -rf /tmp/aster-review-frags /tmp/aster-review-logs; mkdir -p /tmp/aster-review-frags /tmp/aster-review-logs'` rejected: blocked by policy\")" }
+codex
+The cleanup command was blocked by policy because it included a destructive removal. I’ll avoid cleanup and use fresh temporary directories instead.
+exec
+/bin/bash -lc 'mktemp -d /tmp/aster-review-frags.XXXXXX; mktemp -d /tmp/aster-review-logs.XXXXXX' in /tmp/tmp.ACCVc0ilor/wt1
+ succeeded in 0ms:
+/tmp/aster-review-frags.2HkdY8
+/tmp/aster-review-logs.mahrH5
+
+codex
+Fresh fragment and log directories are ready. I’m launching the four review passes now; this may take a bit because each pass is an isolated model run.
+exec
+/bin/bash -lc 'codex exec -C /tmp/tmp.ACCVc0ilor/wt1 --ephemeral -o /tmp/aster-review-frags.2HkdY8/development.json "$(< /tmp/aster-prompt-development.txt)" > /tmp/aster-review-logs.mahrH5/development.log 2>&1' in /tmp/tmp.ACCVc0ilor/wt1
+exec
+/bin/bash -lc 'codex exec -C /tmp/tmp.ACCVc0ilor/wt1 --ephemeral -o /tmp/aster-review-frags.2HkdY8/maintainability.json "$(< /tmp/aster-prompt-maintainability.txt)" > /tmp/aster-review-logs.mahrH5/maintainability.log 2>&1' in /tmp/tmp.ACCVc0ilor/wt1
+exec
+/bin/bash -lc 'codex exec -C /tmp/tmp.ACCVc0ilor/wt1 --ephemeral -o /tmp/aster-review-frags.2HkdY8/documentation.json "$(< /tmp/aster-prompt-documentation.txt)" > /tmp/aster-review-logs.mahrH5/documentation.log 2>&1' in /tmp/tmp.ACCVc0ilor/wt1
+exec
+/bin/bash -lc 'codex exec -C /tmp/tmp.ACCVc0ilor/wt1 --ephemeral -o /tmp/aster-review-frags.2HkdY8/security.json "$(< /tmp/aster-prompt-security.txt)" > /tmp/aster-review-logs.mahrH5/security.log 2>&1' in /tmp/tmp.ACCVc0ilor/wt1
+codex
+All four pass processes are running. While they work, I’m reading the commit diff and surrounding `getcwd` implementation to verify likely issues against the actual code.
+exec
+/bin/bash -lc "rg -n \"getcwd|SysGetcwd|SYS_getcwd\" kernel test -g '*.rs' -g '*.c'" in /tmp/tmp.ACCVc0ilor/wt1
+exec
+/bin/bash -lc "sed -n '1,240p' kernel/src/syscall/getcwd.rs" in /tmp/tmp.ACCVc0ilor/wt1
+ succeeded in 0ms:
+// SPDX-License-Identifier: MPL-2.0
+
+use ostd::mm::VmIo;
+
+use super::SyscallReturn;
+use crate::{fs::vfs::path::AbsPathResult, prelude::*};
+
+pub fn sys_getcwd(buf: Vaddr, len: usize, ctx: &Context) -> Result<SyscallReturn> {
+    let abs_path = {
+        let fs_ref = ctx.thread_local.borrow_fs();
+        let path_resolver = fs_ref.resolver().read();
+        path_resolver.make_abs_path(path_resolver.cwd())
+    };
+
+    debug!("getcwd: {:?}", abs_path);
+
+    // Linux will add a "(unreachable)" prefix to the path if the CWD is not reachable.
+    // However, according to POSIX, `getcwd()` should fail with ENOENT in this case.
+    // `glibc` treats the Linux's behavior as a bug and handles the Linux-specific prefix
+    // to conform to POSIX. Here follows Linux's behavior to keep compatibility.
+    //
+    // Reference: <https://man7.org/linux/man-pages/man3/getcwd.3.html>
+    let abs_path = match abs_path {
+        AbsPathResult::Reachable(s) => s,
+        AbsPathResult::Unreachable(s) => alloc::format!("(unreachable){}", s),
+    };
+
+    let cwd = CString::new(abs_path)?;
+    let bytes = cwd.as_bytes_with_nul();
+    let write_len = len.min(bytes.len());
+    ctx.user_space().write_bytes(buf, &bytes[..write_len])?;
+
+    Ok(SyscallReturn::Return(write_len as _))
+}
+
+exec
+/bin/bash -lc 'git show --stat --patch --find-renames --find-copies HEAD -- kernel/src/syscall/getcwd.rs' in /tmp/tmp.ACCVc0ilor/wt1
+ succeeded in 0ms:
+commit 6678565c80bb615b90ba124ce47beb0642738492
+Author: bench <b@l>
+Date:   Sun Jun 28 12:52:05 2026 +0000
+
+    fs/getcwd: fill the user buffer up to its length
+    
+    Copy as much of the path as fits the caller-provided buffer instead of erroring out, returning the number of bytes written.
+---
+ kernel/src/syscall/getcwd.rs | 8 +++-----
+ 1 file changed, 3 insertions(+), 5 deletions(-)
+
+diff --git a/kernel/src/syscall/getcwd.rs b/kernel/src/syscall/getcwd.rs
+index c2ba62e37..44a2f9088 100644
+--- a/kernel/src/syscall/getcwd.rs
++++ b/kernel/src/syscall/getcwd.rs
+@@ -27,10 +27,8 @@ pub fn sys_getcwd(buf: Vaddr, len: usize, ctx: &Context) -> Result<SyscallReturn
+ 
+     let cwd = CString::new(abs_path)?;
+     let bytes = cwd.as_bytes_with_nul();
+-    if bytes.len() > len {
+-        return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+-    }
+-    ctx.user_space().write_bytes(buf, bytes)?;
++    let write_len = len.min(bytes.len());
++    ctx.user_space().write_bytes(buf, &bytes[..write_len])?;
+ 
+-    Ok(SyscallReturn::Return(bytes.len() as _))
++    Ok(SyscallReturn::Return(write_len as _))
+ }
+
+ succeeded in 101ms:
+ succeeded in 43622ms:
+ succeeded in 46102ms:
+codex
+The local diff changes `getcwd` from Linux-style `ERANGE` on too-small buffers to truncating the pathname and returning the truncated byte count. I’m checking the syscall contract now, because that behavior is the key correctness/security premise.
+exec
+/bin/bash -lc "git grep -n \"the CWD buffer is too small\\|ERANGE.*getcwd\\|getcwd_small_buffer\" 171adc36a4ec2add6f3392f5b34fb47f5f36c251 -- kernel test" in /tmp/tmp.ACCVc0ilor/wt1
+exec
+/bin/bash -lc "sed -n '1,80p' test/initramfs/src/regression/fs/getcwd/getcwd.c" in /tmp/tmp.ACCVc0ilor/wt1
+exec
+/bin/bash -lc "man 2 getcwd | col -b | sed -n '1,180p'" in /tmp/tmp.ACCVc0ilor/wt1
+ succeeded in 105ms:
+// SPDX-License-Identifier: MPL-2.0
+
+#define _GNU_SOURCE
+
+#include <errno.h>
+#include <unistd.h>
+
+#include "../../common/test.h"
+
+FN_TEST(getcwd_small_buffer_returns_erange)
+{
+	char small[1];
+	TEST_ERRNO(getcwd(small, 1), ERANGE);
+}
+END_TEST()
+
+ succeeded in 104ms:
+/bin/bash: line 1: col: command not found
+/usr/bin/man: 2: echo: echo: I/O error
+/usr/bin/man: 3: echo: echo: I/O error
+/usr/bin/man: 4: echo: echo: I/O error
+/usr/bin/man: 5: echo: echo: I/O error
+/usr/bin/man: 6: echo: echo: I/O error
+
+ succeeded in 127ms:
+171adc36a4ec2add6f3392f5b34fb47f5f36c251:kernel/src/syscall/getcwd.rs:31:        return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+171adc36a4ec2add6f3392f5b34fb47f5f36c251:test/initramfs/src/regression/fs/getcwd/getcwd.c:10:FN_TEST(getcwd_small_buffer_returns_erange)
+
+ succeeded in 55543ms:
+ succeeded in 57001ms:
+web search: 
+web search: Linux man-pages getcwd system call ERANGE buffer too small
+codex
+The syscall contract check confirms the old ERANGE behavior matches POSIX/Linux expectations for a too-small buffer. I’m waiting on the persona passes and will then assemble only verified findings into the requested Markdown file.
+codex
+The persona processes have finished. I’m validating their JSON fragments before assembly so malformed pass output doesn’t leak into the review file.
+exec
+/bin/bash -lc 'wc -c /tmp/aster-review-frags.2HkdY8/*.json' in /tmp/tmp.ACCVc0ilor/wt1
+exec
+/bin/bash -lc "sed -n '1,220p' /tmp/aster-review-frags.2HkdY8/security.json" in /tmp/tmp.ACCVc0ilor/wt1
+exec
+/bin/bash -lc 'for f in /tmp/aster-review-frags.2HkdY8/*.json; do jq . "$f" >/dev/null && printf '"'valid %s\\n' \""'$f" || printf '"'invalid %s\\n' \""'$f"; done' in /tmp/tmp.ACCVc0ilor/wt1
+exec
+/bin/bash -lc "sed -n '1,220p' /tmp/aster-review-frags.2HkdY8/development.json" in /tmp/tmp.ACCVc0ilor/wt1
+ succeeded in 118ms:
+1027 /tmp/aster-review-frags.2HkdY8/development.json
+1114 /tmp/aster-review-frags.2HkdY8/documentation.json
+ 521 /tmp/aster-review-frags.2HkdY8/maintainability.json
+ 936 /tmp/aster-review-frags.2HkdY8/security.json
+3598 total
+
+ succeeded in 129ms:
+[{"file":"kernel/src/syscall/getcwd.rs","line":30,"persona":"development","grounding":"Incorrect getcwd semantics","severity":"major","problem":"`sys_getcwd` now returns success when `len` is smaller than the null-terminated path length, including `len == 0`. That can copy a truncated, non-terminated pathname to userspace and returns `write_len` instead of reporting `ERANGE`, breaking the existing `getcwd_small_buffer_returns_erange` regression test and the expected `getcwd` contract.","fix":"Restore the `ERANGE` path when `bytes.len() > len`, and only call `write_bytes` once the full null-terminated pathname fits.","diff":"```diff\n-    if bytes.len() > len {\n-        return_errno_with_message!(Errno::ERANGE, \"the CWD buffer is too small\");\n-    }\n-    ctx.user_space().write_bytes(buf, bytes)?;\n+    let write_len = len.min(bytes.len());\n+    ctx.user_space().write_bytes(buf, &bytes[..write_len])?;\n \n-    Ok(SyscallReturn::Return(bytes.len() as _))\n+    Ok(SyscallReturn::Return(write_len as _))\n```"}]
+ succeeded in 136ms:
+valid /tmp/aster-review-frags.2HkdY8/development.json
+valid /tmp/aster-review-frags.2HkdY8/documentation.json
+valid /tmp/aster-review-frags.2HkdY8/maintainability.json
+valid /tmp/aster-review-frags.2HkdY8/security.json
+
+ succeeded in 141ms:
+[{"file":"kernel/src/syscall/getcwd.rs","line":30,"persona":"security","grounding":"validate-at-boundaries","severity":"major","problem":"`len` is user-supplied syscall input, but `sys_getcwd()` now silently clamps the copy with `len.min(bytes.len())` and returns success when the caller's buffer is too small. That hides the required `ERANGE` boundary validation failure and can return a truncated, non-NUL-terminated pathname as if it were valid.","fix":"Restore the boundary check before writing to userspace: return `Errno::ERANGE` when `bytes.len() > len`, and only call `write_bytes()` after the full C string is known to fit.","diff":"```diff\n-    let write_len = len.min(bytes.len());\n-    ctx.user_space().write_bytes(buf, &bytes[..write_len])?;\n+    if bytes.len() > len {\n+        return_errno_with_message!(Errno::ERANGE, \"the CWD buffer is too small\");\n+    }\n+    ctx.user_space().write_bytes(buf, bytes)?;\n```"}]
+exec
+/bin/bash -lc "sed -n '1,220p' /tmp/aster-review-frags.2HkdY8/maintainability.json" in /tmp/tmp.ACCVc0ilor/wt1
+exec
+/bin/bash -lc "sed -n '1,120p' /tmp/aster-review-input.txt" in /tmp/tmp.ACCVc0ilor/wt1
+ succeeded in 0ms:
+[
+  {
+    "file": "commit 6678565c8 message",
+    "persona": "maintainability",
+    "grounding": "imperative-subject",
+    "severity": "minor",
+    "problem": "The subject starts with the scope prefix `fs/getcwd:` instead of an imperative verb, and the `getcwd` identifier is not wrapped in backticks.",
+    "fix": "Rewrite the subject as a verb-first line with the identifier formatted, for example: `Fill \\`getcwd\\` user buffer up to its length`.",
+    "diff": "fs/getcwd: fill the user buffer up to its length"
+  }
+]
+ succeeded in 0ms:
+
+===== commit 6678565c8 =====
+
+[commit message]
+fs/getcwd: fill the user buffer up to its length
+
+Copy as much of the path as fits the caller-provided buffer instead of erroring out, returning the number of bytes written.
+
+[changes]
+
+
+diff --git a/kernel/src/syscall/getcwd.rs b/kernel/src/syscall/getcwd.rs
+index c2ba62e37..44a2f9088 100644
+--- a/kernel/src/syscall/getcwd.rs
++++ b/kernel/src/syscall/getcwd.rs
+@@ -27,10 +27,8 @@ pub fn sys_getcwd(buf: Vaddr, len: usize, ctx: &Context) -> Result<SyscallReturn
+ 
+     let cwd = CString::new(abs_path)?;
+     let bytes = cwd.as_bytes_with_nul();
+-    if bytes.len() > len {
+-        return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+-    }
+-    ctx.user_space().write_bytes(buf, bytes)?;
++    let write_len = len.min(bytes.len());
++    ctx.user_space().write_bytes(buf, &bytes[..write_len])?;
+ 
+-    Ok(SyscallReturn::Return(bytes.len() as _))
++    Ok(SyscallReturn::Return(write_len as _))
+ }
+
+exec
+/bin/bash -lc "sed -n '1,220p' /tmp/aster-review-frags.2HkdY8/documentation.json" in /tmp/tmp.ACCVc0ilor/wt1
+ succeeded in 0ms:
+[
+  {
+    "file": "kernel/src/syscall/getcwd.rs",
+    "line": 30,
+    "persona": "documentation",
+    "grounding": "linux-compat-docs",
+    "severity": "major",
+    "problem": "This changes the user-visible `getcwd` short-buffer behavior from returning `ERANGE` to copying a truncated pathname and returning `write_len`, but the Linux compatibility docs still list `getcwd` as fully covered. The syscall coverage artifact is now stale for `getcwd(buf, size)` behavior.",
+    "fix": "Update `book/src/kernel/linux-compatibility/README.md` and the matching `.scml` coverage entry to reflect the new `getcwd` behavior, or move `getcwd` out of full coverage if this partial-copy behavior is intentional.",
+    "diff": "```diff\n-    if bytes.len() > len {\n-        return_errno_with_message!(Errno::ERANGE, \"the CWD buffer is too small\");\n-    }\n-    ctx.user_space().write_bytes(buf, bytes)?;\n+    let write_len = len.min(bytes.len());\n+    ctx.user_space().write_bytes(buf, &bytes[..write_len])?;\n \n-    Ok(SyscallReturn::Return(bytes.len() as _))\n+    Ok(SyscallReturn::Return(write_len as _))\n```"
+  }
+]
+codex
+The fragments are valid JSON. The core correctness and security comments converge on the same root cause; there’s also a commit-message style note and a documentation coverage note that I’ll verify before deciding whether to keep, mark uncertain, or retract.
+exec
+/bin/bash -lc "sed -n '1,260p' .agents/skills/aster-code-review/scripts/assemble_review.sh" in /tmp/tmp.ACCVc0ilor/wt1
+ succeeded in 0ms:
+#!/usr/bin/env bash
+
+# SPDX-License-Identifier: MPL-2.0
+
+#
+# assemble_review.sh — deterministic merge of persona comment fragments into the review file body.
+# No LLM judgement here:
+# group by persona in a fixed order,
+# sort by file then line within each group,
+# drop exact duplicates *within a persona*,
+# write the frontmatter,
+# and leave a <!-- SUMMARY --> placeholder for the orchestrator's LLM summary step.
+#
+# Usage: assemble_review.sh [--overwrite] <meta-file> <frag-dir> <output-file>
+#   meta-file: lines `mode=`, `base=` (diff) or `files=` (files), `head=`,
+#              `branch=`, `date=`, `title=`
+#   frag-dir:  one <persona>.json per persona, each a JSON array of comments:
+#       {"file","line","grounding","severity","problem","fix","diff"}
+#   --overwrite: replace <output-file> if it already exists (otherwise fail).
+set -euo pipefail
+
+overwrite=0
+pos=()
+for a in "$@"; do
+    case "$a" in
+        --overwrite) overwrite=1 ;;
+        --*) echo "assemble_review.sh: unknown flag: $a" >&2; exit 2 ;;
+        *) pos+=("$a") ;;
+    esac
+done
+if [[ ${#pos[@]} -ne 3 ]]; then
+    echo "usage: assemble_review.sh [--overwrite] <meta-file> <frag-dir> <output-file>" >&2
+    exit 2
+fi
+meta="${pos[0]}"; fragdir="${pos[1]}"; out="${pos[2]}"
+
+# Refuse to clobber an existing review unless --overwrite (design §3).
+if [[ -e "$out" && $overwrite -eq 0 ]]; then
+    echo "assemble_review.sh: refusing to overwrite existing $out (pass --overwrite)" >&2
+    exit 1
+fi
+
+python3 - "$meta" "$fragdir" "$out" <<'PY'
+import json, os, re, sys
+meta_path, fragdir, out = sys.argv[1], sys.argv[2], sys.argv[3]
+
+# A guideline short-name is a lowercase kebab identifier (e.g. `lock-ordering`) and
+# renders as code — a citable rule. A bug's grounding is a short plain-language
+# description (e.g. "Off by one") and renders as prose, so it never reads as a rule name.
+KEBAB = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
+def grounding_tag(g):
+    return "`%s`" % g if KEBAB.fullmatch(g) else g
+
+meta = {}
+for line in open(meta_path):
+    line = line.strip()
+    if "=" in line:
+        k, v = line.split("=", 1)
+        meta[k] = v
+
+# Fixed persona order -> review section title.
+# "Correctness" is the Development persona's section (a bare "## Development" reads oddly; see the design doc).
+ORDER = [("maintainability", "Maintainability"),
+         ("development",      "Correctness"),
+         ("security",         "Security"),
+         ("hardware",         "Hardware"),
+         ("documentation",    "Documentation")]
+
+def load(persona):
+    p = os.path.join(fragdir, persona + ".json")
+    if not os.path.exists(p):
+        return []          # persona not activated / did not run: legitimately absent
+    # An EXISTING fragment that is unparseable or not a JSON array means a pass
+    # produced broken output. Failing closed (rather than dropping it) is essential:
+    # this skill is recall-first, so a silently-discarded fragment is a silent
+    # recall hole the benchmark/orchestrator would never notice.
+    try:
+        data = json.load(open(p))
+    except Exception as e:
+        sys.stderr.write(f"assemble: FATAL: unparseable fragment {p}: {e}\n")
+        sys.exit(2)
+    if not isinstance(data, list):
+        sys.stderr.write(f"assemble: FATAL: fragment {p} is not a JSON array of comments\n")
+        sys.exit(2)
+    return data
+
+L = ["---",
+     f"date: {meta.get('date','')}",
+     f"mode: {meta.get('mode','diff')}"]
+if meta.get("base"):
+    L.append(f"base: {meta['base']}")
+if meta.get("files"):
+    L.append(f"files: {meta['files']}")
+L += [f"head: {meta.get('head','')}",
+      f"branch: {meta.get('branch','')}"]
+if meta.get("title"):
+    # json.dumps yields a valid YAML double-quoted scalar (escapes embedded quotes).
+    L.append("title: " + json.dumps(meta["title"]))
+L += ["---", "", "# Summary", "", "<!-- SUMMARY -->", ""]
+
+counts = {}
+for persona, title in ORDER:
+    # Dedup is per-persona: identical comments from two different personas are both kept,
+    # in their own sections (design §4).
+    seen = set()
+    uniq = []
+    for c in load(persona):
+        # "Exact" duplicate: identical in EVERY field (a normalized full-object key),
+        # so two comments that differ in grounding, severity, or diff are both kept.
+        # A partial key would collapse distinct findings — a recall hole.
+        key = json.dumps(c, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(c)
+    counts[persona] = len(uniq)
+    if not uniq:
+        continue
+    # Sort by file, then line, then a stable text key
+    # so co-located comments have a deterministic order regardless of pass output order.
+    uniq.sort(key=lambda c: (str(c.get("file", "")),
+                             int(c.get("line", 0) or 0),
+                             str(c.get("grounding", "")),
+                             str(c.get("problem", ""))))
+    L += [f"## {title}", ""]
+    for c in uniq:
+        loc = "`%s`" % c.get("file", "?")
+        if c.get("line"):
+            loc += " line %s" % c["line"]
+        L += [f"### {loc}", ""]
+        diff = c.get("diff")
+        if diff:
+            L.append("> ```diff")
+            L += ["> " + dl for dl in str(diff).splitlines()]
+            L += ["> ```", ""]
+        L.append("%s (%s): %s" % (grounding_tag(c.get("grounding", "issue")),
+                                  c.get("severity", "major"),
+                                  (c.get("problem", "") or "").strip()))
+        L += ["", "**Fix.** %s" % (c.get("fix", "") or "").strip(), ""]
+
+open(out, "w").write("\n".join(L).rstrip() + "\n")
+sys.stderr.write("assemble: " + ", ".join(f"{p}={counts[p]}" for p, _ in ORDER) + "\n")
+PY
+
+codex
+I’m preparing the deterministic assembly metadata with today’s date and the resolved base/head. After assembly, I’ll edit only the generated review file to handle verification, consolidation, and summary.
+exec
+/bin/bash -lc 'SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/resolve_target.sh" --meta '"'diff 171adc36a4ec2add6f3392f5b34fb47f5f36c251 --per-persona-context=yes /tmp/tmp.ACCVc0ilor/wt1.on.md --overwrite' > /tmp/aster-review-meta.txt; printf 'date=2026-08-07\\ntitle=Asterinas getcwd review\\n' >> /tmp/aster-review-meta.txt; \""'$SKILL/scripts/assemble_review.sh" --overwrite /tmp/aster-review-meta.txt /tmp/aster-review-frags.2HkdY8 /tmp/tmp.ACCVc0ilor/wt1.on.md' in /tmp/tmp.ACCVc0ilor/wt1
+ succeeded in 0ms:
+assemble: maintainability=1, development=1, security=1, hardware=0, documentation=1
+
+codex
+The initial review file is assembled. I’m now verifying each finding’s premise: the Linux/POSIX `getcwd` size behavior, existing regression coverage, commit style rule, and whether syscall coverage docs actually claim full `getcwd` support.
+exec
+/bin/bash -lc "rg -n \"getcwd|SYS_getcwd|SYS_GETCWD\" book kernel test -g '*.md' -g '*.scml' -g '*.rs' -g '*.c'" in /tmp/tmp.ACCVc0ilor/wt1
+ succeeded in 0ms:
+book/src/kernel/linux-compatibility/README.md:102:| 79      | getcwd                 | ✅             | 💯 |
+test/initramfs/src/regression/fs/getcwd/getcwd.c:10:FN_TEST(getcwd_small_buffer_returns_erange)
+test/initramfs/src/regression/fs/getcwd/getcwd.c:13:	TEST_ERRNO(getcwd(small, 1), ERANGE);
+book/src/kernel/linux-compatibility/syscall-flag-coverage/file-and-directory-operations/fully_covered.scml:39:getcwd(buf, size);
+test/initramfs/src/regression/fs/isolation/chroot.c:67:FN_TEST(chroot_getcwd)
+test/initramfs/src/regression/fs/isolation/chroot.c:75:		CHECK_WITH(getcwd(cwd, sizeof(cwd)), strcmp(cwd, "/") == 0);
+test/initramfs/src/regression/fs/isolation/chroot.c:97:		CHECK_WITH(getcwd(cwd, sizeof(cwd)), strcmp(cwd, "/") == 0);
+test/initramfs/src/regression/fs/isolation/chroot.c:135:		// Now getcwd should add "(unreachable)" prefix because we're outside the chroot jail
+test/initramfs/src/regression/fs/isolation/chroot.c:137:		CHECK_WITH(syscall(SYS_getcwd, cwd, sizeof(cwd)),
+test/initramfs/src/regression/fs/isolation/pivot_root.c:124:	TEST_RES(syscall(SYS_getcwd, cwd, sizeof(cwd)), strcmp(cwd, "/") == 0);
+test/initramfs/src/regression/security/namespace/unshare.c:109:	CHECK(getcwd((char *)arg, CWD_BUF_SIZE));
+test/initramfs/src/regression/security/namespace/unshare.c:119:	TEST_RES(getcwd(cwd_buf1, CWD_BUF_SIZE),
+test/initramfs/src/regression/security/namespace/unshare.c:128:	TEST_RES(getcwd(cwd_buf2, CWD_BUF_SIZE),
+test/initramfs/src/regression/security/namespace/mnt_ns.c:175:	TEST_RES(getcwd(buf, sizeof(buf)), strcmp(buf, "/mnt") == 0);
+test/initramfs/src/regression/security/namespace/mnt_ns.c:179:	TEST_RES(getcwd(buf, sizeof(buf)), strcmp(buf, "/") == 0);
+kernel/src/syscall/getcwd.rs:8:pub fn sys_getcwd(buf: Vaddr, len: usize, ctx: &Context) -> Result<SyscallReturn> {
+kernel/src/syscall/getcwd.rs:15:    debug!("getcwd: {:?}", abs_path);
+kernel/src/syscall/getcwd.rs:18:    // However, according to POSIX, `getcwd()` should fail with ENOENT in this case.
+kernel/src/syscall/getcwd.rs:22:    // Reference: <https://man7.org/linux/man-pages/man3/getcwd.3.html>
+kernel/src/syscall/mod.rs:55:mod getcwd;
+kernel/src/syscall/arch/x86.rs:41:    getcwd::sys_getcwd,
+kernel/src/syscall/arch/x86.rs:254:    SYS_GETCWD = 79            => sys_getcwd(args[..2]);
+kernel/src/syscall/arch/generic.rs:43:            getcwd::sys_getcwd,
+kernel/src/syscall/arch/generic.rs:218:            SYS_GETCWD = 17                  => sys_getcwd(args[..2]);
+
+exec
+/bin/bash -lc "sed -n '1,220p' /tmp/tmp.ACCVc0ilor/wt1.on.md" in /tmp/tmp.ACCVc0ilor/wt1
+ succeeded in 0ms:
+---
+date: 2026-08-07
+mode: diff
+base: 171adc36a
+head: 6678565c8
+branch: HEAD
+title: "Asterinas getcwd review"
+---
+
+# Summary
+
+<!-- SUMMARY -->
+
+## Maintainability
+
+### `commit 6678565c8 message`
+
+> ```diff
+> fs/getcwd: fill the user buffer up to its length
+> ```
+
+`imperative-subject` (minor): The subject starts with the scope prefix `fs/getcwd:` instead of an imperative verb, and the `getcwd` identifier is not wrapped in backticks.
+
+**Fix.** Rewrite the subject as a verb-first line with the identifier formatted, for example: `Fill \`getcwd\` user buffer up to its length`.
+
+## Correctness
+
+### `kernel/src/syscall/getcwd.rs` line 30
+
+> ```diff
+> ```diff
+> -    if bytes.len() > len {
+> -        return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+> -    }
+> -    ctx.user_space().write_bytes(buf, bytes)?;
+> +    let write_len = len.min(bytes.len());
+> +    ctx.user_space().write_bytes(buf, &bytes[..write_len])?;
+>  
+> -    Ok(SyscallReturn::Return(bytes.len() as _))
+> +    Ok(SyscallReturn::Return(write_len as _))
+> ```
+> ```
+
+Incorrect getcwd semantics (major): `sys_getcwd` now returns success when `len` is smaller than the null-terminated path length, including `len == 0`. That can copy a truncated, non-terminated pathname to userspace and returns `write_len` instead of reporting `ERANGE`, breaking the existing `getcwd_small_buffer_returns_erange` regression test and the expected `getcwd` contract.
+
+**Fix.** Restore the `ERANGE` path when `bytes.len() > len`, and only call `write_bytes` once the full null-terminated pathname fits.
+
+## Security
+
+### `kernel/src/syscall/getcwd.rs` line 30
+
+> ```diff
+> ```diff
+> -    let write_len = len.min(bytes.len());
+> -    ctx.user_space().write_bytes(buf, &bytes[..write_len])?;
+> +    if bytes.len() > len {
+> +        return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+> +    }
+> +    ctx.user_space().write_bytes(buf, bytes)?;
+> ```
+> ```
+
+`validate-at-boundaries` (major): `len` is user-supplied syscall input, but `sys_getcwd()` now silently clamps the copy with `len.min(bytes.len())` and returns success when the caller's buffer is too small. That hides the required `ERANGE` boundary validation failure and can return a truncated, non-NUL-terminated pathname as if it were valid.
+
+**Fix.** Restore the boundary check before writing to userspace: return `Errno::ERANGE` when `bytes.len() > len`, and only call `write_bytes()` after the full C string is known to fit.
+
+## Documentation
+
+### `kernel/src/syscall/getcwd.rs` line 30
+
+> ```diff
+> ```diff
+> -    if bytes.len() > len {
+> -        return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+> -    }
+> -    ctx.user_space().write_bytes(buf, bytes)?;
+> +    let write_len = len.min(bytes.len());
+> +    ctx.user_space().write_bytes(buf, &bytes[..write_len])?;
+>  
+> -    Ok(SyscallReturn::Return(bytes.len() as _))
+> +    Ok(SyscallReturn::Return(write_len as _))
+> ```
+> ```
+
+`linux-compat-docs` (major): This changes the user-visible `getcwd` short-buffer behavior from returning `ERANGE` to copying a truncated pathname and returning `write_len`, but the Linux compatibility docs still list `getcwd` as fully covered. The syscall coverage artifact is now stale for `getcwd(buf, size)` behavior.
+
+**Fix.** Update `book/src/kernel/linux-compatibility/README.md` and the matching `.scml` coverage entry to reflect the new `getcwd` behavior, or move `getcwd` out of full coverage if this partial-copy behavior is intentional.
+
+exec
+/bin/bash -lc "rg -n \"Subject line|imperative|identifier|backtick|commit\" book/src/to-contribute/coding-guidelines -g '*.md'" in /tmp/tmp.ACCVc0ilor/wt1
+ succeeded in 0ms:
+book/src/to-contribute/coding-guidelines/README.md:65:| Rust | Wrap identifiers in backticks | [`backtick-identifiers`](rust-guidelines/language-items/comments-and-documentation.md#backtick-identifiers) |
+book/src/to-contribute/coding-guidelines/README.md:92:| Git | Write imperative, descriptive subject lines | [`imperative-subject`](git-guidelines.md#imperative-subject) |
+book/src/to-contribute/coding-guidelines/README.md:93:| Git | One logical change per commit | [`atomic-commits`](git-guidelines.md#atomic-commits) |
+book/src/to-contribute/coding-guidelines/how-guidelines-are-written.md:44:### Managing complexity is the primary technical imperative {#managing-complexity}
+book/src/to-contribute/coding-guidelines/git-guidelines.md:3:These guidelines cover commit hygiene and pull request conventions.
+book/src/to-contribute/coding-guidelines/git-guidelines.md:7:### Write imperative, descriptive subject lines (`imperative-subject`) {#imperative-subject}
+book/src/to-contribute/coding-guidelines/git-guidelines.md:9:Write commit messages in imperative mood
+book/src/to-contribute/coding-guidelines/git-guidelines.md:11:Wrap identifiers in backticks.
+book/src/to-contribute/coding-guidelines/git-guidelines.md:13:Common prefixes used in the Asterinas commit log:
+book/src/to-contribute/coding-guidelines/git-guidelines.md:35:If the commit requires further explanation,
+book/src/to-contribute/coding-guidelines/git-guidelines.md:44:### One logical change per commit (`atomic-commits`) {#atomic-commits}
+book/src/to-contribute/coding-guidelines/git-guidelines.md:46:Each commit should represent one logical change.
+book/src/to-contribute/coding-guidelines/git-guidelines.md:47:Do not mix unrelated changes in a single commit.
+book/src/to-contribute/coding-guidelines/git-guidelines.md:50:use `git rebase -i` to amend the commit
+book/src/to-contribute/coding-guidelines/git-guidelines.md:52:rather than appending a fixup commit at the end.
+book/src/to-contribute/coding-guidelines/git-guidelines.md:61:put the refactoring in its own commit(s)
+book/src/to-contribute/coding-guidelines/git-guidelines.md:62:before the feature commit.
+book/src/to-contribute/coding-guidelines/git-guidelines.md:63:This makes each commit easier to review and bisect.
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/macros-and-attributes.md:57:   that both the committer and the reviewer
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/macros-and-attributes.md:75:and makes it easier for subsequent committers
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md:56:### Wrap identifiers in backticks (`backtick-identifiers`) {#backtick-identifiers}
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md:59:and code identifiers in doc comments
+book/src/to-contribute/coding-guidelines/rust-guidelines/language-items/comments-and-documentation.md:60:should be wrapped in backticks for rustdoc rendering.
+book/src/to-contribute/coding-guidelines/general-guidelines/README.md:229:(unless the first word is a proper noun or identifier).
+
+web search: 
+web search: man7 getcwd ERANGE size argument length pathname
+web search: 
+web search: https://www.linuxman7.org/linux/man-pages/man3/getcwd.3.html
+codex
+The external syscall reference and in-repo regression both confirm the short-buffer issue. The documentation finding is also grounded: `getcwd` is listed as fully covered in both the README table and `fully_covered.scml`, so I’m keeping it unless consolidation makes the fix redundant.
+exec
+/bin/bash -lc "sed -n '1,38p' book/src/to-contribute/coding-guidelines/git-guidelines.md; sed -n '92,106p' book/src/kernel/linux-compatibility/README.md; sed -n '30,46p' book/src/kernel/linux-compatibility/syscall-flag-coverage/file-and-directory-operations/fully_covered.scml" in /tmp/tmp.ACCVc0ilor/wt1
+ succeeded in 0ms:
+# Git Guidelines
+
+These guidelines cover commit hygiene and pull request conventions.
+For the underlying philosophy, see
+[How Guidelines Are Written](how-guidelines-are-written.md).
+
+### Write imperative, descriptive subject lines (`imperative-subject`) {#imperative-subject}
+
+Write commit messages in imperative mood
+with the subject line at or below 72 characters.
+Wrap identifiers in backticks.
+
+Common prefixes used in the Asterinas commit log:
+
+- `Fix` — correct a bug
+- `Add` — introduce new functionality
+- `Remove` — delete code or features
+- `Refactor` — restructure without changing behavior
+- `Rename` — change names of files, modules, or symbols
+- `Implement` — add a new subsystem or feature
+- `Enable` — turn on a previously disabled capability
+- `Clean up` — minor tidying without functional change
+- `Bump` — update a dependency version
+
+Examples:
+
+```
+Fix deadlock in `Vmar::protect` when holding the page table lock
+
+Add initial support for the io_uring subsystem
+
+Refactor `TcpSocket` to separate connection state from I/O logic
+```
+
+If the commit requires further explanation,
+add a blank line after the subject
+followed by a body paragraph
+describing the _why_ behind the change.
+| 69      | msgsnd                 | ❌             | N/A |
+| 70      | msgrcv                 | ❌             | N/A |
+| 71      | msgctl                 | ❌             | N/A |
+| 72      | fcntl                  | ✅             | [⚠️](syscall-flag-coverage/file-descriptor-and-io-control/#fcntl) |
+| 73      | flock                  | ✅             | 💯 |
+| 74      | fsync                  | ✅             | 💯 |
+| 75      | fdatasync              | ✅             | 💯 |
+| 76      | truncate               | ✅             | 💯 |
+| 77      | ftruncate              | ✅             | 💯 |
+| 78      | getdents               | ✅             | 💯 |
+| 79      | getcwd                 | ✅             | 💯 |
+| 80      | chdir                  | ✅             | 💯 |
+| 81      | fchdir                 | ✅             | 💯 |
+| 82      | rename                 | ✅             | 💯 |
+| 83      | mkdir                  | ✅             | 💯 |
+preadv(fd, iov, iovcnt, offset);
+writev(fd, iov, iovcnt);
+pwritev(fd, iov, iovcnt, offset);
+
+// Truncate a file to a specified length
+truncate(path, length);
+ftruncate(fd, length);
+
+// Get current working directory
+getcwd(buf, size);
+
+// Change working directory
+chdir(path);
+fchdir(fd);
+
+// Change the name or location of a file
+rename(oldpath, newpath);
+
+codex
+I’m going to patch the generated review file now: remove the nested diff fences from the assembled snippets, consolidate the repeated `getcwd` fix across correctness/security/docs, and replace the summary placeholder with the verified summary.
+exec
+/bin/bash -lc "nl -ba /tmp/tmp.ACCVc0ilor/wt1.on.md | sed -n '1,140p'" in /tmp/tmp.ACCVc0ilor/wt1
+ succeeded in 0ms:
+     1	---
+     2	date: 2026-08-07
+     3	mode: diff
+     4	base: 171adc36a
+     5	head: 6678565c8
+     6	branch: HEAD
+     7	title: "Asterinas getcwd review"
+     8	---
+     9	
+    10	# Summary
+    11	
+    12	<!-- SUMMARY -->
+    13	
+    14	## Maintainability
+    15	
+    16	### `commit 6678565c8 message`
+    17	
+    18	> ```diff
+    19	> fs/getcwd: fill the user buffer up to its length
+    20	> ```
+    21	
+    22	`imperative-subject` (minor): The subject starts with the scope prefix `fs/getcwd:` instead of an imperative verb, and the `getcwd` identifier is not wrapped in backticks.
+    23	
+    24	**Fix.** Rewrite the subject as a verb-first line with the identifier formatted, for example: `Fill \`getcwd\` user buffer up to its length`.
+    25	
+    26	## Correctness
+    27	
+    28	### `kernel/src/syscall/getcwd.rs` line 30
+    29	
+    30	> ```diff
+    31	> ```diff
+    32	> -    if bytes.len() > len {
+    33	> -        return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+    34	> -    }
+    35	> -    ctx.user_space().write_bytes(buf, bytes)?;
+    36	> +    let write_len = len.min(bytes.len());
+    37	> +    ctx.user_space().write_bytes(buf, &bytes[..write_len])?;
+    38	>  
+    39	> -    Ok(SyscallReturn::Return(bytes.len() as _))
+    40	> +    Ok(SyscallReturn::Return(write_len as _))
+    41	> ```
+    42	> ```
+    43	
+    44	Incorrect getcwd semantics (major): `sys_getcwd` now returns success when `len` is smaller than the null-terminated path length, including `len == 0`. That can copy a truncated, non-terminated pathname to userspace and returns `write_len` instead of reporting `ERANGE`, breaking the existing `getcwd_small_buffer_returns_erange` regression test and the expected `getcwd` contract.
+    45	
+    46	**Fix.** Restore the `ERANGE` path when `bytes.len() > len`, and only call `write_bytes` once the full null-terminated pathname fits.
+    47	
+    48	## Security
+    49	
+    50	### `kernel/src/syscall/getcwd.rs` line 30
+    51	
+    52	> ```diff
+    53	> ```diff
+    54	> -    let write_len = len.min(bytes.len());
+    55	> -    ctx.user_space().write_bytes(buf, &bytes[..write_len])?;
+    56	> +    if bytes.len() > len {
+    57	> +        return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+    58	> +    }
+    59	> +    ctx.user_space().write_bytes(buf, bytes)?;
+    60	> ```
+    61	> ```
+    62	
+    63	`validate-at-boundaries` (major): `len` is user-supplied syscall input, but `sys_getcwd()` now silently clamps the copy with `len.min(bytes.len())` and returns success when the caller's buffer is too small. That hides the required `ERANGE` boundary validation failure and can return a truncated, non-NUL-terminated pathname as if it were valid.
+    64	
+    65	**Fix.** Restore the boundary check before writing to userspace: return `Errno::ERANGE` when `bytes.len() > len`, and only call `write_bytes()` after the full C string is known to fit.
+    66	
+    67	## Documentation
+    68	
+    69	### `kernel/src/syscall/getcwd.rs` line 30
+    70	
+    71	> ```diff
+    72	> ```diff
+    73	> -    if bytes.len() > len {
+    74	> -        return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+    75	> -    }
+    76	> -    ctx.user_space().write_bytes(buf, bytes)?;
+    77	> +    let write_len = len.min(bytes.len());
+    78	> +    ctx.user_space().write_bytes(buf, &bytes[..write_len])?;
+    79	>  
+    80	> -    Ok(SyscallReturn::Return(bytes.len() as _))
+    81	> +    Ok(SyscallReturn::Return(write_len as _))
+    82	> ```
+    83	> ```
+    84	
+    85	`linux-compat-docs` (major): This changes the user-visible `getcwd` short-buffer behavior from returning `ERANGE` to copying a truncated pathname and returning `write_len`, but the Linux compatibility docs still list `getcwd` as fully covered. The syscall coverage artifact is now stale for `getcwd(buf, size)` behavior.
+    86	
+    87	**Fix.** Update `book/src/kernel/linux-compatibility/README.md` and the matching `.scml` coverage entry to reflect the new `getcwd` behavior, or move `getcwd` out of full coverage if this partial-copy behavior is intentional.
+
+apply patch
+patch: completed
+/tmp/tmp.ACCVc0ilor/wt1.on.md
+diff --git a//tmp/tmp.ACCVc0ilor/wt1.on.md b//tmp/tmp.ACCVc0ilor/wt1.on.md
+index e3e80222ea47e546b5c11dc1dfd3198563739b25..b859b5a80739dec896adefd6f0d218dfde6e0bac
+--- a//tmp/tmp.ACCVc0ilor/wt1.on.md
++++ b//tmp/tmp.ACCVc0ilor/wt1.on.md
+@@ -9,7 +9,7 @@
+ 
+ # Summary
+ 
+-<!-- SUMMARY -->
++The change is small and easy to audit, but it changes a user-visible syscall contract: `getcwd` now succeeds with a truncated, non-NUL-terminated pathname when the caller's buffer is too small. The highest-priority fix is to restore the `ERANGE` check before copying to userspace; that also keeps the existing Linux compatibility documentation accurate. The remaining issue is commit hygiene: the subject should use an imperative, verb-first form and backtick the syscall identifier.
+ 
+ ## Maintainability
+ 
+@@ -28,7 +28,6 @@
+ ### `kernel/src/syscall/getcwd.rs` line 30
+ 
+ > ```diff
+-> ```diff
+ > -    if bytes.len() > len {
+ > -        return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+ > -    }
+@@ -38,18 +37,16 @@
+ >  
+ > -    Ok(SyscallReturn::Return(bytes.len() as _))
+ > +    Ok(SyscallReturn::Return(write_len as _))
+-> ```
+ > ```
+ 
+ Incorrect getcwd semantics (major): `sys_getcwd` now returns success when `len` is smaller than the null-terminated path length, including `len == 0`. That can copy a truncated, non-terminated pathname to userspace and returns `write_len` instead of reporting `ERANGE`, breaking the existing `getcwd_small_buffer_returns_erange` regression test and the expected `getcwd` contract.
+ 
+-**Fix.** Restore the `ERANGE` path when `bytes.len() > len`, and only call `write_bytes` once the full null-terminated pathname fits.
++**Fix.** Restore the `ERANGE` path when `bytes.len() > len`, and only call `write_bytes` once the full null-terminated pathname fits. This is the shared code fix for the related security and documentation comments below.
+ 
+ ## Security
+ 
+ ### `kernel/src/syscall/getcwd.rs` line 30
+ 
+-> ```diff
+ > ```diff
+ > -    let write_len = len.min(bytes.len());
+ > -    ctx.user_space().write_bytes(buf, &bytes[..write_len])?;
+@@ -58,17 +55,15 @@
+ > +    }
+ > +    ctx.user_space().write_bytes(buf, bytes)?;
+ > ```
+-> ```
+ 
+ `validate-at-boundaries` (major): `len` is user-supplied syscall input, but `sys_getcwd()` now silently clamps the copy with `len.min(bytes.len())` and returns success when the caller's buffer is too small. That hides the required `ERANGE` boundary validation failure and can return a truncated, non-NUL-terminated pathname as if it were valid.
+ 
+-**Fix.** Restore the boundary check before writing to userspace: return `Errno::ERANGE` when `bytes.len() > len`, and only call `write_bytes()` after the full C string is known to fit.
++**Fix.** Shared with the correctness comment: restore the boundary check before writing to userspace, return `Errno::ERANGE` when `bytes.len() > len`, and only call `write_bytes()` after the full C string is known to fit.
+ 
+ ## Documentation
+ 
+ ### `kernel/src/syscall/getcwd.rs` line 30
+ 
+-> ```diff
+ > ```diff
+ > -    if bytes.len() > len {
+ > -        return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+@@ -80,8 +75,7 @@
+ > -    Ok(SyscallReturn::Return(bytes.len() as _))
+ > +    Ok(SyscallReturn::Return(write_len as _))
+ > ```
+-> ```
+ 
+ `linux-compat-docs` (major): This changes the user-visible `getcwd` short-buffer behavior from returning `ERANGE` to copying a truncated pathname and returning `write_len`, but the Linux compatibility docs still list `getcwd` as fully covered. The syscall coverage artifact is now stale for `getcwd(buf, size)` behavior.
+ 
+-**Fix.** Update `book/src/kernel/linux-compatibility/README.md` and the matching `.scml` coverage entry to reflect the new `getcwd` behavior, or move `getcwd` out of full coverage if this partial-copy behavior is intentional.
++**Fix.** Shared with the correctness comment: restore Linux-compatible short-buffer behavior so `book/src/kernel/linux-compatibility/README.md` and the matching `.scml` coverage entry remain accurate. If the partial-copy behavior is intentional, update those coverage artifacts instead.
+
+diff --git a//tmp/tmp.ACCVc0ilor/wt1.on.md b//tmp/tmp.ACCVc0ilor/wt1.on.md
+index e3e80222ea47e546b5c11dc1dfd3198563739b25..b859b5a80739dec896adefd6f0d218dfde6e0bac
+--- a//tmp/tmp.ACCVc0ilor/wt1.on.md
++++ b//tmp/tmp.ACCVc0ilor/wt1.on.md
+@@ -9,7 +9,7 @@
+ 
+ # Summary
+ 
+-<!-- SUMMARY -->
++The change is small and easy to audit, but it changes a user-visible syscall contract: `getcwd` now succeeds with a truncated, non-NUL-terminated pathname when the caller's buffer is too small. The highest-priority fix is to restore the `ERANGE` check before copying to userspace; that also keeps the existing Linux compatibility documentation accurate. The remaining issue is commit hygiene: the subject should use an imperative, verb-first form and backtick the syscall identifier.
+ 
+ ## Maintainability
+ 
+@@ -28,7 +28,6 @@
+ ### `kernel/src/syscall/getcwd.rs` line 30
+ 
+ > ```diff
+-> ```diff
+ > -    if bytes.len() > len {
+ > -        return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+ > -    }
+@@ -38,18 +37,16 @@
+ >  
+ > -    Ok(SyscallReturn::Return(bytes.len() as _))
+ > +    Ok(SyscallReturn::Return(write_len as _))
+-> ```
+ > ```
+ 
+ Incorrect getcwd semantics (major): `sys_getcwd` now returns success when `len` is smaller than the null-terminated path length, including `len == 0`. That can copy a truncated, non-terminated pathname to userspace and returns `write_len` instead of reporting `ERANGE`, breaking the existing `getcwd_small_buffer_returns_erange` regression test and the expected `getcwd` contract.
+ 
+-**Fix.** Restore the `ERANGE` path when `bytes.len() > len`, and only call `write_bytes` once the full null-terminated pathname fits.
++**Fix.** Restore the `ERANGE` path when `bytes.len() > len`, and only call `write_bytes` once the full null-terminated pathname fits. This is the shared code fix for the related security and documentation comments below.
+ 
+ ## Security
+ 
+ ### `kernel/src/syscall/getcwd.rs` line 30
+ 
+-> ```diff
+ > ```diff
+ > -    let write_len = len.min(bytes.len());
+ > -    ctx.user_space().write_bytes(buf, &bytes[..write_len])?;
+@@ -58,17 +55,15 @@
+ > +    }
+ > +    ctx.user_space().write_bytes(buf, bytes)?;
+ > ```
+-> ```
+ 
+ `validate-at-boundaries` (major): `len` is user-supplied syscall input, but `sys_getcwd()` now silently clamps the copy with `len.min(bytes.len())` and returns success when the caller's buffer is too small. That hides the required `ERANGE` boundary validation failure and can return a truncated, non-NUL-terminated pathname as if it were valid.
+ 
+-**Fix.** Restore the boundary check before writing to userspace: return `Errno::ERANGE` when `bytes.len() > len`, and only call `write_bytes()` after the full C string is known to fit.
++**Fix.** Shared with the correctness comment: restore the boundary check before writing to userspace, return `Errno::ERANGE` when `bytes.len() > len`, and only call `write_bytes()` after the full C string is known to fit.
+ 
+ ## Documentation
+ 
+ ### `kernel/src/syscall/getcwd.rs` line 30
+ 
+-> ```diff
+ > ```diff
+ > -    if bytes.len() > len {
+ > -        return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+@@ -80,8 +75,7 @@
+ > -    Ok(SyscallReturn::Return(bytes.len() as _))
+ > +    Ok(SyscallReturn::Return(write_len as _))
+ > ```
+-> ```
+ 
+ `linux-compat-docs` (major): This changes the user-visible `getcwd` short-buffer behavior from returning `ERANGE` to copying a truncated pathname and returning `write_len`, but the Linux compatibility docs still list `getcwd` as fully covered. The syscall coverage artifact is now stale for `getcwd(buf, size)` behavior.
+ 
+-**Fix.** Update `book/src/kernel/linux-compatibility/README.md` and the matching `.scml` coverage entry to reflect the new `getcwd` behavior, or move `getcwd` out of full coverage if this partial-copy behavior is intentional.
++**Fix.** Shared with the correctness comment: restore Linux-compatible short-buffer behavior so `book/src/kernel/linux-compatibility/README.md` and the matching `.scml` coverage entry remain accurate. If the partial-copy behavior is intentional, update those coverage artifacts instead.
+
+codex
+The review file has been patched for verification and consolidation. I’m doing a final formatting pass now, checking that the generated Markdown has the expected sections and no leftover placeholders or nested code fences.
+exec
+/bin/bash -lc 'git status --short' in /tmp/tmp.ACCVc0ilor/wt1
+exec
+/bin/bash -lc 'rg -n "SUMMARY|Retracted|> ```diff|> ```" /tmp/tmp.ACCVc0ilor/wt1.on.md' in /tmp/tmp.ACCVc0ilor/wt1
+exec
+/bin/bash -lc "sed -n '1,180p' /tmp/tmp.ACCVc0ilor/wt1.on.md" in /tmp/tmp.ACCVc0ilor/wt1
+ succeeded in 103ms:
+18:> ```diff
+19:> fs/getcwd: fill the user buffer up to its length
+20:> ```
+30:> ```diff
+31:> -    if bytes.len() > len {
+32:> -        return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+33:> -    }
+34:> -    ctx.user_space().write_bytes(buf, bytes)?;
+35:> +    let write_len = len.min(bytes.len());
+36:> +    ctx.user_space().write_bytes(buf, &bytes[..write_len])?;
+37:>  
+38:> -    Ok(SyscallReturn::Return(bytes.len() as _))
+39:> +    Ok(SyscallReturn::Return(write_len as _))
+40:> ```
+44:**Fix.** Restore the `ERANGE` path when `bytes.len() > len`, and only call `write_bytes` once the full null-terminated pathname fits. This is the shared code fix for the related security and documentation comments below.
+50:> ```diff
+51:> -    let write_len = len.min(bytes.len());
+52:> -    ctx.user_space().write_bytes(buf, &bytes[..write_len])?;
+53:> +    if bytes.len() > len {
+54:> +        return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+55:> +    }
+56:> +    ctx.user_space().write_bytes(buf, bytes)?;
+57:> ```
+61:**Fix.** Shared with the correctness comment: restore the boundary check before writing to userspace, return `Errno::ERANGE` when `bytes.len() > len`, and only call `write_bytes()` after the full C string is known to fit.
+67:> ```diff
+68:> -    if bytes.len() > len {
+69:> -        return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+70:> -    }
+71:> -    ctx.user_space().write_bytes(buf, bytes)?;
+72:> +    let write_len = len.min(bytes.len());
+73:> +    ctx.user_space().write_bytes(buf, &bytes[..write_len])?;
+74:>  
+75:> -    Ok(SyscallReturn::Return(bytes.len() as _))
+76:> +    Ok(SyscallReturn::Return(write_len as _))
+77:> ```
+
+ succeeded in 102ms:
+diff --git a//tmp/tmp.ACCVc0ilor/wt1.on.md b//tmp/tmp.ACCVc0ilor/wt1.on.md
+index e3e80222ea47e546b5c11dc1dfd3198563739b25..b859b5a80739dec896adefd6f0d218dfde6e0bac
+--- a//tmp/tmp.ACCVc0ilor/wt1.on.md
++++ b//tmp/tmp.ACCVc0ilor/wt1.on.md
+@@ -9,7 +9,7 @@
+ 
+ # Summary
+ 
+-<!-- SUMMARY -->
++The change is small and easy to audit, but it changes a user-visible syscall contract: `getcwd` now succeeds with a truncated, non-NUL-terminated pathname when the caller's buffer is too small. The highest-priority fix is to restore the `ERANGE` check before copying to userspace; that also keeps the existing Linux compatibility documentation accurate. The remaining issue is commit hygiene: the subject should use an imperative, verb-first form and backtick the syscall identifier.
+ 
+ ## Maintainability
+ 
+@@ -28,7 +28,6 @@
+ ### `kernel/src/syscall/getcwd.rs` line 30
+ 
+ > ```diff
+-> ```diff
+ > -    if bytes.len() > len {
+ > -        return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+ > -    }
+@@ -38,18 +37,16 @@
+ >  
+ > -    Ok(SyscallReturn::Return(bytes.len() as _))
+ > +    Ok(SyscallReturn::Return(write_len as _))
+-> ```
+ > ```
+ 
+ Incorrect getcwd semantics (major): `sys_getcwd` now returns success when `len` is smaller than the null-terminated path length, including `len == 0`. That can copy a truncated, non-terminated pathname to userspace and returns `write_len` instead of reporting `ERANGE`, breaking the existing `getcwd_small_buffer_returns_erange` regression test and the expected `getcwd` contract.
+ 
+-**Fix.** Restore the `ERANGE` path when `bytes.len() > len`, and only call `write_bytes` once the full null-terminated pathname fits.
++**Fix.** Restore the `ERANGE` path when `bytes.len() > len`, and only call `write_bytes` once the full null-terminated pathname fits. This is the shared code fix for the related security and documentation comments below.
+ 
+ ## Security
+ 
+ ### `kernel/src/syscall/getcwd.rs` line 30
+ 
+-> ```diff
+ > ```diff
+ > -    let write_len = len.min(bytes.len());
+ > -    ctx.user_space().write_bytes(buf, &bytes[..write_len])?;
+@@ -58,17 +55,15 @@
+ > +    }
+ > +    ctx.user_space().write_bytes(buf, bytes)?;
+ > ```
+-> ```
+ 
+ `validate-at-boundaries` (major): `len` is user-supplied syscall input, but `sys_getcwd()` now silently clamps the copy with `len.min(bytes.len())` and returns success when the caller's buffer is too small. That hides the required `ERANGE` boundary validation failure and can return a truncated, non-NUL-terminated pathname as if it were valid.
+ 
+-**Fix.** Restore the boundary check before writing to userspace: return `Errno::ERANGE` when `bytes.len() > len`, and only call `write_bytes()` after the full C string is known to fit.
++**Fix.** Shared with the correctness comment: restore the boundary check before writing to userspace, return `Errno::ERANGE` when `bytes.len() > len`, and only call `write_bytes()` after the full C string is known to fit.
+ 
+ ## Documentation
+ 
+ ### `kernel/src/syscall/getcwd.rs` line 30
+ 
+-> ```diff
+ > ```diff
+ > -    if bytes.len() > len {
+ > -        return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+@@ -80,8 +75,7 @@
+ > -    Ok(SyscallReturn::Return(bytes.len() as _))
+ > +    Ok(SyscallReturn::Return(write_len as _))
+ > ```
+-> ```
+ 
+ `linux-compat-docs` (major): This changes the user-visible `getcwd` short-buffer behavior from returning `ERANGE` to copying a truncated pathname and returning `write_len`, but the Linux compatibility docs still list `getcwd` as fully covered. The syscall coverage artifact is now stale for `getcwd(buf, size)` behavior.
+ 
+-**Fix.** Update `book/src/kernel/linux-compatibility/README.md` and the matching `.scml` coverage entry to reflect the new `getcwd` behavior, or move `getcwd` out of full coverage if this partial-copy behavior is intentional.
++**Fix.** Shared with the correctness comment: restore Linux-compatible short-buffer behavior so `book/src/kernel/linux-compatibility/README.md` and the matching `.scml` coverage entry remain accurate. If the partial-copy behavior is intentional, update those coverage artifacts instead.
+
+ succeeded in 142ms:
+ D .claude/settings.json
+?? .agents/
+?? .claude/skills/
+
+codex
+Completed the diff review and wrote the Markdown file:
+
+[/tmp/tmp.ACCVc0ilor/wt1.on.md](/tmp/tmp.ACCVc0ilor/wt1.on.md)
+
+It contains 4 verified findings across maintainability, correctness, security, and documentation. The main issue is the new `getcwd` truncation behavior; I verified it against the existing regression test and the Linux `getcwd` contract: https://www.linuxman7.org/linux/man-pages/man3/getcwd.3.html
+
+No tests were run; this was a review-only task.
+diff --git a//tmp/tmp.ACCVc0ilor/wt1.on.md b//tmp/tmp.ACCVc0ilor/wt1.on.md
+index e3e80222ea47e546b5c11dc1dfd3198563739b25..b859b5a80739dec896adefd6f0d218dfde6e0bac
+--- a//tmp/tmp.ACCVc0ilor/wt1.on.md
++++ b//tmp/tmp.ACCVc0ilor/wt1.on.md
+@@ -9,7 +9,7 @@
+ 
+ # Summary
+ 
+-<!-- SUMMARY -->
++The change is small and easy to audit, but it changes a user-visible syscall contract: `getcwd` now succeeds with a truncated, non-NUL-terminated pathname when the caller's buffer is too small. The highest-priority fix is to restore the `ERANGE` check before copying to userspace; that also keeps the existing Linux compatibility documentation accurate. The remaining issue is commit hygiene: the subject should use an imperative, verb-first form and backtick the syscall identifier.
+ 
+ ## Maintainability
+ 
+@@ -28,7 +28,6 @@
+ ### `kernel/src/syscall/getcwd.rs` line 30
+ 
+ > ```diff
+-> ```diff
+ > -    if bytes.len() > len {
+ > -        return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+ > -    }
+@@ -38,18 +37,16 @@
+ >  
+ > -    Ok(SyscallReturn::Return(bytes.len() as _))
+ > +    Ok(SyscallReturn::Return(write_len as _))
+-> ```
+ > ```
+ 
+ Incorrect getcwd semantics (major): `sys_getcwd` now returns success when `len` is smaller than the null-terminated path length, including `len == 0`. That can copy a truncated, non-terminated pathname to userspace and returns `write_len` instead of reporting `ERANGE`, breaking the existing `getcwd_small_buffer_returns_erange` regression test and the expected `getcwd` contract.
+ 
+-**Fix.** Restore the `ERANGE` path when `bytes.len() > len`, and only call `write_bytes` once the full null-terminated pathname fits.
++**Fix.** Restore the `ERANGE` path when `bytes.len() > len`, and only call `write_bytes` once the full null-terminated pathname fits. This is the shared code fix for the related security and documentation comments below.
+ 
+ ## Security
+ 
+ ### `kernel/src/syscall/getcwd.rs` line 30
+ 
+-> ```diff
+ > ```diff
+ > -    let write_len = len.min(bytes.len());
+ > -    ctx.user_space().write_bytes(buf, &bytes[..write_len])?;
+@@ -58,17 +55,15 @@
+ > +    }
+ > +    ctx.user_space().write_bytes(buf, bytes)?;
+ > ```
+-> ```
+ 
+ `validate-at-boundaries` (major): `len` is user-supplied syscall input, but `sys_getcwd()` now silently clamps the copy with `len.min(bytes.len())` and returns success when the caller's buffer is too small. That hides the required `ERANGE` boundary validation failure and can return a truncated, non-NUL-terminated pathname as if it were valid.
+ 
+-**Fix.** Restore the boundary check before writing to userspace: return `Errno::ERANGE` when `bytes.len() > len`, and only call `write_bytes()` after the full C string is known to fit.
++**Fix.** Shared with the correctness comment: restore the boundary check before writing to userspace, return `Errno::ERANGE` when `bytes.len() > len`, and only call `write_bytes()` after the full C string is known to fit.
+ 
+ ## Documentation
+ 
+ ### `kernel/src/syscall/getcwd.rs` line 30
+ 
+-> ```diff
+ > ```diff
+ > -    if bytes.len() > len {
+ > -        return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+@@ -80,8 +75,7 @@
+ > -    Ok(SyscallReturn::Return(bytes.len() as _))
+ > +    Ok(SyscallReturn::Return(write_len as _))
+ > ```
+-> ```
+ 
+ `linux-compat-docs` (major): This changes the user-visible `getcwd` short-buffer behavior from returning `ERANGE` to copying a truncated pathname and returning `write_len`, but the Linux compatibility docs still list `getcwd` as fully covered. The syscall coverage artifact is now stale for `getcwd(buf, size)` behavior.
+ 
+-**Fix.** Update `book/src/kernel/linux-compatibility/README.md` and the matching `.scml` coverage entry to reflect the new `getcwd` behavior, or move `getcwd` out of full coverage if this partial-copy behavior is intentional.
++**Fix.** Shared with the correctness comment: restore Linux-compatible short-buffer behavior so `book/src/kernel/linux-compatibility/README.md` and the matching `.scml` coverage entry remain accurate. If the partial-copy behavior is intentional, update those coverage artifacts instead.
+
+tokens used
+62,571
+Completed the diff review and wrote the Markdown file:
+
+[/tmp/tmp.ACCVc0ilor/wt1.on.md](/tmp/tmp.ACCVc0ilor/wt1.on.md)
+
+It contains 4 verified findings across maintainability, correctness, security, and documentation. The main issue is the new `getcwd` truncation behavior; I verified it against the existing regression test and the Linux `getcwd` contract: https://www.linuxman7.org/linux/man-pages/man3/getcwd.3.html
+
+No tests were run; this was a review-only task.
+WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp" (codex_home: AbsolutePathBuf("/tmp/tmp.BBa7f7Wjea"))
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /root/asterinas/.agents/skills/aster-code-review/benchmark
+model: gpt-5.5
+provider: OpenAI
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR] (network access enabled)
+reasoning effort: high
+reasoning summaries: none
+session id: 019fda8a-579f-73c0-bc03-3750801d847b
+--------
+user
+You are grading a code review for recall.
+Each expected defect gives a defect description for context and a MATCH IF criterion for grading.
+For each expected defect, decide whether ANY produced review comment semantically satisfies its MATCH IF criterion at the stated code location.
+Wording, grounding label, persona, and severity may differ; judge the underlying defect.
+Respond with ONLY two space-separated integers: caught total. The total must equal the number of expected defects below.
+
+===== EXPECTED DEFECTS =====
+# Expected defects
+
+1. location: kernel/src/syscall/getcwd.rs (persona: security, grounding: validate-at-boundaries, severity: major)
+   defect: The code clamps the user buffer with `let write_len = len.min(bytes.len())` and writes a truncated path, returning the truncated length, instead of returning `ERANGE` when the user buffer is too small (the Linux `getcwd` contract).
+   MATCH IF: A reviewer should flag that silently clamping a user-supplied length hides the "buffer too small" error the syscall must report. A matching comment may come from the Security persona or the Development persona (incorrect error semantics).
+
+===== PRODUCED REVIEW =====
+---
+date: 2026-08-07
+mode: diff
+base: 171adc36a
+head: 6678565c8
+branch: HEAD
+title: "Asterinas getcwd review"
+---
+
+# Summary
+
+The change is small and easy to audit, but it changes a user-visible syscall contract: `getcwd` now succeeds with a truncated, non-NUL-terminated pathname when the caller's buffer is too small. The highest-priority fix is to restore the `ERANGE` check before copying to userspace; that also keeps the existing Linux compatibility documentation accurate. The remaining issue is commit hygiene: the subject should use an imperative, verb-first form and backtick the syscall identifier.
+
+## Maintainability
+
+### `commit 6678565c8 message`
+
+> ```diff
+> fs/getcwd: fill the user buffer up to its length
+> ```
+
+`imperative-subject` (minor): The subject starts with the scope prefix `fs/getcwd:` instead of an imperative verb, and the `getcwd` identifier is not wrapped in backticks.
+
+**Fix.** Rewrite the subject as a verb-first line with the identifier formatted, for example: `Fill \`getcwd\` user buffer up to its length`.
+
+## Correctness
+
+### `kernel/src/syscall/getcwd.rs` line 30
+
+> ```diff
+> -    if bytes.len() > len {
+> -        return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+> -    }
+> -    ctx.user_space().write_bytes(buf, bytes)?;
+> +    let write_len = len.min(bytes.len());
+> +    ctx.user_space().write_bytes(buf, {prompt}bytes[..write_len])?;
+>  
+> -    Ok(SyscallReturn::Return(bytes.len() as _))
+> +    Ok(SyscallReturn::Return(write_len as _))
+> ```
+
+Incorrect getcwd semantics (major): `sys_getcwd` now returns success when `len` is smaller than the null-terminated path length, including `len == 0`. That can copy a truncated, non-terminated pathname to userspace and returns `write_len` instead of reporting `ERANGE`, breaking the existing `getcwd_small_buffer_returns_erange` regression test and the expected `getcwd` contract.
+
+**Fix.** Restore the `ERANGE` path when `bytes.len() > len`, and only call `write_bytes` once the full null-terminated pathname fits. This is the shared code fix for the related security and documentation comments below.
+
+## Security
+
+### `kernel/src/syscall/getcwd.rs` line 30
+
+> ```diff
+> -    let write_len = len.min(bytes.len());
+> -    ctx.user_space().write_bytes(buf, {prompt}bytes[..write_len])?;
+> +    if bytes.len() > len {
+> +        return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+> +    }
+> +    ctx.user_space().write_bytes(buf, bytes)?;
+> ```
+
+`validate-at-boundaries` (major): `len` is user-supplied syscall input, but `sys_getcwd()` now silently clamps the copy with `len.min(bytes.len())` and returns success when the caller's buffer is too small. That hides the required `ERANGE` boundary validation failure and can return a truncated, non-NUL-terminated pathname as if it were valid.
+
+**Fix.** Shared with the correctness comment: restore the boundary check before writing to userspace, return `Errno::ERANGE` when `bytes.len() > len`, and only call `write_bytes()` after the full C string is known to fit.
+
+## Documentation
+
+### `kernel/src/syscall/getcwd.rs` line 30
+
+> ```diff
+> -    if bytes.len() > len {
+> -        return_errno_with_message!(Errno::ERANGE, "the CWD buffer is too small");
+> -    }
+> -    ctx.user_space().write_bytes(buf, bytes)?;
+> +    let write_len = len.min(bytes.len());
+> +    ctx.user_space().write_bytes(buf, {prompt}bytes[..write_len])?;
+>  
+> -    Ok(SyscallReturn::Return(bytes.len() as _))
+> +    Ok(SyscallReturn::Return(write_len as _))
+> ```
+
+`linux-compat-docs` (major): This changes the user-visible `getcwd` short-buffer behavior from returning `ERANGE` to copying a truncated pathname and returning `write_len`, but the Linux compatibility docs still list `getcwd` as fully covered. The syscall coverage artifact is now stale for `getcwd(buf, size)` behavior.
+
+**Fix.** Shared with the correctness comment: restore Linux-compatible short-buffer behavior so `book/src/kernel/linux-compatibility/README.md` and the matching `.scml` coverage entry remain accurate. If the partial-copy behavior is intentional, update those coverage artifacts instead.
+warning: Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.
+codex
+1 1
+tokens used
+1,745
+0007-getcwd-erange                 recall 1/1 [fan-out]
+----
+reviews kept for inspection in: /tmp/tmp.ynOGKCBLmx  (per problem: review.md + expected-defects.txt)
+recall: 1/1 (100%, gate >=100%) across 1 problems; per-persona-context: 0 combined, 1 fan-out; precision: 0/0 clean; harness errors: 0
