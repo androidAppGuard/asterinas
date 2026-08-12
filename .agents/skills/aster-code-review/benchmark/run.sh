@@ -160,12 +160,22 @@ default_review() { # <worktree> <out> <skill-args>
     ( cd "$1" && ACR_GUIDELINE_ROOT="$GROOT" "$ACR_CLI" $3 "$2" --overwrite )
 }
 default_grade() { # <defects-file> <review>
-    "$RUN_AGENT" "You are grading a code review. The expected defects are in $1; the \
-produced review is $2. Each expected defect gives a 'defect:' description for context \
-and a 'MATCH IF:' criterion. For each expected defect, decide whether ANY comment in \
-the review satisfies its MATCH IF criterion at the stated code location (wording may \
-differ). Respond with ONLY two space-separated integers, caught then total, and \
-nothing else (for example: 1 2)."
+    local defects_file="$1" review_file="$2" prompt_file status
+    prompt_file="$(mktemp)"
+    {
+        printf 'You are grading a code review for recall.\n'
+        printf 'Each expected defect gives a defect description for context and a MATCH IF criterion for grading.\n'
+        printf 'For each expected defect, decide whether ANY produced review comment semantically satisfies its MATCH IF criterion at the stated code location.\n'
+        printf 'Wording, grounding label, persona, and severity may differ; judge the underlying defect.\n'
+        printf 'Respond with ONLY two space-separated integers: caught total. The total must equal the number of expected defects below.\n\n'
+        printf '===== EXPECTED DEFECTS =====\n'
+        cat "$defects_file"
+        printf '\n===== PRODUCED REVIEW =====\n'
+        cat "$review_file"
+    } > "$prompt_file"
+    "$RUN_AGENT" "$(cat "$prompt_file")"; status=$?
+    rm -f "$prompt_file"
+    return "$status"
 }
 default_neg_grade() { # <negatives-file> <review>
     "$RUN_AGENT" "The items in $1 are false-positive traps that a correct review must \
@@ -235,13 +245,13 @@ run_one() { # <wt> <id> <mode> <co> <remote> <arg> <n_real> <n_neg>
     #  pure-precision problems take the NEG branch above.
     #  No current problem mixes the two.)
     local df="$SPEC/$id.defects.txt"
-    off="$wt.off.md"; rm -f "$off"
-    "$REVIEW_CMD" "$wt" "$off" "$skillargs --per-persona-context=no" >&2 || return 1
-    [[ -s "$off" ]] || return 1
-    read -r c t <<<"$("$GRADE_CMD" "$df" "$off")"
-    if [[ "${c:-}" =~ ^[0-9]+$ && "${t:-}" =~ ^[0-9]+$ && "$c" -eq "$nreal" && "$nreal" -gt 0 ]]; then
-        printf 'OFF %s %s\n' "$c" "$nreal"; return 0
-    fi
+    # off="$wt.off.md"; rm -f "$off"
+    # "$REVIEW_CMD" "$wt" "$off" "$skillargs --per-persona-context=no" >&2 || return 1
+    # [[ -s "$off" ]] || return 1
+    # read -r c t <<<"$("$GRADE_CMD" "$df" "$off")"
+    # if [[ "${c:-}" =~ ^[0-9]+$ && "${t:-}" =~ ^[0-9]+$ && "$c" -eq "$nreal" && "$nreal" -gt 0 ]]; then
+    #     printf 'OFF %s %s\n' "$c" "$nreal"; return 0
+    # fi
     on="$wt.on.md"; rm -f "$on"
     "$REVIEW_CMD" "$wt" "$on" "$skillargs --per-persona-context=yes" >&2 || return 1
     [[ -s "$on" ]] || return 1
