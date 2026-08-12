@@ -665,7 +665,9 @@
         public when all uses are contained in the same source file.
 
 
-- problem_id: 0408-pr-2290-defect-targets
+
+
+- problem_id: 0400-pr-2290-defect-targets
   commit: c6a6e66aaca9635e36d99e47ed87edd6d4b69f87
   source: >
     PR-derived from https://github.com/asterinas/asterinas/pull/2290. Files mode
@@ -757,7 +759,7 @@
         waker cleanup on the early-return path.
 
 
-- problem_id: 0409-getrandom-boundary-semantics
+- problem_id: 0401-getrandom-boundary-semantics
   commit: b606e3456c43924f4b465900b51e2349a554c0df
   source: >
     PR-derived from https://github.com/asterinas/asterinas/pull/2482. The PR
@@ -847,7 +849,7 @@
         for direct userspace-writer based copying that reports actual progress.
 
 
-- problem_id: 0410-clone-reaper-defects
+- problem_id: 0402-clone-reaper-defects
   commit: 702aa7d9eeffec033aff33769c2fd5cc75984262
   source: >
     PR-derived from https://github.com/asterinas/asterinas/pull/2477. The PR
@@ -983,7 +985,7 @@
         addresses to be handled without a kernel panic.
 
 
-- problem_id: 0411-pr-podman-small-issues
+- problem_id: 0403-pr-podman-small-issues
   commit: 3b0666449f8f4dc68e339cb7ee0646b45bf21fb1
   source: >
     PR-derived from https://github.com/asterinas/asterinas/pull/2390. The PR
@@ -1071,8 +1073,7 @@
         resolution and require `sys_openat` to return `ENOENT` explicitly before
         resolution.
 
-
-- problem_id: 0412-read-cstring-init-stack-defects
+- problem_id: 0404-read-cstring-init-stack-defects
   commit: 329c12aaa8cecae8e3de54fc93af07060fade406
   source: >
     PR 2430 introduced the new ReadCString APIs and changed init-stack string
@@ -1127,7 +1128,7 @@
         reaching the reader end or max length without nul must be an error, not
         accepted by appending a nul byte.
 
-- problem_id: 0413-named-pipe-open-nonblock-status-flags
+- problem_id: 0405-named-pipe-open-nonblock-status-flags
   commit: 7e7ba43cdfc572cd2ddeecc86a5951bbd200d692
   source: >
     PR 2434 fixes three named-pipe defects present before the PR: FIFO open
@@ -1214,5 +1215,57 @@
         interfere with each other and cannot support simultaneous blocking and
         nonblocking opens.
 
-
-
+- problem_id: 0406-runqueue-irq-reparent-wakeup
+  commit: 56d78ab64965194ad03cb6cde07fd5d98b17129d
+  source: >
+    PR 2488 fixes two LTP hang causes listed in the PR body: run queues can be
+    locked without disabling local IRQs, and reparented dead children do not
+    wake the reaper/init process.
+  review_mode:
+    files:
+      - kernel/src/sched/sched_class/mod.rs:396-402
+      - ostd/src/task/scheduler/mod.rs:100-108
+      - kernel/src/process/exit.rs:99-126
+  defects:
+    - target:
+        kind: file
+        path: kernel/src/sched/sched_class/mod.rs
+        lines: "396-402"
+      persona: development
+      grounding: run queues must be locked with local IRQ disabled
+      severity: critical
+      desc: >
+        ClassScheduler::nr_queued_and_running locks each run queue with
+        rq.lock() while local IRQs remain enabled. The same run queues can be
+        touched from the timer IRQ callback registered by enable_preemption_on_cpu.
+        If an IRQ fires while the current context holds a run-queue lock, the
+        callback can try to lock the same run queue again and deadlock.
+      fix: >
+        Make the run-queue spinlock require LocalIrqDisabled, or otherwise
+        disable local IRQs before every run-queue lock acquisition so task and
+        interrupt contexts cannot re-enter the lock on the same CPU.
+      expectation: >
+        A valid review must identify that run-queue locks are used from IRQ
+        callbacks and therefore must always be acquired with local IRQ disabled;
+        merely locking the SpinLock is insufficient.
+    - target:
+        kind: file
+        path: kernel/src/process/exit.rs
+        lines: "99-126"
+      persona: development
+      grounding: wake reaper after moving dead children
+      severity: major
+      desc: >
+        move_children_to_reaper_process moves children from an exiting process
+        to a reaper or init process, but it does not wake the new parent's
+        children_wait_queue. If some moved children are already dead, init can
+        sleep in wait because no child-death notification is delivered after the
+        reparenting, so tests such as kill08 can hang waiting for reaping.
+      fix: >
+        After move_process_children succeeds, call
+        reaper_process.children_wait_queue().wake_all(); do the same for the
+        fallback init_process path.
+      expectation: >
+        A valid review must say that moving children to init/reaper must wake
+        that process's child wait queue, otherwise already-dead reparented
+        children may never be reaped.
