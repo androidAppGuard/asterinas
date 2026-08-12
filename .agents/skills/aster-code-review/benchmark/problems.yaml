@@ -757,10 +757,8 @@
         waker cleanup on the early-return path.
 
 
-
 - problem_id: 0409-getrandom-boundary-semantics
   commit: b606e3456c43924f4b465900b51e2349a554c0df
-  remote: https://github.com/asterinas/asterinas
   source: >
     PR-derived from https://github.com/asterinas/asterinas/pull/2482. The PR
     description explicitly identifies three `getrandom` defects in the base
@@ -849,10 +847,8 @@
         for direct userspace-writer based copying that reports actual progress.
 
 
-
 - problem_id: 0410-clone-reaper-defects
   commit: 702aa7d9eeffec033aff33769c2fd5cc75984262
-  remote: https://github.com/asterinas/asterinas
   source: >
     PR-derived from https://github.com/asterinas/asterinas/pull/2477. The PR
     description explicitly identifies five defects: a clone-flag check in the
@@ -989,7 +985,6 @@
 
 - problem_id: 0411-pr-podman-small-issues
   commit: 3b0666449f8f4dc68e339cb7ee0646b45bf21fb1
-  remote: https://github.com/asterinas/asterinas
   source: >
     PR-derived from https://github.com/asterinas/asterinas/pull/2390. The PR
     description explicitly identifies three Podman-related issues, and each is
@@ -1076,6 +1071,148 @@
         resolution and require `sys_openat` to return `ENOENT` explicitly before
         resolution.
 
+
+- problem_id: 0412-read-cstring-init-stack-defects
+  commit: 329c12aaa8cecae8e3de54fc93af07060fade406
+  source: >
+    PR 2430 introduced the new ReadCString APIs and changed init-stack string
+    parsing in commit 329c12aaa8cecae8e3de54fc93af07060fade406. Two GitHub
+    review comments identify independent defects in that same change. Comment
+    points out that using Vec::with_capacity(max_len) can allocate too much
+    memory before reading short strings; follow-up comment confirms the threshold
+    approach, and final PR head ea60866 caps the initial capacity with INIT_ALLOC_SIZE.
+    Comment questions accepting argv without a nul terminator; The reply states that
+    reporting an error is better than returning a wrong value, and final PR head
+    changes argv/envp to read_cstring_until_nul(...).ok_or_else(...).
+  review_mode:
+    diff:
+      base: 46aa437c8738e72a47510e764cb2b6eed8032706
+  defects:
+    - target:
+        kind: file
+        path: kernel/src/util/read_cstring.rs
+      persona: development
+      grounding: avoid unnecessary large heap allocation from caller-provided limits
+      severity: minor
+      desc: >
+        The new ReadCString implementation uses Vec::with_capacity(max_len)
+        before reading any byte. max_len is a caller-provided upper bound, not
+        the expected string length, so common short strings with a large bound
+        can trigger avoidable large heap allocations or allocation failures.
+      fix: >
+        Use a small initial capacity capped by max_len, and let Vec grow only if
+        the actual string requires it. The final PR uses INIT_ALLOC_SIZE.min(max_len).
+      expectation: >
+        A valid review must point out that preallocating max_len is too large
+        for a C-string reader because max_len is only a limit; it should suggest
+        using min(self.remain(), max_len), a threshold, or another capped initial
+        capacity to avoid unnecessary allocation.
+    - target:
+        kind: file
+        path: kernel/src/process/process_vm/init_stack/mod.rs
+      persona: development
+      grounding: reject malformed init-stack strings instead of silently appending nul
+      severity: major
+      desc: >
+        InitStackReader::argv and envp use read_cstring_until_end and then take
+        .0, which accepts a reader that reaches the page or max length without a
+        nul byte by constructing a CString with an appended nul. For argv/envp
+        on the initial stack, missing nul termination means the stack content is
+        corrupted; silently accepting it can return a wrong string.
+      fix: >
+        Use read_cstring_until_nul(MAX_LEN_STRING_ARG)? and convert None to
+        Errno::EINVAL with the existing argv/envp corruption error.
+      expectation: >
+        A valid review must say that argv/envp should require a nul terminator;
+        reaching the reader end or max length without nul must be an error, not
+        accepted by appending a nul byte.
+
+- problem_id: 0413-named-pipe-open-nonblock-status-flags
+  commit: 7e7ba43cdfc572cd2ddeecc86a5951bbd200d692
+  source: >
+    PR 2434 fixes three named-pipe defects present before the PR: FIFO open
+    does not wait for the peer endpoint, read/write cannot honor each fd's
+    O_NONBLOCK flag, and named-pipe status flags are not per-fd. The PR body
+    states these three issues directly, and final head
+    66194a964af102206886424bd1840af5c2c197a6 refactors NamedPipe into
+    per-open handles to fix them.
+  review_mode:
+    files:
+      - kernel/src/fs/named_pipe.rs
+      - kernel/src/fs/ramfs/fs.rs
+      - kernel/src/fs/path/mod.rs
+      - kernel/src/fs/pipe.rs
+      - kernel/src/fs/pipe.rs
+      - kernel/src/fs/inode_handle/mod.rs
+      - kernel/src/fs/inode_handle/mod.rs
+  defects:
+    - target:
+        kind: file
+        path: kernel/src/fs/named_pipe.rs
+        lines: "14-45"
+      persona: development
+      grounding: FIFO open must block until the peer endpoint is present
+      severity: major
+      desc: >
+        NamedPipe stores one PipeReader and one PipeWriter from creation time
+        and exposes itself as O_RDWR. Opening the FIFO through Path::open only
+        builds a normal InodeHandle; there is no per-open reader/writer handle
+        and no wait in open. Therefore blocking open(O_RDONLY) can return even
+        when no writer has opened the FIFO, and blocking open(O_WRONLY) can
+        return even when no reader has opened it.
+      fix: >
+        Add a NamedPipe::open(access_mode, status_flags) path that creates a
+        per-open handle and waits for the opposite endpoint for blocking
+        O_RDONLY/O_WRONLY opens, while allowing O_RDWR to succeed immediately.
+      expectation: >
+        A valid review must say that FIFO open semantics are wrong because open
+        returns before both read and write ends are present in blocking mode; it
+        should request blocking in open based on access mode and peer presence.
+    - target:
+        kind: file
+        path: kernel/src/fs/ramfs/fs.rs
+        lines: "552-600"
+      persona: development
+      grounding: named-pipe read/write ignore the fd's O_NONBLOCK flag
+      severity: major
+      desc: >
+        RamFS dispatches NamedPipe read/write directly to the shared
+        NamedPipe object. NamedPipe::read and NamedPipe::write take no
+        StatusFlags, and InodeHandle::read/write do not pass their per-fd
+        status_flags into FileLike/FileIo. As a result, read/write behavior is
+        determined by the shared pipe endpoints, not by the file descriptor that
+        issued the operation, so O_NONBLOCK on a FIFO fd is not reliably honored.
+      fix: >
+        Route named-pipe I/O through a FileIo handle whose read/write methods
+        receive the current InodeHandle status_flags, and choose try_read/try_write
+        for O_NONBLOCK or wait_events for blocking descriptors.
+      expectation: >
+        A valid review must identify that named-pipe read/write need access to
+        the caller fd's status_flags; otherwise O_NONBLOCK cannot control whether
+        the operation returns EAGAIN or blocks.
+    - target:
+        kind: file
+        path: kernel/src/fs/pipe.rs
+        lines: "50-123,158-234"
+      persona: development
+      grounding: status_flags must be per file descriptor, not shared by the pipe object
+      severity: major
+      desc: >
+        PipeReader and PipeWriter each store status_flags inside the shared pipe
+        endpoint object. A FIFO inode has one shared NamedPipe with shared reader
+        and writer endpoints, while each open fd has its own InodeHandle
+        status_flags. If two descriptors open the same FIFO with different flags,
+        such as one blocking reader and one nonblocking reader, storing the flag
+        on the shared endpoint cannot represent both descriptors correctly.
+      fix: >
+        Keep status_flags on InodeHandle/per-open handles and pass them into
+        named-pipe read/write. Do not store FIFO nonblocking behavior as mutable
+        state in the shared PipeReader/PipeWriter object.
+      expectation: >
+        A valid review must state that status_flags for a named pipe must be
+        per-fd; a shared NamedPipe/PipeReader/PipeWriter flag makes descriptors
+        interfere with each other and cannot support simultaneous blocking and
+        nonblocking opens.
 
 
 
