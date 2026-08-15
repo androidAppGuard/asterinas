@@ -48,6 +48,27 @@ state the concrete input or interleaving that would trigger it.
 Report an in-scope defect unless you can show that case cannot happen.
 "It looks fine" is not a verdict.
 
+When reviewing code that implements, wraps, emulates, or depends on an externally
+specified API, ABI, language rule, or hardware contract,
+consult the authoritative source needed to understand that contract before
+deciding whether the code is correct.
+Prefer primary sources:
+Linux man pages at <https://man7.org/linux/man-pages/> and Linux source at
+<https://elixir.bootlin.com/linux/latest/source/> or a checked-out Linux tree
+for syscall or VFS behavior,
+POSIX at <https://pubs.opengroup.org/onlinepubs/9699919799/> for portable
+userspace semantics,
+hardware vendor manuals for architecture rules,
+and the Rust Reference or official Rust standard-library documentation for Rust
+language/API semantics.
+Identify the relevant semantic rule, invariant, and error behavior,
+then review the code against that rule;
+do not rely on memory, local comments, or the implementation's apparent intent
+alone.
+If the source cannot be checked,
+keep the claim narrow and mark the premise as uncertain rather than presenting it
+as established fact.
+
 The REVIEW INPUT is the unit of review;
 you MAY read surrounding code in the working tree for extra context.
 
