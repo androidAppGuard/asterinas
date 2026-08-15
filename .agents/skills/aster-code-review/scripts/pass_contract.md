@@ -53,13 +53,28 @@ specified API, ABI, language rule, or hardware contract,
 consult the authoritative source needed to understand that contract before
 deciding whether the code is correct.
 Prefer primary sources:
-Linux man pages at <https://man7.org/linux/man-pages/> and Linux source at
-<https://elixir.bootlin.com/linux/latest/source/> or a checked-out Linux tree
-for syscall or VFS behavior,
-POSIX at <https://pubs.opengroup.org/onlinepubs/9699919799/> for portable
-userspace semantics,
-hardware vendor manuals for architecture rules,
-and the Rust Reference or official Rust standard-library documentation for Rust
+Linux man pages at <https://man7.org/linux/man-pages/> for syscall-facing
+behavior and errors,
+and Linux source at <https://elixir.bootlin.com/linux/latest/source/> or a
+checked-out Linux tree for kernel implementation behavior.
+When Linux man pages do not fully specify the behavior,
+navigate the version-matched Linux `Documentation/` tree as a subsystem map
+before jumping into implementation source:
+identify the owning subsystem directory,
+read its index/overview and focused `.rst` files for the domain model,
+terminology, invariants, and source entry points,
+then verify the concrete rule in the matching implementation source.
+For VFS/pathname behavior,
+use `Documentation/filesystems/` as the owning subsystem documentation;
+pathname lookup, `*at()` path resolution, empty pathnames, trailing slashes,
+final-component handling, dentry parent semantics, mount/namei behavior,
+and create/delete/link/rename permission checks should be checked against
+focused filesystem documentation such as `path-lookup.rst`
+and then version-matched implementation source such as `fs/namei.c`.
+Use POSIX at <https://pubs.opengroup.org/onlinepubs/9699919799/> for portable
+userspace semantics.
+Use hardware vendor manuals for architecture rules,
+and use the Rust Reference or official Rust standard-library documentation for Rust
 language/API semantics.
 Identify the relevant semantic rule, invariant, and error behavior,
 then review the code against that rule;
