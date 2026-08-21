@@ -52,27 +52,49 @@ When reviewing code that implements, wraps, emulates, or depends on an externall
 specified API, ABI, language rule, or hardware contract,
 consult the authoritative source needed to understand that contract before
 deciding whether the code is correct.
-Prefer primary sources:
-Linux man pages at <https://man7.org/linux/man-pages/> for syscall-facing
-behavior and errors,
-and Linux source at <https://elixir.bootlin.com/linux/latest/source/> or a
-checked-out Linux tree for kernel implementation behavior.
+For Linux/POSIX/kernel-facing contracts,
+use the configured MCP servers as the primary lookup path instead of manually
+navigating web pages from memory:
+
+- `man_pages` for syscall-facing userspace behavior, libc/POSIX-adjacent APIs,
+  sections, and documented errno behavior
+  (`search_man_pages`, `get_man_page`, `list_man_sections`).
+- `linux_kernel` for current Linux kernel documentation, upstream release
+  information, upstream source snippets, and optional local Linux-tree searches
+  (`latest_kernel_releases`, `search_kernel_docs`, `fetch_kernel_doc`,
+  `search_online_kernel_code`, `fetch_upstream_kernel_file`,
+  `search_local_kernel_code`, `read_local_kernel_file`,
+  `search_local_kernel_api`, `inspect_kernel_capabilities`,
+  `find_driver_examples`).
+- `elixir_bootlin` for Bootlin Elixir source browsing, version/project listing,
+  raw source reads, identifier lookup, and autocomplete
+  (`list_projects`, `list_versions`, `get_raw_source`, `ident_lookup`,
+  `autocomplete`).
+
+Pick the MCP that matches the question first:
+use `man_pages` for syscall/user-visible semantics,
+`linux_kernel` for kernel documentation and upstream source,
+and `elixir_bootlin` when Bootlin-style versioned source or identifier lookup is
+the clearest way to confirm the implementation detail.
 When Linux man pages do not fully specify the behavior,
 navigate the version-matched Linux `Documentation/` tree as a subsystem map
-before jumping into implementation source:
+through `linux_kernel` before jumping into implementation source:
 identify the owning subsystem directory,
 read its index/overview and focused `.rst` files for the domain model,
 terminology, invariants, and source entry points,
-then verify the concrete rule in the matching implementation source.
+then verify the concrete rule in matching source through `linux_kernel` or
+`elixir_bootlin`.
 For VFS/pathname behavior,
 use `Documentation/filesystems/` as the owning subsystem documentation;
 pathname lookup, `*at()` path resolution, empty pathnames, trailing slashes,
 final-component handling, dentry parent semantics, mount/namei behavior,
 and create/delete/link/rename permission checks should be checked against
-focused filesystem documentation such as `path-lookup.rst`
-and then version-matched implementation source such as `fs/namei.c`.
-Use POSIX at <https://pubs.opengroup.org/onlinepubs/9699919799/> for portable
-userspace semantics.
+focused filesystem documentation such as `path-lookup.rst` via `linux_kernel`
+and then version-matched implementation source such as `fs/namei.c` via
+`linux_kernel` or `elixir_bootlin`.
+For portable userspace semantics,
+start with the installed `man_pages` material and mark any POSIX premise
+uncertain if the needed rule is not present there.
 Use hardware vendor manuals for architecture rules,
 and use the Rust Reference or official Rust standard-library documentation for Rust
 language/API semantics.
