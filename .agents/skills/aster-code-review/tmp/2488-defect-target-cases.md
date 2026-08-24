@@ -1,4 +1,4 @@
-- problem_id: 0413-kill-fixes-defects
+- problem_id: 0407-kill-fixes-defects
   commit: 50eaffc7314d5ef2f4a16cb0e2437cc0010c01ee
   remote: https://github.com/asterinas/asterinas
   source: >
@@ -32,9 +32,7 @@
         with IRQs enabled and the local interrupt callback tries to take it
         again, the CPU can deadlock.
       fix: >
-        Make the run queue lock require the `LocalIrqDisabled` marker, as fixing
-        commit `2cee744ed9dfdd70d1097d5747e2c72cc2df63b6` does with
-        `SpinLock<PerCpuClassRqSet, LocalIrqDisabled>`. Then existing callers
+        Make the run queue lock require the `LocalIrqDisabled` marker, and existing callers
         must hold an IRQ-disable guard before locking, and call sites that
         already disabled IRQs can use `lock()` directly.
       expectation: >
@@ -52,7 +50,7 @@
       severity: major
       desc: >
         `move_children_to_reaper_process` moves all children from an exiting
-        process to either a subreaper or init, but it returns without waking the
+        process to a subreaper, but it returns without waking the
         new parent's `children_wait_queue`. A process already blocked in
         `wait*()` sleeps on that queue until a child status change wakes it; if
         dead children were just reparented to it, the waiter may never re-check
@@ -60,8 +58,7 @@
         stuck forever.
       fix: >
         After a successful `move_process_children`, wake the chosen reaper's
-        `children_wait_queue`; also wake init after the fallback reparenting, as
-        fixing commit `62513ec49c832909ff39f01d590edbe2483a0d48` does.
+        `children_wait_queue`; also wake init after the fallback reparenting.
       expectation: >
         A reviewer should flag that reparenting creates newly waitable children
         for the reaper/init process and must wake that process's child wait

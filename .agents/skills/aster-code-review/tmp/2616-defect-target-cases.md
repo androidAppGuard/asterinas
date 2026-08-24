@@ -1,4 +1,4 @@
-- problem_id: 0416-evdev-fixes-defects
+- problem_id: 0410-evdev-fixes-defects
   commit: 70eda539dfade526c28d44e6cb60c056c56cc06c
   remote: https://github.com/asterinas/asterinas
   source: >
@@ -32,7 +32,7 @@
         files are stream-like input files and should reject seeking with
         `ESPIPE`.
       fix: >
-        Return `ESPIPE` from `check_seekable` for evdev files, as the PR does,
+        Return `ESPIPE` from `check_seekable` for evdev files
         while keeping `is_offset_aware()` false.
       expectation: >
         A reviewer should flag that evdev must not advertise seek support and
@@ -53,8 +53,8 @@
         stale and possibly reporting input that can never be read.
       fix: >
         Update packet/count state immediately after a successful pop, before
-        the fallible user write. The PR removes the redundant event counter and
-        decrements the packet count before `write_val`.
+        the fallible user write. Remove the redundant event counter and
+        decrement the packet count before `write_val`.
       expectation: >
         A reviewer should notice that ring-buffer consumption and availability
         counters must be updated atomically with respect to the pop, not after
@@ -96,8 +96,7 @@
       fix: >
         Detect the almost-full condition before the normal event push, clear or
         make room for stale events while holding the producer side, and queue
-        `SYN_DROPPED` before continuing with new input, as the PR's
-        `free_len() <= 1` path does.
+        `SYN_DROPPED` before continuing with new input.
       expectation: >
         A reviewer should flag that a recovery path entered only after the
         buffer is already full cannot reliably enqueue `SYN_DROPPED`.

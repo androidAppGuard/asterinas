@@ -1,4 +1,4 @@
-- problem_id: 0414-procfs-bug-fix-defects
+- problem_id: 0408-procfs-bug-fix-defects
   commit: ff021e0b89811c92069950a5a96ef41f9860de0b
   remote: https://github.com/asterinas/asterinas
   source: >
@@ -38,10 +38,10 @@
         process table. Concurrent process exit and `/proc` directory population
         can deadlock.
       fix: >
-        Use a single lock order for root procfs process entries. The PR fixes
-        this by taking the process table before `cached_children` when dynamic
-        PID entries are populated or looked up, and by keeping static entries
-        separate from the process-table critical section.
+        Use a single lock order for root procfs process entries. Taking the process
+        table before `cached_children` when dynamic PID entries are populated or
+        looked up, and by keeping static entries separate from the process-table
+        critical section.
       expectation: >
         A reviewer should identify both lock acquisition paths and require the
         process table and procfs cached-entry locks to be acquired in one
@@ -64,8 +64,7 @@
       fix: >
         Remove the file-table observer mechanism for procfs fd entries. Rebuild
         or validate `/proc/.../fd` cached children by reading the current file
-        table from procfs lookup/readdir paths, as fixing commit
-        `a1a6660a9c863ded0ab0a5e98eaaaf8020b047fb` does.
+        table from procfs lookup/readdir paths.
       expectation: >
         A reviewer should flag that fd close notifications can enter procfs cache
         mutation while the file table spin lock is held, and require procfs not
@@ -88,8 +87,7 @@
       fix: >
         Represent process-level procfs entries without a pinned thread, and
         resolve `process_ref.main_thread()` when the file is read or the fd
-        directory is populated. The PR does this by making `TidDirOps.thread_ref`
-        optional and using `TidDirOps::thread()`.
+        directory is populated.
       expectation: >
         A reviewer should identify that process-level procfs state caches the
         main thread too early and require it to resolve the current main thread
@@ -133,8 +131,7 @@
       fix: >
         Register the task directory as an observer of the process task set and
         remove the cached child named by the exiting TID when a `TidEvent::Exit`
-        arrives, as fixing commit `ecf61b7223528e99ecfadfe5689412ba67623ca6`
-        does.
+        arrives.
       expectation: >
         A reviewer should identify that cached task directories need an invalidation
         path on thread exit and require `/proc/[pid]/task/[tid]` entries to be

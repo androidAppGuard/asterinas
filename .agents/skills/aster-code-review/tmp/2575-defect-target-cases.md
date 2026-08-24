@@ -1,4 +1,4 @@
-- problem_id: 0415-sched-syscall-error-defects
+- problem_id: 0409-sched-syscall-error-defects
   commit: cef527f372afeb78b5648048f7aaa631207e59bc
   remote: https://github.com/asterinas/asterinas
   source: >
@@ -40,8 +40,7 @@
         failures to `EINVAL`.
       expectation: >
         A reviewer should flag the blanket `map_err(|_| EINVAL)` around a
-        user-copy helper and require syscall-visible errors such as `EFAULT`
-        and `E2BIG` to be preserved.
+        user-copy helper and require syscall-visible errors to be preserved.
 
     - target:
         kind: file
