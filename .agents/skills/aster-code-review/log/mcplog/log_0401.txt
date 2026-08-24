@@ -1,0 +1,1282 @@
+OK: 20 problems (11 diff, 9 files), 45 defects (0 negative), problem_ids unique (numeric ids too)
+WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp" (codex_home: AbsolutePathBuf("/tmp/tmp.6mvZi31sCg"))
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /tmp/tmp.bO2yqMmb5b/wt1
+model: gpt-5.5
+provider: OpenAI
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR] (network access enabled)
+reasoning effort: high
+reasoning summaries: none
+session id: 01a0317d-54e7-7cd0-bab7-83a10a82e48b
+--------
+user
+Use the aster-code-review skill with these arguments: files kernel/src/syscall/getrandom.rs --per-persona-context=yes /tmp/tmp.bO2yqMmb5b/wt1.on.md --overwrite. Review this working tree.
+warning: Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.
+codex
+I’m reading the review instructions and then I’ll inspect the working tree diff around `kernel/src/syscall/getrandom.rs`.
+exec
+/bin/bash -lc "sed -n '1,240p' /tmp/tmp.bO2yqMmb5b/wt1/.agents/skills/aster-code-review/SKILL.md" in /tmp/tmp.bO2yqMmb5b/wt1
+ succeeded in 0ms:
+---
+name: aster-code-review
+description: Review code against Asterinas's persona-keyed coding guidelines and write a Markdown review file. Use when asked to review a Git change (diff mode) or a set of target files (files mode) for defects, or inside a write-test-review loop.
+---
+
+# aster-code-review
+
+Review code against Asterinas's coding guidelines
+— the persona-keyed pages under `book/src/to-contribute/coding-guidelines/`
+— and write one Markdown review file.
+The review is **recall-first**: miss as few real defects as possible.
+It makes both objective calls (undeniable bugs) and subjective calls (guideline violations, each grounded in a cited rule).
+
+There are two review modes, both **anchored at the current checkout (HEAD)**:
+
+- **`diff <base>`** — a Git change:
+  the **commit series** the branch adds over its merge-base with `<base>`
+  — each commit's message *and* its diff,
+  so the review covers per-commit intent and commit hygiene, not just the net change.
+  (Commit first; uncommitted edits are not reviewed in diff mode.)
+- **`files <path[:lines] ...>`**
+  — target code: the working-tree contents of the named files,
+  optionally narrowed to line ranges.
+
+To review at a specific commit, check it out first (it becomes HEAD).
+
+This skill is agent-agnostic (Claude Code and Codex).
+Only step 3's spawn primitive differs between agents;
+everything else is identical.
+
+## Interface
+
+However the skill is triggered,
+it receives ONE raw argument string that begins with a mode word:
+
+```
+diff   <base>              <output> [--overwrite] [--per-persona-context=auto|yes|no]
+files  <path[:lines] ...>  <output> [--overwrite] [--per-persona-context=auto|yes|no]
+```
+
+- `<base>` (diff) — **required**,
+  any ref or SHA;
+  reviews the commit series `merge-base(<base>, HEAD)..HEAD` (each commit's message + diff).
+- `<path[:lines] ...>` (files) — **required**, one or more targets in the working tree.
+  A target is a path, optionally `path:N-M` or `path:N-M,K-L` (1-based, inclusive);
+  repeat a path to add ranges.
+  Wrap a path in double quotes to allow spaces or colons (`"a: b.rs":10-20`).
+- `<output>` — **required, last positional** (`cp src... dest` style);
+  refuse to overwrite unless `--overwrite`.
+- `--overwrite` — replace the output file if it already exists.
+- `--per-persona-context` — `yes`: fan out one isolated agent per persona (best recall).
+  `no`: one combined agent reviews all personas (cheaper, lower recall).
+  `auto` (default) currently resolves to `yes`;
+  it will become a benchmark-driven heuristic.
+  Controls step 3 only.
+
+**Do not pre-split the argument string yourself.**
+Pass it verbatim, as a single quoted argument,
+to `resolve_target.sh` (step 1)
+— the script self-tokenizes (whitespace-split except inside double quotes),
+which keeps the parse deterministic and identical across agents.
+
+## Pipeline
+
+Run these steps in order.
+Steps 1 and 5 are deterministic scripts;
+steps 6–8 use the model.
+
+The helper scripts live in the skill's own `scripts/` directory,
+at `.agents/skills/aster-code-review/scripts/` inside the repository under review.
+**Invoke every script by its absolute path**
+— the working directory is the code under review (the repo root), *not* the skill directory,
+so a bare `scripts/…` is not found (notably on Codex, which runs commands from the repo root; do not `cd` into the skill dir either — `resolve_target.sh` needs the repo as its cwd).
+Shells do not persist between commands,
+so **set `SKILL` at the start of each command that uses it** (or inline the `$(git rev-parse …)`):
+
+```sh
+SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/resolve_target.sh" '<raw args>'
+```
+
+The steps below write `$SKILL/scripts/…` as shorthand for that absolute path.
+
+1. **Resolve the target.**
+   `"$SKILL/scripts/resolve_target.sh" '<raw args>'` prints the canonical review input
+   — the commit series (each commit's message + diff) in `diff` mode,
+   annotated file excerpts in `files` mode;
+   save it to a temp file.
+   Run it again with `--meta` first (`"$SKILL/scripts/resolve_target.sh" --meta '<raw args>'`) to get
+   `mode=`, `base=`/`files=`, `head=`, `branch=`, `output=`, `overwrite=`, `per_persona_context=`;
+   add `date=` (today) and an optional `title=` to make the meta file.
+   Pass the raw argument string as a single quoted argument
+   so the script's tokenizer sees it intact.
+2. **Activate personas.**
+   Pick which of the five personas run,
+   from the reviewed paths — changed paths in `diff` mode,
+   named paths in `files` mode (see *Activation*).
+3. **Fan out.**
+   Spawn the persona passes (see *Spawning*).
+   With `per_persona_context` = `yes` or `auto` (the default),
+   run **one isolated PASS per activated persona** — best recall.
+   With `no`, run **one combined PASS** over all activated personas in a single context
+   — cheaper, lower recall.
+   Build each pass's prompt deterministically with `"$SKILL/scripts/build_pass_prompt.sh" <input-file> <persona>...`
+   — one persona for fan-out, all activated personas for combined
+   — and spawn the sub-agent with **that exact text**.
+   Each pass returns a JSON array of comments;
+   file each under its persona's `<fragdir>/<persona>.json` (the comment's `persona` field says which),
+   so step 5 is unchanged.
+4. **Collect** the per-persona JSON fragments.
+5. **Assemble.**
+   `"$SKILL/scripts/assemble_review.sh" [--overwrite] <meta> <fragdir> <output>` performs the deterministic merge (group by persona in fixed order, sort by file→line, drop exact duplicates *within a persona*, write frontmatter, leave a `<!-- SUMMARY -->` placeholder).
+   Pass `--overwrite` only if the user gave it;
+   otherwise the script refuses to clobber an existing `<output>`.
+6. **Verify** (see *Verification*).
+7. **Consolidate** (see *Consolidation*).
+8. **Summary.**
+   Replace `<!-- SUMMARY -->` with a constructive summary over the final comments:
+   what the code does well, the top issues ranked by severity,
+   any structural recommendations.
+
+## Activation
+
+A persona runs unless the reviewed paths *provably* contain nothing in its remit (reviewed paths = changed paths in `diff` mode, named paths in `files` mode):
+
+- **maintainability, development, security** — any reviewed code.
+- **hardware** — a reviewed path is assembly (`*.S`, `*.asm`),
+  an architecture directory (`.../arch/...`), or contains `asm!` / `global_asm!`.
+- **documentation** — a reviewed path is `book/`, any `*.md`,
+  syscall-coverage files (`*.scml`), or a user-facing API surface (a syscall or kernel parameter).
+
+Activation is path-based and deterministic;
+do not use a model to triage (a wrongly-skipped persona is a silent recall hole).
+
+## Pass contract
+
+The shared reviewer contract
+— the review methodology and the JSON comment schema every pass must follow
+— lives in [`scripts/pass_contract.md`](scripts/pass_contract.md),
+inlined as the **stable head** of every pass prompt by `build_pass_prompt.sh` (step 3).
+Do not paraphrase it into the prompt yourself:
+retyping it breaks the byte-identical prefix the prompt cache relies on (see [`execution_model.md`](spec/execution_model.md)).
+A pass reads only the persona block(s) it is given (selective exposure),
+reviews the **REVIEW INPUT** at the foot of the prompt,
+and returns a JSON array of comments per that schema.
+
+## Spawning a pass
+
+Build every pass prompt with `"$SKILL/scripts/build_pass_prompt.sh" <input-file> <persona>...`
+and spawn the sub-agent with its **exact** output
+— only a script keeps the prompt's stable head (contract + guideline) byte-identical across passes and reviews,
+which is what lets the prompt cache reuse it (see [`execution_model.md`](spec/execution_model.md)).
+
+**Default (`per_persona_context` = `yes`/`auto`)**
+— one pass per activated persona,
+each in a CLEAN context with only its own persona block (selective exposure):
+
+- **Claude Code** — spawn a Task sub-agent per persona.
+- **Codex** — run `codex exec "<build_pass_prompt.sh output>"` per persona
+  (pass the built PROMPT TEXT as the argument).
+
+**Never spawn a pass by re-running `aster_code_review.sh` / `run_agent.sh`,
+nor by re-issuing the skill's own arguments** (e.g. `codex exec … diff <base> <out>`).
+A pass is a *reviewer* invocation whose input is the `build_pass_prompt.sh` text
+— not another run of this skill.
+Re-entering the launcher spawns another orchestrator that spawns another … , an infinite fork bomb;
+the launcher now refuses it (`ACR_AGENT_RUNNING`).
+
+Passes are independent;
+order does not matter.
+Collect each pass's JSON.
+
+**Combined (`per_persona_context` = `no`)**
+— build ONE prompt with all activated personas (`"$SKILL/scripts/build_pass_prompt.sh" <input> <p1> <p2> ...`)
+and run a single pass;
+it reviews through every lens at once and tags each comment with its `persona`.
+The input and spawn overhead are paid once,
+so it is cheaper
+— but a larger shared context dilutes focus,
+so it finds fewer defects.
+The default stays fan-out:
+recall comes first,
+and `no` is an explicit, opt-in concession.
+
+## Verification (step 6)
+
+For each comment, isolate the key premise it rests on
+— especially an external-system fact (Linux/POSIX behaviour, the System V ABI, Rust semantics).
+Try to **refute** it:
+re-read the cited code and consult an authoritative source.
+Assign a verdict:
+
+- **confirmed** — keep the comment unchanged.
+- **uncertain** — keep it, but prefix `problem` with `(unverified) `.
+- **refuted** — remove the comment,
+  and append it to a `## Retracted by verification` list at the foot of the file with a one-line reason.
+
+Remove **only** on confident refutation;
+an unsure check is `uncertain`, not `refuted`.
+This is the only step that may remove a comment, and only false positives.
+
+## Consolidation (step 7)
+
+Find clusters of comments that share one root cause or one fix
+(e.g. several manual lock/unlock pairs that all want RAII).
+For each cluster, write a single unified fix
+and repoint each member's `**Fix.**` at it ("Shared with the other `raii` comments: …").
+**Never remove a comment**
+— every symptom stays at its own location.
+
+## Output format
+
+The assembled file is:
+frontmatter (`date`, `mode`, `base` or `files`, `head`, `branch`, optional `title`),
+a `# Summary`,
+then a `## <section>` per persona in the order **Maintainability, Correctness, Security, Hardware, Documentation** (Correctness is the Development persona's section).
+Each comment is a `### \`file\` line N` subsection:
+a quoted ` ```diff ` snippet,
+then a prose line `` `<grounding>` (<severity>): <problem> ``,
+then a `**Fix.**` paragraph.
+Do not restructure what the script emits;
+only fill the summary and apply the verify/consolidate edits.
+
+codex
+I’ve got the review workflow. Next I’m resolving the target and checking the file context so I can review the current working tree, not an old commit.
+exec
+/bin/bash -lc 'SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/resolve_target.sh" --meta '"'files kernel/src/syscall/getrandom.rs /tmp/tmp.bO2yqMmb5b/wt1.on.md --overwrite --per-persona-context=yes'" in /tmp/tmp.bO2yqMmb5b/wt1
+ succeeded in 0ms:
+mode=files
+files=kernel/src/syscall/getrandom.rs
+head=b606e3456
+branch=HEAD
+output=/tmp/tmp.bO2yqMmb5b/wt1.on.md
+overwrite=1
+per_persona_context=yes
+
+exec
+/bin/bash -lc 'SKILL="$(git rev-parse --show-toplevel)/.agents/skills/aster-code-review"; "$SKILL/scripts/resolve_target.sh" '"'files kernel/src/syscall/getrandom.rs /tmp/tmp.bO2yqMmb5b/wt1.on.md --overwrite --per-persona-context=yes'" in /tmp/tmp.bO2yqMmb5b/wt1
+ succeeded in 0ms:
+===== kernel/src/syscall/getrandom.rs =====
+     1	// SPDX-License-Identifier: MPL-2.0
+     2	
+     3	use super::SyscallReturn;
+     4	use crate::{device, prelude::*};
+     5	
+     6	pub fn sys_getrandom(buf: Vaddr, count: usize, flags: u32, ctx: &Context) -> Result<SyscallReturn> {
+     7	    let flags = GetRandomFlags::from_bits_truncate(flags);
+     8	    debug!(
+     9	        "buf = 0x{:x}, count = 0x{:x}, flags = {:?}",
+    10	        buf, count, flags
+    11	    );
+    12	    // TODO: support nonblock flag.
+    13	    // Currently our getrandom implementation relies on x86-specific `rdrand` instruction, so it will never block.
+    14	    let mut buffer = vec![0u8; count];
+    15	    let read_len = if flags.contains(GetRandomFlags::GRND_RANDOM) {
+    16	        device::Random::getrandom(&mut buffer)?
+    17	    } else {
+    18	        device::Urandom::getrandom(&mut buffer)?
+    19	    };
+    20	    ctx.user_space()
+    21	        .write_bytes(buf, &mut VmReader::from(buffer.as_slice()))?;
+    22	    Ok(SyscallReturn::Return(read_len as isize))
+    23	}
+    24	
+    25	bitflags::bitflags! {
+    26	    #[derive(Pod)]
+    27	    #[repr(C)]
+    28	    pub struct GetRandomFlags: u32 {
+    29	        const GRND_NONBLOCK = 0x0001;
+    30	        const GRND_RANDOM = 0x0002;
+    31	        const GRND_INSECURE = 0x0004;
+    32	    }
+    33	}
+
+
+exec
+/bin/bash -lc 'rg -n "sys_getrandom|GetRandomFlags|GRND_" kernel/src -S' in /tmp/tmp.bO2yqMmb5b
+ exited 2 in 0ms:
+rg: kernel/src: IO error for operation on kernel/src: No such file or directory (os error 2)
+
+exec
+/bin/bash -lc 'pwd && ls -la && rg -n "sys_getrandom|GetRandomFlags|GRND_" -S .' in /tmp/tmp.bO2yqMmb5b/wt1
+ succeeded in 0ms:
+/tmp/tmp.bO2yqMmb5b/wt1
+total 224
+drwxr-xr-x 13 root root  4096 Aug 24 01:58 .
+drwx------  3 root root  4096 Aug 24 01:58 ..
+drwxr-xr-x  3 root root  4096 Aug 24 01:58 .agents
+drwxr-xr-x  3 root root  4096 Aug 24 01:58 .claude
+-rw-r--r--  1 root root    87 Aug 24 01:58 .code-workspace
+dr-xr-xr-x  2 root root    40 Aug 24 01:58 .codex
+-rw-r--r--  1 root root   128 Aug 24 01:58 .dockerignore
+-rw-r--r--  1 root root    45 Aug 24 01:58 .git
+drwxr-xr-x  5 root root  4096 Aug 24 01:58 .github
+-rw-r--r--  1 root root   603 Aug 24 01:58 .gitignore
+-rw-r--r--  1 root root  1643 Aug 24 01:58 .licenserc.yaml
+-rw-r--r--  1 root root   785 Aug 24 01:58 .typos.toml
+drwxr-xr-x  2 root root  4096 Aug 24 01:58 .vscode
+-rw-r--r--  1 root root  3471 Aug 24 01:58 CODEOWNERS
+-rw-r--r--  1 root root   488 Aug 24 01:58 COPYRIGHT
+-rw-r--r--  1 root root 49445 Aug 24 01:58 Cargo.lock
+-rw-r--r--  1 root root  2213 Aug 24 01:58 Cargo.toml
+-rw-r--r--  1 root root   564 Aug 24 01:58 Components.toml
+-rw-r--r--  1 root root    15 Aug 24 01:58 DOCKER_IMAGE_VERSION
+-rw-r--r--  1 root root 16725 Aug 24 01:58 LICENSE-MPL
+-rw-r--r--  1 root root 12071 Aug 24 01:58 Makefile
+-rw-r--r--  1 root root  2048 Aug 24 01:58 OSDK.toml
+-rw-r--r--  1 root root  4713 Aug 24 01:58 README.md
+-rw-r--r--  1 root root  4044 Aug 24 01:58 README_CN.md
+-rw-r--r--  1 root root  4847 Aug 24 01:58 README_JP.md
+-rw-r--r--  1 root root  6306 Aug 24 01:58 RELEASES.md
+-rw-r--r--  1 root root     6 Aug 24 01:58 VERSION
+drwxr-xr-x  3 root root  4096 Aug 24 01:58 book
+drwxr-xr-x  5 root root  4096 Aug 24 01:58 kernel
+drwxr-xr-x  7 root root  4096 Aug 24 01:58 osdk
+drwxr-xr-x  4 root root  4096 Aug 24 01:58 ostd
+-rw-r--r--  1 root root   234 Aug 24 01:58 rust-toolchain.toml
+-rw-r--r--  1 root root   126 Aug 24 01:58 rustfmt.toml
+drwxr-xr-x  4 root root  4096 Aug 24 01:58 test
+drwxr-xr-x  5 root root  4096 Aug 24 01:58 tools
+-rw-r--r--  1 root root  2155 Aug 24 01:58 triagebot.toml
+./book/src/kernel/linux-compatibility/limitations-on-system-calls/system-information-and-misc.md:115:        GRND_RANDOM
+./book/src/kernel/linux-compatibility/limitations-on-system-calls/system-information-and-misc.md:120:* `GRND_NONBLOCK` because the underlying operation never blocks
+./kernel/src/syscall/getrandom.rs:6:pub fn sys_getrandom(buf: Vaddr, count: usize, flags: u32, ctx: &Context) -> Result<SyscallReturn> {
+./kernel/src/syscall/getrandom.rs:7:    let flags = GetRandomFlags::from_bits_truncate(flags);
+./kernel/src/syscall/getrandom.rs:15:    let read_len = if flags.contains(GetRandomFlags::GRND_RANDOM) {
+./kernel/src/syscall/getrandom.rs:28:    pub struct GetRandomFlags: u32 {
+./kernel/src/syscall/getrandom.rs:29:        const GRND_NONBLOCK = 0x0001;
+./kernel/src/syscall/getrandom.rs:30:        const GRND_RANDOM = 0x0002;
+./kernel/src/syscall/getrandom.rs:31:        const GRND_INSECURE = 0x0004;
+./kernel/src/syscall/arch/riscv.rs:45:    getrandom::sys_getrandom,
+./kernel/src/syscall/arch/riscv.rs:341:    SYS_GETRANDOM = 278              => sys_getrandom(args[..3]);
+./kernel/src/syscall/arch/loongarch.rs:45:    getrandom::sys_getrandom,
+./kernel/src/syscall/arch/loongarch.rs:339:    SYS_GETRANDOM = 278              => sys_getrandom(args[..3]);
+./kernel/src/syscall/arch/x86.rs:52:    getrandom::sys_getrandom,
+./kernel/src/syscall/arch/x86.rs:389:    SYS_GETRANDOM = 318        => sys_getrandom(args[..3]);
+
+exec
+/bin/bash -lc "sed -n '100,140p' book/src/kernel/linux-compatibility/limitations-on-system-calls/system-information-and-misc.md" in /tmp/tmp.bO2yqMmb5b/wt1
+ succeeded in 0ms:
+For more information,
+see [the man page](https://man7.org/linux/man-pages/man2/getrusage.2.html).
+
+## `getrandom`
+
+Supported functionality in SCML:
+
+```c
+// Obtain random bytes
+getrandom(
+    buf, buflen,
+    flags =
+        // Optional flags:
+        //
+        // High-entropy pool
+        GRND_RANDOM
+);
+```
+
+Silently-ignored flags:
+* `GRND_NONBLOCK` because the underlying operation never blocks
+
+For more information,
+see [the man page](https://man7.org/linux/man-pages/man2/getrandom.2.html).
+exec
+/bin/bash -lc "rg -n \"struct Random|struct Urandom|getrandom\\(\" kernel/src ostd/src -S" in /tmp/tmp.bO2yqMmb5b
+ exited 2 in 0ms:
+rg: kernel/src: No such file or directory (os error 2)
+rg: ostd/src: No such file or directory (os error 2)
+
+codex
+I’ve confirmed this is the working tree copy, and I’m checking the surrounding syscall plumbing and entropy source behavior so I can validate whether the issue is functional or just a docs mismatch.
+exec
+/bin/bash -lc "find kernel -maxdepth 2 -type d | head -n 40 && find . -path './kernel/src/syscall*' -maxdepth 4 -type f | head -n 20" in /tmp/tmp.bO2yqMmb5b/wt1
+ succeeded in 0ms:
+kernel
+kernel/libs
+kernel/libs/aster-bigtcp
+kernel/libs/atomic-integer-wrapper
+kernel/libs/typeflags
+kernel/libs/int-to-c-enum
+kernel/libs/logo-ascii-art
+kernel/libs/jhash
+kernel/libs/typeflags-util
+kernel/libs/comp-sys
+kernel/libs/aster-util
+kernel/libs/keyable-arc
+kernel/libs/xarray
+kernel/libs/aster-rights-proc
+kernel/libs/aster-rights
+kernel/libs/cpio-decoder
+kernel/src
+kernel/src/thread
+kernel/src/util
+kernel/src/vm
+kernel/src/time
+kernel/src/driver
+kernel/src/device
+kernel/src/process
+kernel/src/net
+kernel/src/sched
+kernel/src/arch
+kernel/src/events
+kernel/src/syscall
+kernel/src/fs
+kernel/src/ipc
+kernel/comps
+kernel/comps/pci
+kernel/comps/systree
+kernel/comps/logger
+kernel/comps/framebuffer
+kernel/comps/virtio
+kernel/comps/softirq
+kernel/comps/network
+kernel/comps/time
+./kernel/src/syscall/select.rs
+./kernel/src/syscall/mkdir.rs
+./kernel/src/syscall/getsockname.rs
+./kernel/src/syscall/open.rs
+./kernel/src/syscall/rt_sigpending.rs
+./kernel/src/syscall/sendfile.rs
+./kernel/src/syscall/recvfrom.rs
+./kernel/src/syscall/sched_affinity.rs
+./kernel/src/syscall/sethostname.rs
+./kernel/src/syscall/clock_gettime.rs
+./kernel/src/syscall/accept.rs
+./kernel/src/syscall/ppoll.rs
+./kernel/src/syscall/getdents64.rs
+./kernel/src/syscall/sched_yield.rs
+./kernel/src/syscall/statx.rs
+./kernel/src/syscall/setdomainname.rs
+./kernel/src/syscall/setresgid.rs
+./kernel/src/syscall/setgid.rs
+./kernel/src/syscall/unshare.rs
+./kernel/src/syscall/rt_sigsuspend.rs
+find: ‘standard output’: Broken pipe
+find: write error
+
+exec
+/bin/bash -lc "rg -n \"struct Random|struct Urandom|getrandom\\(\" . -S" in /tmp/tmp.bO2yqMmb5b/wt1
+ succeeded in 0ms:
+./book/src/kernel/linux-compatibility/limitations-on-system-calls/system-information-and-misc.md:109:getrandom(
+./kernel/src/util/random.rs:15:pub fn getrandom(dst: &mut [u8]) -> Result<()> {
+./kernel/src/device/random.rs:16:pub struct Random;
+./kernel/src/device/random.rs:19:    pub fn getrandom(buf: &mut [u8]) -> Result<usize> {
+./kernel/src/device/random.rs:20:        getrandom(buf)?;
+./kernel/src/device/random.rs:50:        let size = Self::getrandom(buf.as_mut_slice());
+./kernel/src/device/urandom.rs:16:pub struct Urandom;
+./kernel/src/device/urandom.rs:19:    pub fn getrandom(buf: &mut [u8]) -> Result<usize> {
+./kernel/src/device/urandom.rs:20:        getrandom(buf)?;
+./kernel/src/device/urandom.rs:50:        let size = Self::getrandom(buf.as_mut_slice());
+./kernel/src/process/process_vm/init_stack/mod.rs:136:            getrandom(nr_random_padding_pages.as_bytes_mut()).unwrap();
+./kernel/src/process/process_vm/init_stack/mod.rs:373:    getrandom(&mut rand_val).unwrap();
+./kernel/src/net/socket/netlink/table/mod.rs:131:                getrandom(random_port.as_bytes_mut()).unwrap();
+./kernel/src/syscall/getrandom.rs:6:pub fn sys_getrandom(buf: Vaddr, count: usize, flags: u32, ctx: &Context) -> Result<SyscallReturn> {
+./kernel/src/syscall/getrandom.rs:16:        device::Random::getrandom(&mut buffer)?
+./kernel/src/syscall/getrandom.rs:18:        device::Urandom::getrandom(&mut buffer)?
+./kernel/src/syscall/arch/riscv.rs:341:    SYS_GETRANDOM = 278              => sys_getrandom(args[..3]);
+./kernel/src/syscall/arch/x86.rs:389:    SYS_GETRANDOM = 318        => sys_getrandom(args[..3]);
+./kernel/src/syscall/arch/loongarch.rs:339:    SYS_GETRANDOM = 278              => sys_getrandom(args[..3]);
+
+exec
+/bin/bash -lc "sed -n '1,220p' kernel/src/util/random.rs" in /tmp/tmp.bO2yqMmb5b/wt1
+ succeeded in 0ms:
+// SPDX-License-Identifier: MPL-2.0
+
+#![expect(unused_variables)]
+
+use rand::{rngs::StdRng, Error as RandError, RngCore};
+use spin::Once;
+
+use crate::prelude::*;
+
+static RNG: Once<SpinLock<StdRng>> = Once::new();
+
+/// Fill `dest` with random bytes.
+///
+/// It's cryptographically secure, as documented in [`rand::rngs::StdRng`].
+pub fn getrandom(dst: &mut [u8]) -> Result<()> {
+    Ok(RNG.get().unwrap().lock().try_fill_bytes(dst)?)
+}
+
+pub fn init() {
+    // The seed used to initialize the RNG is required to be secure and unpredictable.
+
+    cfg_if::cfg_if! {
+        if #[cfg(target_arch = "x86_64")] {
+            use rand::SeedableRng;
+            use ostd::arch::read_random;
+
+            let mut seed = <StdRng as SeedableRng>::Seed::default();
+            let mut chunks = seed.as_mut().chunks_exact_mut(size_of::<u64>());
+            for chunk in chunks.by_ref() {
+                let src = read_random().expect("read_random failed multiple times").to_ne_bytes();
+                chunk.copy_from_slice(&src);
+            }
+            let tail = chunks.into_remainder();
+            let n = tail.len();
+            if n > 0 {
+                let src = read_random().expect("read_random failed multiple times").to_ne_bytes();
+                tail.copy_from_slice(&src[..n]);
+            }
+
+            RNG.call_once(|| SpinLock::new(StdRng::from_seed(seed)));
+        } else if #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))] {
+            use rand::SeedableRng;
+            use ostd::arch::boot::DEVICE_TREE;
+
+            let chosen = DEVICE_TREE.get().unwrap().find_node("/chosen").unwrap();
+            let seed = chosen.property("rng-seed").unwrap().value.try_into().unwrap();
+
+            RNG.call_once(|| SpinLock::new(StdRng::from_seed(seed)));
+        } else {
+            compile_error!("unsupported target");
+        }
+    }
+}
+
+impl From<RandError> for Error {
+    fn from(value: RandError) -> Self {
+        Error::with_message(Errno::ENOSYS, "cannot generate random bytes")
+    }
+}
+
+exec
+/bin/bash -lc "rg -n \"from_bits_truncate\\(\" kernel/src/syscall -S" in /tmp/tmp.bO2yqMmb5b/wt1
+ succeeded in 0ms:
+kernel/src/syscall/fcntl.rs:85:    status_flags.insert(StatusFlags::from_bits_truncate(arg as _) & valid_flags_mask);
+kernel/src/syscall/recvmsg.rs:19:    let flags = SendRecvFlags::from_bits_truncate(flags);
+kernel/src/syscall/chmod.rs:18:    file.set_mode(InodeMode::from_bits_truncate(mode))?;
+kernel/src/syscall/chmod.rs:53:    path.set_mode(InodeMode::from_bits_truncate(mode))?;
+kernel/src/syscall/poll.rs:265:        let events = IoEvents::from_bits_truncate(raw.events as _);
+kernel/src/syscall/poll.rs:266:        let revents = Cell::new(IoEvents::from_bits_truncate(raw.revents as _));
+kernel/src/syscall/umount.rs:12:    let umount_flags = UmountFlags::from_bits_truncate(flags as u32);
+kernel/src/syscall/execve.rs:49:        let flags = OpenFlags::from_bits_truncate(flags);
+kernel/src/syscall/socket.rs:21:    let sock_flags = SockFlags::from_bits_truncate(type_ & !SOCK_TYPE_MASK);
+kernel/src/syscall/mmap.rs:24:    let perms = VmPerms::from_bits_truncate(perms as u32);
+kernel/src/syscall/sendmsg.rs:19:    let flags = SendRecvFlags::from_bits_truncate(flags);
+kernel/src/syscall/socketpair.rs:23:    let sock_flags = SockFlags::from_bits_truncate(type_ & !SOCK_TYPE_MASK);
+kernel/src/syscall/sendto.rs:20:    let flags = SendRecvFlags::from_bits_truncate(flags);
+kernel/src/syscall/getrandom.rs:7:    let flags = GetRandomFlags::from_bits_truncate(flags);
+kernel/src/syscall/mknod.rs:27:        InodeMode::from_bits_truncate(mask_mode)
+kernel/src/syscall/mprotect.rs:9:    let vm_perms = VmPerms::from_bits_truncate(perms as u32);
+kernel/src/syscall/accept.rs:33:    let flags = Flags::from_bits_truncate(flags);
+kernel/src/syscall/sigaltstack.rs:42:        let attr_flags = SigStackAttrFlags::from_bits_truncate(old_stack.flags().bits());
+kernel/src/syscall/sigaltstack.rs:90:    let status_flags = SigStackStatusFlags::from_bits_truncate(ss_flags.bits());
+kernel/src/syscall/pipe.rs:18:    let fd_flags = if CreationFlags::from_bits_truncate(flags).contains(CreationFlags::O_CLOEXEC) {
+kernel/src/syscall/recvfrom.rs:20:    let flags = SendRecvFlags::from_bits_truncate(flags);
+kernel/src/syscall/open.rs:51:            if CreationFlags::from_bits_truncate(flags).contains(CreationFlags::O_CLOEXEC) {
+kernel/src/syscall/statx.rs:26:    let mask = StatxMask::from_bits_truncate(mask);
+kernel/src/syscall/mkdir.rs:38:        InodeMode::from_bits_truncate(mask_mode)
+kernel/src/syscall/capset.rs:55:    credentials.set_inheritable_capset(CapSet::from_bits_truncate(inheritable));
+kernel/src/syscall/capset.rs:56:    credentials.set_permitted_capset(CapSet::from_bits_truncate(permitted));
+kernel/src/syscall/capset.rs:57:    credentials.set_effective_capset(CapSet::from_bits_truncate(effective));
+kernel/src/syscall/mount.rs:30:    let mount_flags = MountFlags::from_bits_truncate(flags as u32);
+kernel/src/syscall/epoll.rs:70:            let flags = EpollFlags::from_bits_truncate(c_epoll_event.events);
+kernel/src/syscall/epoll.rs:77:            let flags = EpollFlags::from_bits_truncate(c_epoll_event.events);
+kernel/src/syscall/epoll.rs:288:        Self::new(IoEvents::from_bits_truncate(c_event.events), c_event.data)
+kernel/src/syscall/semget.rs:23:    let flags = IpcFlags::from_bits_truncate(semflags as u32);
+
+exec
+/bin/bash -lc "sed -n '1,140p' kernel/src/device/random.rs && printf '\\n----\\n' && sed -n '1,140p' kernel/src/device/urandom.rs" in /tmp/tmp.bO2yqMmb5b/wt1
+ succeeded in 0ms:
+// SPDX-License-Identifier: MPL-2.0
+
+#![expect(unused_variables)]
+
+use crate::{
+    events::IoEvents,
+    fs::{
+        device::{Device, DeviceId, DeviceType},
+        inode_handle::FileIo,
+    },
+    prelude::*,
+    process::signal::{PollHandle, Pollable},
+    util::random::getrandom,
+};
+
+pub struct Random;
+
+impl Random {
+    pub fn getrandom(buf: &mut [u8]) -> Result<usize> {
+        getrandom(buf)?;
+        Ok(buf.len())
+    }
+}
+
+impl Device for Random {
+    fn type_(&self) -> DeviceType {
+        DeviceType::Char
+    }
+
+    fn id(&self) -> DeviceId {
+        // The same value as Linux
+        DeviceId::new(1, 8)
+    }
+
+    fn open(&self) -> Result<Option<Arc<dyn FileIo>>> {
+        Ok(Some(Arc::new(Random)))
+    }
+}
+
+impl Pollable for Random {
+    fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
+        let events = IoEvents::IN | IoEvents::OUT;
+        events & mask
+    }
+}
+
+impl FileIo for Random {
+    fn read(&self, writer: &mut VmWriter) -> Result<usize> {
+        let mut buf = vec![0; writer.avail()];
+        let size = Self::getrandom(buf.as_mut_slice());
+        writer.write_fallible(&mut buf.as_slice().into())?;
+        size
+    }
+
+    fn write(&self, reader: &mut VmReader) -> Result<usize> {
+        Ok(reader.remain())
+    }
+}
+
+----
+// SPDX-License-Identifier: MPL-2.0
+
+#![expect(unused_variables)]
+
+use crate::{
+    events::IoEvents,
+    fs::{
+        device::{Device, DeviceId, DeviceType},
+        inode_handle::FileIo,
+    },
+    prelude::*,
+    process::signal::{PollHandle, Pollable},
+    util::random::getrandom,
+};
+
+pub struct Urandom;
+
+impl Urandom {
+    pub fn getrandom(buf: &mut [u8]) -> Result<usize> {
+        getrandom(buf)?;
+        Ok(buf.len())
+    }
+}
+
+impl Device for Urandom {
+    fn type_(&self) -> DeviceType {
+        DeviceType::Char
+    }
+
+    fn id(&self) -> DeviceId {
+        // The same value as Linux
+        DeviceId::new(1, 9)
+    }
+
+    fn open(&self) -> Result<Option<Arc<dyn FileIo>>> {
+        Ok(Some(Arc::new(Urandom)))
+    }
+}
+
+impl Pollable for Urandom {
+    fn poll(&self, mask: IoEvents, poller: Option<&mut PollHandle>) -> IoEvents {
+        let events = IoEvents::IN | IoEvents::OUT;
+        events & mask
+    }
+}
+
+impl FileIo for Urandom {
+    fn read(&self, writer: &mut VmWriter) -> Result<usize> {
+        let mut buf = vec![0; writer.avail()];
+        let size = Self::getrandom(buf.as_mut_slice());
+        writer.write_fallible(&mut buf.as_slice().into())?;
+        size
+    }
+
+    fn write(&self, reader: &mut VmReader) -> Result<usize> {
+        Ok(reader.remain())
+    }
+}
+
+exec
+/bin/bash -lc "sed -n '1,120p' kernel/src/syscall/readlink.rs && printf '\\n----\\n' && sed -n '1,120p' kernel/src/syscall/pipe.rs" in /tmp/tmp.bO2yqMmb5b/wt1
+ succeeded in 0ms:
+// SPDX-License-Identifier: MPL-2.0
+
+use super::SyscallReturn;
+use crate::{
+    fs::{
+        file_table::FileDesc,
+        fs_resolver::{FsPath, AT_FDCWD},
+    },
+    prelude::*,
+    syscall::constants::MAX_FILENAME_LEN,
+};
+
+pub fn sys_readlinkat(
+    dirfd: FileDesc,
+    path_addr: Vaddr,
+    usr_buf_addr: Vaddr,
+    usr_buf_len: usize,
+    ctx: &Context,
+) -> Result<SyscallReturn> {
+    let user_space = ctx.user_space();
+    let path_name = user_space.read_cstring(path_addr, MAX_FILENAME_LEN)?;
+    debug!(
+        "dirfd = {}, path = {:?}, usr_buf_addr = 0x{:x}, usr_buf_len = 0x{:x}",
+        dirfd, path_name, usr_buf_addr, usr_buf_len
+    );
+
+    let path = {
+        let path_name = path_name.to_string_lossy();
+        if path_name.is_empty() {
+            return_errno_with_message!(Errno::ENOENT, "path is empty");
+        }
+        let fs_path = FsPath::new(dirfd, path_name.as_ref())?;
+        ctx.thread_local
+            .borrow_fs()
+            .resolver()
+            .read()
+            .lookup_no_follow(&fs_path)?
+    };
+
+    let linkpath = path.inode().read_link()?;
+    let bytes = linkpath.as_bytes();
+    let write_len = bytes.len().min(usr_buf_len);
+    user_space.write_bytes(usr_buf_addr, &mut VmReader::from(&bytes[..write_len]))?;
+    Ok(SyscallReturn::Return(write_len as _))
+}
+
+pub fn sys_readlink(
+    path_addr: Vaddr,
+    usr_buf_addr: Vaddr,
+    usr_buf_len: usize,
+    ctx: &Context,
+) -> Result<SyscallReturn> {
+    self::sys_readlinkat(AT_FDCWD, path_addr, usr_buf_addr, usr_buf_len, ctx)
+}
+
+----
+// SPDX-License-Identifier: MPL-2.0
+
+use super::SyscallReturn;
+use crate::{
+    fs::{
+        file_table::{FdFlags, FileDesc},
+        pipe,
+        utils::CreationFlags,
+    },
+    prelude::*,
+};
+
+pub fn sys_pipe2(fds: Vaddr, flags: u32, ctx: &Context) -> Result<SyscallReturn> {
+    debug!("flags: {:?}", flags);
+
+    let (pipe_reader, pipe_writer) = pipe::new_pair()?;
+
+    let fd_flags = if CreationFlags::from_bits_truncate(flags).contains(CreationFlags::O_CLOEXEC) {
+        FdFlags::CLOEXEC
+    } else {
+        FdFlags::empty()
+    };
+
+    let file_table = ctx.thread_local.borrow_file_table();
+    let mut file_table_locked = file_table.unwrap().write();
+
+    let pipe_fds = PipeFds {
+        reader_fd: file_table_locked.insert(pipe_reader, fd_flags),
+        writer_fd: file_table_locked.insert(pipe_writer, fd_flags),
+    };
+    debug!("pipe_fds: {:?}", pipe_fds);
+
+    if let Err(err) = ctx.user_space().write_val(fds, &pipe_fds) {
+        file_table_locked.close_file(pipe_fds.reader_fd).unwrap();
+        file_table_locked.close_file(pipe_fds.writer_fd).unwrap();
+        return Err(err);
+    }
+
+    Ok(SyscallReturn::Return(0))
+}
+
+pub fn sys_pipe(fds: Vaddr, ctx: &Context) -> Result<SyscallReturn> {
+    self::sys_pipe2(fds, 0, ctx)
+}
+
+#[derive(Debug, Clone, Copy, Pod)]
+#[repr(C)]
+struct PipeFds {
+    reader_fd: FileDesc,
+    writer_fd: FileDesc,
+}
+
+codex
+I’ve narrowed it to a small set of semantic questions: flag validation, and whether this syscall can safely allocate a kernel-side buffer proportional to an untrusted user count. I’m checking how the rest of the kernel handles those cases before I write anything up.
+exec
+/bin/bash -lc 'rg -n "vec!'"\\[0u8; .*count|vec"'!'"\\[0; .*avail|Vec::with_capacity\\(|alloc::\" kernel/src/syscall kernel/src -S" in /tmp/tmp.bO2yqMmb5b/wt1
+ succeeded in 0ms:
+kernel/src/ipc/semaphore/system_v/sem_set.rs:3:use alloc::{collections::btree_map::BTreeMap, vec::Vec};
+kernel/src/ipc/semaphore/system_v/sem_set.rs:7:use id_alloc::IdAlloc;
+kernel/src/ipc/semaphore/system_v/sem_set.rs:209:        let mut sems = Vec::with_capacity(nsems);
+kernel/src/driver/mod.rs:3:use alloc::string::ToString;
+kernel/src/vdso.rs:15:use alloc::sync::Arc;
+kernel/src/kcmdline.rs:13:use alloc::{
+kernel/src/fs/file_table.rs:217:        use alloc::borrow::Cow;
+kernel/src/syscall/get_ioprio.rs:3:use alloc::{sync::Arc, vec::Vec};
+kernel/src/fs/devpts/mod.rs:8:use id_alloc::IdAlloc;
+kernel/src/time/clocks/system_wide.rs:3:use alloc::sync::Arc;
+kernel/src/vm/vmar/interval_set.rs:5:use alloc::collections::btree_map::{BTreeMap, Cursor, CursorMut};
+kernel/src/vm/vmar/interval_set.rs:250:    use alloc::{vec, vec::Vec};
+kernel/src/time/clocks/cpu_clock.rs:3:use alloc::sync::Arc;
+kernel/src/syscall/semop.rs:61:    let mut semops = Vec::with_capacity(nsops);
+kernel/src/fs/sysfs/inode.rs:3:use alloc::sync::{Arc, Weak};
+kernel/src/time/softirq.rs:3:use alloc::{boxed::Box, vec, vec::Vec};
+kernel/src/fs/sysfs/test.rs:3:use alloc::{
+kernel/src/time/core/timer.rs:3:use alloc::{
+kernel/src/error.rs:259:impl From<alloc::string::FromUtf8Error> for Error {
+kernel/src/error.rs:260:    fn from(_: alloc::string::FromUtf8Error) -> Self {
+kernel/src/error.rs:319:impl From<alloc::ffi::NulError> for Error {
+kernel/src/error.rs:320:    fn from(_: alloc::ffi::NulError) -> Self {
+kernel/src/syscall/poll.rs:49:        let mut poll_fds = Vec::with_capacity(nfds as _);
+kernel/src/vm/mod.rs:36:const fn slot_type_from_layout(layout: core::alloc::Layout) -> Option<ostd::mm::heap::SlotInfo> {
+kernel/src/vm/memfd.rs:5:use alloc::format;
+kernel/src/fs/procfs/loadavg.rs:8:use alloc::format;
+kernel/src/fs/procfs/uptime.rs:8:use alloc::format;
+kernel/src/prelude.rs:5:pub(crate) use alloc::{
+kernel/src/fs/utils/flock.rs:2:use alloc::fmt;
+kernel/src/fs/utils/endpoint.rs:3:use alloc::sync::Arc;
+kernel/src/fs/procfs/sys/kernel/cap_last_cap.rs:3:use alloc::format;
+kernel/src/fs/procfs/sys/kernel/pid_max.rs:3:use alloc::format;
+kernel/src/fs/utils/random_test.rs:5:use alloc::sync::Arc;
+kernel/src/fs/procfs/cmdline.rs:8:use alloc::format;
+kernel/src/thread/oops.rs:14:use alloc::{
+kernel/src/fs/utils/mod.rs:91:        Ok(alloc::str::from_utf8(self.as_bytes())?)
+kernel/src/fs/utils/mod.rs:172:        Ok(alloc::str::from_utf8(self.as_bytes())?)
+kernel/src/util/read_cstring.rs:48:        let mut buffer: Vec<u8> = Vec::with_capacity(INIT_ALLOC_SIZE.min(max_len));
+kernel/src/util/read_cstring.rs:58:        let mut buffer: Vec<u8> = Vec::with_capacity(INIT_ALLOC_SIZE.min(max_len));
+kernel/src/util/read_cstring.rs:72:        let mut buffer: Vec<u8> = Vec::with_capacity(INIT_ALLOC_SIZE.min(max_len));
+kernel/src/util/read_cstring.rs:84:        let mut buffer: Vec<u8> = Vec::with_capacity(INIT_ALLOC_SIZE.min(max_len));
+kernel/src/util/iovec.rs:88:    let mut v = Vec::with_capacity(count);
+kernel/src/thread/work_queue/simple_scheduler.rs:3:use alloc::sync::Weak;
+kernel/src/events/observer.rs:26:/// use alloc::sync::Weak;
+kernel/src/fs/utils/systree_inode.rs:3:use alloc::{
+kernel/src/fs/procfs/pid/task/mod.rs:3:use alloc::format;
+kernel/src/process/clone.rs:3:use alloc::borrow::Cow;
+kernel/src/fs/ext2/fs.rs:73:            let mut block_groups = Vec::with_capacity(block_groups_count);
+kernel/src/process/process/timer_manager.rs:3:use alloc::{
+kernel/src/process/process/timer_manager.rs:9:use id_alloc::IdAlloc;
+kernel/src/fs/epoll/file.rs:3:use alloc::{collections::btree_set::BTreeSet, sync::Arc};
+kernel/src/fs/ext2/block_group.rs:3:use id_alloc::IdAlloc;
+kernel/src/fs/epoll/entry.rs:3:use alloc::{
+kernel/src/process/process/process_group.rs:3:use alloc::collections::btree_map::Values;
+kernel/src/fs/procfs/meminfo.rs:9:use alloc::format;
+kernel/src/fs/overlayfs/fs.rs:5:use alloc::format;
+kernel/src/fs/ext2/inode.rs:6:use alloc::{borrow::ToOwned, rc::Rc};
+kernel/src/fs/ext2/inode.rs:1470:            let mut indirect_bids: Vec<Ext2Bid> = Vec::with_capacity(indirect_cnt as usize);
+kernel/src/process/process/terminal.rs:3:use alloc::sync::Arc;
+kernel/src/process/posix_thread/futex.rs:420:            vec: Vec::with_capacity(size),
+kernel/src/process/posix_thread/futex.rs:448:            items: Vec::with_capacity(1),
+kernel/src/fs/procfs/thread_self.rs:3:use alloc::format;
+kernel/src/process/posix_thread/name.rs:3:use alloc::borrow::ToOwned;
+kernel/src/arch/x86/cpu.rs:3:use alloc::{borrow::ToOwned, collections::btree_set::BTreeSet, string::String, vec::Vec};
+kernel/src/fs/pipe.rs:286:    use alloc::sync::Arc;
+kernel/src/fs/procfs/filesystems.rs:3:use alloc::format;
+kernel/src/syscall/setxattr.rs:3:use alloc::borrow::Cow;
+kernel/src/syscall/getrandom.rs:14:    let mut buffer = vec![0u8; count];
+kernel/src/fs/cgroupfs/fs.rs:3:use alloc::sync::Arc;
+kernel/src/fs/fs_resolver.rs:3:use alloc::str;
+kernel/src/process/sync/condvar.rs:6:use alloc::sync::Arc;
+kernel/src/process/sync/condvar.rs:53:/// use alloc::sync::Arc;
+kernel/src/fs/cgroupfs/systree_node.rs:3:use alloc::{
+kernel/src/syscall/get_ioprio.rs:3:use alloc::{sync::Arc, vec::Vec};
+kernel/src/fs/cgroupfs/inode.rs:3:use alloc::sync::{Arc, Weak};
+kernel/src/syscall/getrandom.rs:14:    let mut buffer = vec![0u8; count];
+kernel/src/sched/sched_class/real_time.rs:3:use alloc::{collections::VecDeque, sync::Arc};
+kernel/src/syscall/semop.rs:61:    let mut semops = Vec::with_capacity(nsops);
+kernel/src/sched/sched_class/mod.rs:7:use alloc::{boxed::Box, sync::Arc};
+kernel/src/process/process_vm/init_stack/mod.rs:264:        let mut envp_pointers = Vec::with_capacity(self.envp.len());
+kernel/src/process/process_vm/init_stack/mod.rs:273:        let mut argv_pointers = Vec::with_capacity(self.argv.len());
+kernel/src/process/process_vm/init_stack/mod.rs:418:        let mut argv = Vec::with_capacity(argc);
+kernel/src/fs/exfat/inode.rs:6:use alloc::string::String;
+kernel/src/fs/exfat/inode.rs:1224:    fn fs(&self) -> alloc::sync::Arc<dyn crate::fs::utils::FileSystem> {
+kernel/src/sched/sched_class/fair.rs:3:use alloc::{collections::BinaryHeap, sync::Arc};
+kernel/src/fs/exfat/mod.rs:23:    use alloc::fmt::Debug;
+kernel/src/sched/sched_class/stop.rs:3:use alloc::sync::Arc;
+kernel/src/sched/sched_class/idle.rs:3:use alloc::sync::Arc;
+kernel/src/process/program_loader/shebang.rs:47:    use alloc::{ffi::CString, vec};
+kernel/src/syscall/select.rs:108:        let mut poll_fds = Vec::with_capacity(nfds as usize);
+kernel/src/syscall/poll.rs:49:        let mut poll_fds = Vec::with_capacity(nfds as _);
+kernel/src/syscall/select.rs:108:        let mut poll_fds = Vec::with_capacity(nfds as usize);
+kernel/src/syscall/setxattr.rs:3:use alloc::borrow::Cow;
+kernel/src/process/process_table.rs:9:use alloc::collections::btree_map::Values;
+kernel/src/process/program_loader/elf/elf_file.rs:36:        let mut program_headers = Vec::with_capacity(ph_count as usize);
+kernel/src/net/iface/poll.rs:3:use alloc::sync::Arc;
+kernel/src/device/random.rs:49:        let mut buf = vec![0; writer.avail()];
+kernel/src/net/iface/init.rs:3:use alloc::{borrow::ToOwned, sync::Arc};
+kernel/src/net/iface/init.rs:32:        let mut ifaces = Vec::with_capacity(2);
+kernel/src/device/urandom.rs:49:        let mut buf = vec![0; writer.avail()];
+kernel/src/device/pty/master.rs:3:use alloc::format;
+kernel/src/device/mod.rs:15:use alloc::format;
+kernel/src/net/socket/unix/ns/abs.rs:3:use alloc::{collections::btree_map::Entry, format};
+kernel/src/device/tty/n_tty.rs:3:use alloc::{boxed::Box, sync::Arc, vec};
+kernel/src/net/socket/vsock/common.rs:3:use alloc::collections::BTreeSet;
+kernel/src/net/socket/vsock/mod.rs:3:use alloc::sync::Arc;
+kernel/src/net/socket/unix/datagram/message.rs:3:use alloc::{
+kernel/src/net/socket/unix/ctrl_msg.rs:98:        let mut files = Vec::with_capacity(nfiles);
+kernel/src/net/socket/netlink/kobject_uevent/message/test.rs:3:use alloc::vec;
+kernel/src/net/socket/netlink/kobject_uevent/message/syn_uevent.rs:10:use alloc::format;
+
+codex
+I’ve got enough context to compare against `HEAD` now. I’m looking at the actual delta so I can separate a genuine regression from something that was already in the tree.
+exec
+/bin/bash -lc 'git diff -- kernel/src/syscall/getrandom.rs' in /tmp/tmp.bO2yqMmb5b/wt1
+ succeeded in 0ms:
+web search: 
+web search: man 2 getrandom invalid flags EINVAL site:man7.org
+codex
+I found one standards mismatch already: the syscall should reject unknown flag bits with `EINVAL`, but this code truncates them away. I’m checking one more concrete failure mode before I decide whether there’s a second finding or just one.
+exec
+/bin/bash -lc "rg -n \"alloc_error_handler|oom|handle_alloc_error|panic = 'abort'|panic *= *\\\"abort\\\"|#[ ]*alloc_error_handler\" . -S" in /tmp/tmp.bO2yqMmb5b/wt1
+ succeeded in 0ms:
+./kernel/src/fs/procfs/pid/task/oom_score_adj.rs:14:/// Represents the inode at `/proc/[pid]/task/[tid]/oom_score_adj` (and also `/proc/[pid]/oom_score_adj`).
+./kernel/src/fs/procfs/pid/task/oom_score_adj.rs:15:pub struct OomScoreAdjFileOps(Arc<Process>);
+./kernel/src/fs/procfs/pid/task/oom_score_adj.rs:17:impl OomScoreAdjFileOps {
+./kernel/src/fs/procfs/pid/task/oom_score_adj.rs:27:impl FileOps for OomScoreAdjFileOps {
+./kernel/src/fs/procfs/pid/task/oom_score_adj.rs:29:        let oom_score_adj = self.0.oom_score_adj().load(Ordering::Relaxed);
+./kernel/src/fs/procfs/pid/task/oom_score_adj.rs:32:        writeln!(output, "{}", oom_score_adj).unwrap();
+./kernel/src/fs/procfs/pid/task/oom_score_adj.rs:45:        if !(OOM_SCORE_ADJ_MIN..=OOM_SCORE_ADJ_MAX).contains(&val) {
+./kernel/src/fs/procfs/pid/task/oom_score_adj.rs:46:            return_errno_with_message!(Errno::EINVAL, "the OOM score adjustment is out of range");
+./kernel/src/fs/procfs/pid/task/oom_score_adj.rs:54:        self.0.oom_score_adj().store(val as i16, Ordering::Relaxed);
+./kernel/src/fs/procfs/pid/task/oom_score_adj.rs:64:// FIXME: Support OOM killer and move these constants to a more appropriate place.
+./kernel/src/fs/procfs/pid/task/oom_score_adj.rs:65:const OOM_SCORE_ADJ_MIN: i32 = -1000;
+./kernel/src/fs/procfs/pid/task/oom_score_adj.rs:66:const OOM_SCORE_ADJ_MAX: i32 = 1000;
+./kernel/src/fs/procfs/pid/task/mod.rs:15:                    exe::ExeSymOps, fd::FdDirOps, oom_score_adj::OomScoreAdjFileOps,
+./kernel/src/fs/procfs/pid/task/mod.rs:33:mod oom_score_adj;
+./kernel/src/fs/procfs/pid/task/mod.rs:84:            "oom_score_adj" => OomScoreAdjFileOps::new_inode(self.process_ref.clone(), this_ptr),
+./kernel/src/fs/procfs/pid/task/mod.rs:132:        cached_children.put_entry_if_not_found("oom_score_adj", || {
+./kernel/src/fs/procfs/pid/task/mod.rs:133:            OomScoreAdjFileOps::new_inode(self.process_ref.clone(), this_ptr.clone())
+./ostd/src/mm/heap/mod.rs:88:#[alloc_error_handler]
+./ostd/src/mm/heap/mod.rs:89:fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
+./Cargo.toml:78:panic = "abort"
+./kernel/src/error.rs:124:    ETOOMANYREFS = 109,   /* Too many references: cannot splice */
+./kernel/src/fs/pipe.rs:25:/// A non-blocking atomic write may fail with `EAGAIN`, even if there is room for a partial write.
+./kernel/src/net/socket/netlink/table/mod.rs:316:    /// Leave room for NETLINK_DM (DM Events)
+./kernel/src/fs/ext2/xattr.rs:183:                    .find_room_for_new_value(value_len)
+./kernel/src/fs/ext2/xattr.rs:202:                .find_room_for_new_entry(name_len)
+./kernel/src/fs/ext2/xattr.rs:205:                .find_room_for_new_value(value_len)
+./kernel/src/fs/ext2/xattr.rs:411:    pub fn find_room_for_new_entry(&self, name_len: usize) -> Option<usize> {
+./kernel/src/fs/ext2/xattr.rs:443:    pub fn find_room_for_new_value(&self, value_len: usize) -> Option<usize> {
+./ostd/src/lib.rs:5:#![feature(alloc_error_handler)]
+./kernel/src/vm/vmar/mod.rs:331:        // Fast path that there's still room to the end.
+./test/src/syscall/gvisor/blocklists/proc_pid_oomscore_test:1:# TODO: Support `/proc/[pid]/oom_score`
+./test/src/syscall/gvisor/blocklists/proc_pid_oomscore_test:2:ProcPidOomscoreTest.BasicRead
+./kernel/src/fs/ext2/indirect_block_cache.rs:14:/// blocks remain in memory for quick retrieval, while less used blocks can be evicted to make room
+./kernel/src/process/clone.rs:476:    // Inherit the parent's OOM score adjustment
+./kernel/src/process/clone.rs:477:    let child_oom_score_adj = process.oom_score_adj().load(Ordering::Relaxed);
+./kernel/src/process/clone.rs:514:            child_oom_score_adj,
+./kernel/src/process/clone.rs:709:    oom_score_adj: i16,
+./kernel/src/process/clone.rs:720:        oom_score_adj,
+./osdk/src/util.rs:163:        std::process::exit(Errno::TooManyCrates as _);
+./osdk/src/commands/test.rs:27:        std::process::exit(Errno::TooManyCrates as _);
+./osdk/src/error.rs:16:    TooManyCrates = 11,
+./test/src/syscall/gvisor/Makefile:37:	proc_pid_oomscore_test \
+./kernel/src/process/process/mod.rs:100:    /// The adjustment value of the out-of-memory (OOM) killer score.
+./kernel/src/process/process/mod.rs:101:    // FIXME: Support OOM killer.
+./kernel/src/process/process/mod.rs:102:    oom_score_adj: AtomicI16,
+./kernel/src/process/process/mod.rs:211:        oom_score_adj: i16,
+./kernel/src/process/process/mod.rs:240:            oom_score_adj: AtomicI16::new(oom_score_adj),
+./kernel/src/process/process/mod.rs:300:    pub fn oom_score_adj(&self) -> &AtomicI16 {
+./kernel/src/process/process/mod.rs:301:        &self.oom_score_adj
+./kernel/src/process/process/init_proc.rs:54:    let oom_score_adj = 0;
+./kernel/src/process/process/init_proc.rs:64:        oom_score_adj,
+./kernel/src/net/socket/unix/ctrl_msg.rs:94:        // TODO: "[the ETOOMANYREFS error] occurs if the number of "in-flight" file descriptors
+./test/src/apps/mmap/mmap_and_mremap.c:44:	// There is no enough room to expand the mapping.
+./kernel/src/device/tty/driver.rs:44:    /// Notifies that the input buffer now has room for new characters.
+./kernel/src/device/tty/mod.rs:93:    /// Notifies that the output buffer now has room for new characters.
+
+exec
+/bin/bash -lc "sed -n '80,110p' ostd/src/mm/heap/mod.rs" in /tmp/tmp.bO2yqMmb5b/wt1
+ succeeded in 0ms:
+
+macro_rules! abort_with_message {
+    ($($arg:tt)*) => {
+        log::error!($($arg)*);
+        crate::panic::abort();
+    };
+}
+
+#[alloc_error_handler]
+fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
+    abort_with_message!("Heap allocation error, layout = {:#x?}", layout);
+}
+
+#[global_allocator]
+static HEAP_ALLOCATOR: AllocDispatch = AllocDispatch;
+
+struct AllocDispatch;
+
+// TODO: Somehow restrict unwinding in the user-provided global allocator.
+// Panicking should be fine, but we shouldn't unwind on panics.
+unsafe impl GlobalAlloc for AllocDispatch {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let Some(required_slot) = slot_size_from_layout(layout) else {
+            abort_with_message!("Heap allocation size not found for layout = {:#x?}", layout);
+        };
+
+        let res = get_global_heap_allocator().alloc(layout);
+        let Ok(slot) = res else {
+            return core::ptr::null_mut();
+        };
+
+
+web search: 
+web search: site:man7.org getrandom man page invalid flags EINVAL
+codex
+I’ve got the two concrete defects I’m going to report. I’m writing the review file now with one correctness issue about flag handling and one availability issue about the unbounded allocation.
+apply patch
+patch: completed
+/tmp/tmp.bO2yqMmb5b/wt1.on.md
+diff --git a//tmp/tmp.bO2yqMmb5b/wt1.on.md b//tmp/tmp.bO2yqMmb5b/wt1.on.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..6b5a983866408e4cea30ce884453b140351bf57a
+--- /dev/null
++++ b//tmp/tmp.bO2yqMmb5b/wt1.on.md
+@@ -0,0 +1,25 @@
++---
++date: 2026-08-24
++mode: files
++files:
++  - kernel/src/syscall/getrandom.rs
++head: b606e3456
++branch: HEAD
++title: Review of kernel/src/syscall/getrandom.rs
++---
++
++# Summary
++
++## Correctness
++
++### `kernel/src/syscall/getrandom.rs` line 7
++```diff
++7	    let flags = GetRandomFlags::from_bits_truncate(flags);
++```
++`GetRandomFlags::from_bits_truncate` silently drops unknown bits, but `getrandom(2)` requires `EINVAL` for any invalid flag value. That makes the syscall accept malformed inputs that Linux rejects, which can hide caller bugs and breaks the ABI. **Fix.** Parse with a checked conversion and return `EINVAL` when `flags` contains unsupported bits.
++
++### `kernel/src/syscall/getrandom.rs` line 14
++```diff
++14	    let mut buffer = vec![0u8; count];
++```
++This allocates a kernel buffer sized directly by the untrusted user `count`. A large request can exhaust heap memory and hit the allocator's abort path, taking down the kernel instead of returning an error. **Fix.** Fill the user buffer in bounded chunks, or write directly from a small scratch buffer without materializing `count` bytes in kernel memory.
+
+diff --git a//tmp/tmp.bO2yqMmb5b/wt1.on.md b//tmp/tmp.bO2yqMmb5b/wt1.on.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..6b5a983866408e4cea30ce884453b140351bf57a
+--- /dev/null
++++ b//tmp/tmp.bO2yqMmb5b/wt1.on.md
+@@ -0,0 +1,25 @@
++---
++date: 2026-08-24
++mode: files
++files:
++  - kernel/src/syscall/getrandom.rs
++head: b606e3456
++branch: HEAD
++title: Review of kernel/src/syscall/getrandom.rs
++---
++
++# Summary
++
++## Correctness
++
++### `kernel/src/syscall/getrandom.rs` line 7
++```diff
++7	    let flags = GetRandomFlags::from_bits_truncate(flags);
++```
++`GetRandomFlags::from_bits_truncate` silently drops unknown bits, but `getrandom(2)` requires `EINVAL` for any invalid flag value. That makes the syscall accept malformed inputs that Linux rejects, which can hide caller bugs and breaks the ABI. **Fix.** Parse with a checked conversion and return `EINVAL` when `flags` contains unsupported bits.
++
++### `kernel/src/syscall/getrandom.rs` line 14
++```diff
++14	    let mut buffer = vec![0u8; count];
++```
++This allocates a kernel buffer sized directly by the untrusted user `count`. A large request can exhaust heap memory and hit the allocator's abort path, taking down the kernel instead of returning an error. **Fix.** Fill the user buffer in bounded chunks, or write directly from a small scratch buffer without materializing `count` bytes in kernel memory.
+
+web search: 
+web search: man7 getrandom invalid flags EINVAL getrandom(2)
+exec
+/bin/bash -lc "sed -n '1,200p' /tmp/tmp.bO2yqMmb5b/wt1.on.md" in /tmp/tmp.bO2yqMmb5b/wt1
+ succeeded in 0ms:
+---
+date: 2026-08-24
+mode: files
+files:
+  - kernel/src/syscall/getrandom.rs
+head: b606e3456
+branch: HEAD
+title: Review of kernel/src/syscall/getrandom.rs
+---
+
+# Summary
+
+## Correctness
+
+### `kernel/src/syscall/getrandom.rs` line 7
+```diff
+7	    let flags = GetRandomFlags::from_bits_truncate(flags);
+```
+`GetRandomFlags::from_bits_truncate` silently drops unknown bits, but `getrandom(2)` requires `EINVAL` for any invalid flag value. That makes the syscall accept malformed inputs that Linux rejects, which can hide caller bugs and breaks the ABI. **Fix.** Parse with a checked conversion and return `EINVAL` when `flags` contains unsupported bits.
+
+### `kernel/src/syscall/getrandom.rs` line 14
+```diff
+14	    let mut buffer = vec![0u8; count];
+```
+This allocates a kernel buffer sized directly by the untrusted user `count`. A large request can exhaust heap memory and hit the allocator's abort path, taking down the kernel instead of returning an error. **Fix.** Fill the user buffer in bounded chunks, or write directly from a small scratch buffer without materializing `count` bytes in kernel memory.
+
+diff --git a//tmp/tmp.bO2yqMmb5b/wt1.on.md b//tmp/tmp.bO2yqMmb5b/wt1.on.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..6b5a983866408e4cea30ce884453b140351bf57a
+--- /dev/null
++++ b//tmp/tmp.bO2yqMmb5b/wt1.on.md
+@@ -0,0 +1,25 @@
++---
++date: 2026-08-24
++mode: files
++files:
++  - kernel/src/syscall/getrandom.rs
++head: b606e3456
++branch: HEAD
++title: Review of kernel/src/syscall/getrandom.rs
++---
++
++# Summary
++
++## Correctness
++
++### `kernel/src/syscall/getrandom.rs` line 7
++```diff
++7	    let flags = GetRandomFlags::from_bits_truncate(flags);
++```
++`GetRandomFlags::from_bits_truncate` silently drops unknown bits, but `getrandom(2)` requires `EINVAL` for any invalid flag value. That makes the syscall accept malformed inputs that Linux rejects, which can hide caller bugs and breaks the ABI. **Fix.** Parse with a checked conversion and return `EINVAL` when `flags` contains unsupported bits.
++
++### `kernel/src/syscall/getrandom.rs` line 14
++```diff
++14	    let mut buffer = vec![0u8; count];
++```
++This allocates a kernel buffer sized directly by the untrusted user `count`. A large request can exhaust heap memory and hit the allocator's abort path, taking down the kernel instead of returning an error. **Fix.** Fill the user buffer in bounded chunks, or write directly from a small scratch buffer without materializing `count` bytes in kernel memory.
+
+web search: 
+web search: site:man7.org/linux/man-pages/man2/getrandom.2.html invalid flags EINVAL
+codex
+Reviewed [kernel/src/syscall/getrandom.rs](</tmp/tmp.bO2yqMmb5b/wt1/kernel/src/syscall/getrandom.rs:6>). I wrote the review to [wt1.on.md](</tmp/tmp.bO2yqMmb5b/wt1.on.md>).
+
+Main findings: unknown flag bits are truncated instead of rejected with `EINVAL` per [getrandom(2)](https://www.man7.org/linux/man-pages/man2/getrandom.2.html), and `vec![0u8; count]` lets an untrusted syscall argument drive a kernel-sized allocation that can abort the kernel on OOM.
+diff --git a//tmp/tmp.bO2yqMmb5b/wt1.on.md b//tmp/tmp.bO2yqMmb5b/wt1.on.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..6b5a983866408e4cea30ce884453b140351bf57a
+--- /dev/null
++++ b//tmp/tmp.bO2yqMmb5b/wt1.on.md
+@@ -0,0 +1,25 @@
++---
++date: 2026-08-24
++mode: files
++files:
++  - kernel/src/syscall/getrandom.rs
++head: b606e3456
++branch: HEAD
++title: Review of kernel/src/syscall/getrandom.rs
++---
++
++# Summary
++
++## Correctness
++
++### `kernel/src/syscall/getrandom.rs` line 7
++```diff
++7	    let flags = GetRandomFlags::from_bits_truncate(flags);
++```
++`GetRandomFlags::from_bits_truncate` silently drops unknown bits, but `getrandom(2)` requires `EINVAL` for any invalid flag value. That makes the syscall accept malformed inputs that Linux rejects, which can hide caller bugs and breaks the ABI. **Fix.** Parse with a checked conversion and return `EINVAL` when `flags` contains unsupported bits.
++
++### `kernel/src/syscall/getrandom.rs` line 14
++```diff
++14	    let mut buffer = vec![0u8; count];
++```
++This allocates a kernel buffer sized directly by the untrusted user `count`. A large request can exhaust heap memory and hit the allocator's abort path, taking down the kernel instead of returning an error. **Fix.** Fill the user buffer in bounded chunks, or write directly from a small scratch buffer without materializing `count` bytes in kernel memory.
+
+tokens used
+24,837
+Reviewed [kernel/src/syscall/getrandom.rs](</tmp/tmp.bO2yqMmb5b/wt1/kernel/src/syscall/getrandom.rs:6>). I wrote the review to [wt1.on.md](</tmp/tmp.bO2yqMmb5b/wt1.on.md>).
+
+Main findings: unknown flag bits are truncated instead of rejected with `EINVAL` per [getrandom(2)](https://www.man7.org/linux/man-pages/man2/getrandom.2.html), and `vec![0u8; count]` lets an untrusted syscall argument drive a kernel-sized allocation that can abort the kernel on OOM.
+WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp" (codex_home: AbsolutePathBuf("/tmp/tmp.IlMgFCxxno"))
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /root/asterinas/.agents/skills/aster-code-review/benchmark
+model: gpt-5.5
+provider: OpenAI
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR] (network access enabled)
+reasoning effort: high
+reasoning summaries: none
+session id: 01a03181-bb80-73a1-9c7a-bcbb1253656b
+--------
+user
+You are grading a code review for recall.
+Each expected defect gives a defect description for context and a MATCH IF criterion for grading.
+For each expected defect, decide whether ANY produced review comment semantically satisfies its MATCH IF criterion at the stated code location.
+Wording, grounding label, persona, and severity may differ; judge the underlying defect.
+Respond with ONLY two space-separated integers: caught total. The total must equal the number of expected defects below.
+
+===== EXPECTED DEFECTS =====
+# Expected defects
+
+1. location: kernel/src/syscall/getrandom.rs lines 6-8 (persona: security, grounding: invalid flags, severity: major)
+   defect: `sys_getrandom` parses user-supplied flags with `GetRandomFlags::from_bits_truncate(flags)`. Unknown bits are silently discarded instead of being rejected. A syscall boundary must validate user-controlled flags before trusting them internally; otherwise callers can pass invalid flag combinations and receive success for a request Linux would reject with `EINVAL`.
+   MATCH IF: A reviewer should flag `from_bits_truncate` at the syscall boundary and require invalid `getrandom` flags, including unsupported bits, to be rejected instead of masked away.
+
+2. location: kernel/src/syscall/getrandom.rs lines 12-18 (persona: security, grounding: unbounded allocation, severity: major)
+   defect: The syscall allocates `vec![0u8; count]` directly from the user-controlled `count` argument. There is no upper bound or streaming through the user buffer, so a large `count` can force an unbounded kernel allocation and panic or exhaust memory. User-supplied sizes must be validated at syscall boundaries before being used to allocate kernel memory.
+   MATCH IF: A reviewer should flag the `vec![0u8; count]` allocation as unbounded allocation from a user-controlled syscall argument and require bounded validation or direct streaming to the user writer.
+
+3. location: kernel/src/syscall/getrandom.rs lines 14-22 (persona: security, grounding: short writes are not allowed, severity: major)
+   defect: The implementation first fills a kernel buffer, records `read_len`, and then writes the entire `buffer.as_slice()` of length `count` to userspace with `write_bytes`. If only part of the requested user buffer can be written, this full-buffer write turns the operation into an error instead of returning the number of bytes already produced. The PR identifies that `getrandom` should permit short writes; therefore the user buffer must be represented by a writer whose partial progress is visible to the random device.
+   MATCH IF: A reviewer should flag that writing the whole `count`-sized buffer after generating `read_len` bytes prevents valid short-write behavior and ask for direct userspace-writer based copying that reports actual progress.
+
+===== PRODUCED REVIEW =====
+---
+date: 2026-08-24
+mode: files
+files:
+  - kernel/src/syscall/getrandom.rs
+head: b606e3456
+branch: HEAD
+title: Review of kernel/src/syscall/getrandom.rs
+---
+
+# Summary
+
+## Correctness
+
+### `kernel/src/syscall/getrandom.rs` line 7
+```diff
+7	    let flags = GetRandomFlags::from_bits_truncate(flags);
+```
+`GetRandomFlags::from_bits_truncate` silently drops unknown bits, but `getrandom(2)` requires `EINVAL` for any invalid flag value. That makes the syscall accept malformed inputs that Linux rejects, which can hide caller bugs and breaks the ABI. **Fix.** Parse with a checked conversion and return `EINVAL` when `flags` contains unsupported bits.
+
+### `kernel/src/syscall/getrandom.rs` line 14
+```diff
+14	    let mut buffer = vec![0u8; count];
+```
+This allocates a kernel buffer sized directly by the untrusted user `count`. A large request can exhaust heap memory and hit the allocator's abort path, taking down the kernel instead of returning an error. **Fix.** Fill the user buffer in bounded chunks, or write directly from a small scratch buffer without materializing `count` bytes in kernel memory.
+warning: Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.
+codex
+2 3
+tokens used
+382
+0401-getrandom-boundary-semantics  recall 2/3 [fan-out]
+----
+reviews kept for inspection in: /tmp/tmp.oHx9oNYFoB  (per problem: review.md + expected-defects.txt)
+recall: 2/3 (66%, gate >=100%) across 1 problems; per-persona-context: 0 combined, 1 fan-out; precision: 0/0 clean; harness errors: 0
+make[1]: *** [Makefile:41: benchmark] Error 1
+make: *** [Makefile:28: benchmark] Error 2
