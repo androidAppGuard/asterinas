@@ -24,9 +24,9 @@ There are two review modes, both **anchored at the current checkout (HEAD)**:
 
 To review at a specific commit, check it out first (it becomes HEAD).
 
-This skill is agent-agnostic (Claude Code and Codex).
-Only step 3's spawn primitive differs between agents;
-everything else is identical.
+This skill runs under Codex.
+Persona passes are spawned with `codex exec`;
+everything else in the pipeline is deterministic and shared.
 
 ## Interface
 
@@ -154,7 +154,6 @@ which is what lets the prompt cache reuse it (see [`execution_model.md`](spec/ex
 — one pass per activated persona,
 each in a CLEAN context with only its own persona block (selective exposure):
 
-- **Claude Code** — spawn a Task sub-agent per persona.
 - **Codex** — run `codex exec "<build_pass_prompt.sh output>"` per persona
   (pass the built PROMPT TEXT as the argument).
 
